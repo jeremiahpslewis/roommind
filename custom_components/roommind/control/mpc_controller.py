@@ -15,8 +15,10 @@ from ..const import (
     AC_BOOST_DELTA_MIN,
     AC_COOLING_BOOST_TARGET,
     AC_HEATING_BOOST_TARGET,
-    AC_SETPOINT_ERROR_FLOOR_C,
-    AC_SETPOINT_ERROR_GAIN,
+    AC_SETPOINT_ERROR_FLOOR_MAX_C,
+    AC_SETPOINT_ERROR_FLOOR_MIN_C,
+    AC_SETPOINT_ERROR_GAIN_MAX,
+    AC_SETPOINT_ERROR_GAIN_MIN,
     APPROACH_RATE_MIN,
     BANGBANG_COOL_HYSTERESIS,
     BANGBANG_HEAT_HYSTERESIS,
@@ -47,7 +49,7 @@ from ..utils.device_utils import (
     get_trv_eids,
     has_reliable_hvac_modes,
 )
-from ..utils.temp_utils import celsius_delta_to_ha, celsius_to_ha_temp
+from ..utils.temp_utils import celsius_delta_to_ha, celsius_to_ha_temp, ha_delta_to_celsius
 from .mpc_optimizer import MPCOptimizer, MPCPlan
 from .residual_heat import get_min_run_blocks
 from .thermal_model import RoomModelManager
@@ -780,6 +782,17 @@ class MPCController:
             AC_BOOST_DELTA_MAX,
             AC_BOOST_DELTA_MIN + (AC_BOOST_DELTA_MAX - AC_BOOST_DELTA_MIN) * cw / DEFAULT_COMFORT_WEIGHT,
         )
+        # Near-target AC setpoint authority. Interpolated over the full slider
+        # range: _ac_boost_delta and _approach_rate both saturate at
+        # DEFAULT_COMFORT_WEIGHT, which left the comfort half of the slider with
+        # no effect at all on the setpoint a room close to target receives.
+        cw_frac = max(0.0, min(1.0, cw / 100.0))
+        self._ac_setpoint_gain: float = (
+            AC_SETPOINT_ERROR_GAIN_MIN + (AC_SETPOINT_ERROR_GAIN_MAX - AC_SETPOINT_ERROR_GAIN_MIN) * cw_frac
+        )
+        self._ac_setpoint_floor: float = (
+            AC_SETPOINT_ERROR_FLOOR_MIN_C + (AC_SETPOINT_ERROR_FLOOR_MAX_C - AC_SETPOINT_ERROR_FLOOR_MIN_C) * cw_frac
+        )
 
     async def async_evaluate(
         self,
@@ -1276,9 +1289,6 @@ class MPCController:
         ac_heat_boost = ac_heating_boost_target if ac_heating_boost_target is not None else AC_HEATING_BOOST_TARGET
         ac_cool_boost = cooling_boost_target if cooling_boost_target is not None else AC_COOLING_BOOST_TARGET
 
-        # How far past the room target an AC setpoint may be driven this cycle.
-        ac_setpoint_limit = self._ac_setpoint_limit(current_temp, effective_target, mode)
-
         can_heat, can_cool = self._get_can_heat_cool()
 
         _exclude = exclude_eids or set()
@@ -1458,7 +1468,12 @@ class MPCController:
                                 1,
                             )
                             t = max(effective_target, t)
-                            t = min(ac_heat_boost, effective_target + ac_setpoint_limit, t)
+                            t = min(
+                                ac_heat_boost,
+                                effective_target
+                                + self.ac_setpoint_limit(current_temp, effective_target, mode, cmd.entity_id),
+                                t,
+                            )
                         else:
                             t = effective_target
                         t_final = effective_target if cmd.entity_id in self._direct_eids else t
@@ -1531,22 +1546,28 @@ class MPCController:
                     temp_intent="heat",
                     deadband=self._proportional_deadband(eid, current_temp, effective_target),
                 )
-            # ACs: proportional setpoint in Full Control, actual target otherwise
-            if self.has_external_sensor and current_temp is not None:
-                ac_heat_target = round(
-                    current_temp + power_fraction * (ac_heat_boost - current_temp),
-                    1,
-                )
-                ac_heat_target = max(effective_target, ac_heat_target)
-                ac_heat_target = min(ac_heat_boost, effective_target + ac_setpoint_limit, ac_heat_target)
-            else:
-                ac_heat_target = effective_target
-            ha_ac_target = celsius_to_ha_temp(self.hass, ac_heat_target)
+            # ACs: proportional setpoint in Full Control, actual target otherwise.
+            # The excursion limit is per-entity because it depends on the
+            # device's own setpoint step.
             ha_ac_direct = celsius_to_ha_temp(self.hass, effective_target)
             for eid in self.acs:
                 if eid in _forced_off:
                     await async_idle_device(self.hass, eid, self._devices, area_id=self._area_id, targets=targets)
                     continue
+                if self.has_external_sensor and current_temp is not None:
+                    ac_heat_target = round(
+                        current_temp + power_fraction * (ac_heat_boost - current_temp),
+                        1,
+                    )
+                    ac_heat_target = max(effective_target, ac_heat_target)
+                    ac_heat_target = min(
+                        ac_heat_boost,
+                        effective_target + self.ac_setpoint_limit(current_temp, effective_target, mode, eid),
+                        ac_heat_target,
+                    )
+                else:
+                    ac_heat_target = effective_target
+                ha_ac_target = celsius_to_ha_temp(self.hass, ac_heat_target)
                 ha_t = ha_ac_direct if eid in self._direct_eids else ha_ac_target
                 ac_state = self.hass.states.get(eid)
                 ac_modes = _effective_ac_modes(ac_state)
@@ -1569,21 +1590,25 @@ class MPCController:
                 else:
                     await self._call("set_hvac_mode", {"entity_id": eid, "hvac_mode": "off"})
         elif mode == MODE_COOLING:
-            if self.has_external_sensor and current_temp is not None:
-                ac_cool_target = round(
-                    current_temp - power_fraction * (current_temp - ac_cool_boost),
-                    1,
-                )
-                ac_cool_target = max(ac_cool_boost, effective_target - ac_setpoint_limit, ac_cool_target)
-                ac_cool_target = min(effective_target, ac_cool_target)
-            else:
-                ac_cool_target = effective_target
-            ha_target = celsius_to_ha_temp(self.hass, ac_cool_target)
             ha_cool_direct = celsius_to_ha_temp(self.hass, effective_target)
             for eid in self.acs:
                 if eid in _forced_off:
                     await async_idle_device(self.hass, eid, self._devices, area_id=self._area_id, targets=targets)
                     continue
+                if self.has_external_sensor and current_temp is not None:
+                    ac_cool_target = round(
+                        current_temp - power_fraction * (current_temp - ac_cool_boost),
+                        1,
+                    )
+                    ac_cool_target = max(
+                        ac_cool_boost,
+                        effective_target - self.ac_setpoint_limit(current_temp, effective_target, mode, eid),
+                        ac_cool_target,
+                    )
+                    ac_cool_target = min(effective_target, ac_cool_target)
+                else:
+                    ac_cool_target = effective_target
+                ha_target = celsius_to_ha_temp(self.hass, ac_cool_target)
                 ha_t = ha_cool_direct if eid in self._direct_eids else ha_target
                 await self._call("set_hvac_mode", {"entity_id": eid, "hvac_mode": "cool"})
                 await self._call(
@@ -1648,29 +1673,41 @@ class MPCController:
                     force_off=force_off,
                 )
 
-    def _ac_setpoint_limit(self, current_temp: float | None, effective_target: float, mode: str) -> float:
+    def ac_setpoint_limit(
+        self,
+        current_temp: float | None,
+        effective_target: float,
+        mode: str,
+        eid: str | None = None,
+    ) -> float:
         """How far past the room target an AC setpoint may be pushed (°C).
 
-        A climate entity's setpoint is not a power dial. Unlike a TRV — whose
-        valve position really does track the setpoint — an AC has its own
-        thermostat and runs its compressor flat out until *that* setpoint is
-        reached. Commanding 17°C because the room sits 0.1°C above a 22°C
-        target therefore does not mean "a bit of cooling", it means "cool the
-        room to 17", and the room overshoots the target before the next
-        evaluation pulls the setpoint back.
+        An AC's compressor speed and fan speed both scale with the gap between
+        the room and the setpoint it has been given: a unit told 19°C in a 22°C
+        room does not cool gently on its way there, it runs hard and loud. The
+        gap is the output dial, and it is also the temperature the unit will
+        eventually drive the room to — one command, both effects.
 
-        So the excursion is bounded by the error actually being corrected,
-        on top of the comfort/efficiency cap: a small error may only ever buy
-        a small excursion, at any slider position. The floor keeps enough
-        authority for the unit to run at all when the room is right at target
-        (device internal sensors are rarely in exact agreement with the room
-        sensor).
+        RoomMind's proportional map spans from the room temperature down to the
+        device's own minimum, so without a bound a 0.1°C excursion above target
+        buys a multi-degree gap: full output, for an error a gentle nudge would
+        fix. Bounding the excursion by the error being corrected keeps the two
+        proportional to each other. Note the gap the unit reacts to is
+        ``error + excursion``, so a gain of G yields a gap of (1+G)x the error —
+        the gain is chosen against that, not against the excursion alone.
 
         Only the error *in the direction the mode is correcting* counts. A
-        signed error matters because a room that has already sailed past
-        target has a large absolute deviation while needing no excursion at
-        all — taking abs() there would hand the biggest allowance to exactly
-        the overshoot the limit exists to prevent.
+        signed error matters because a room that has already sailed past target
+        has a large absolute deviation while needing no excursion at all —
+        taking abs() there would hand the biggest allowance to exactly the
+        overshoot the limit exists to prevent.
+
+        The floor keeps enough authority for the unit to run at all when the
+        room is right at target (device internal sensors rarely agree exactly
+        with the room sensor). On a device with a coarse setpoint step the floor
+        is rounded up to a whole step: half a degree of intent is worth nothing
+        to a unit that only accepts whole degrees — it snaps back to the target
+        and the AC is handed no demand at all.
         """
         if current_temp is None:
             return self._ac_boost_delta
@@ -1680,10 +1717,32 @@ class MPCController:
             error = max(0.0, effective_target - current_temp)
         else:
             error = abs(current_temp - effective_target)
-        return min(
-            self._ac_boost_delta,
-            max(AC_SETPOINT_ERROR_FLOOR_C, AC_SETPOINT_ERROR_GAIN * error),
-        )
+
+        limit = max(self._ac_setpoint_floor, self._ac_setpoint_gain * error)
+        step = self._setpoint_step(eid)
+        if step:
+            # Whole steps, rounded down so the excursion is never widened past
+            # what the error justifies, but never below one step or the command
+            # snaps back onto the target and delivers nothing.
+            limit = max(step, math.floor(round(limit / step, 6)) * step)
+        # 0.1 °C granularity, matching every other setpoint in the controller.
+        return round(min(self._ac_boost_delta, limit), 1)
+
+    def _setpoint_step(self, eid: str | None) -> float | None:
+        """Device target_temp_step in °C, or None when it is unknown/fine."""
+        if not eid:
+            return None
+        state = self.hass.states.get(eid)
+        if state is None:
+            return None
+        raw = state.attributes.get("target_temp_step")
+        try:
+            step = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if step <= 0:
+            return None
+        return ha_delta_to_celsius(self.hass, step)
 
     def _proportional_deadband(self, eid: str, current_temp: float | None, effective_target: float) -> float | None:
         """Deadband threshold for a proportional setpoint send, or None to disable.

@@ -999,6 +999,9 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             cover_eids=cover_eids,
             cover_result=cover_result,
             mpc_active=mpc_active,
+            ac_setpoint_limit=(
+                controller.ac_setpoint_limit(current_temp, target_temp, mode) if target_temp is not None else None
+            ),
             compressor_protection_reason=compressor_protection_reason,
         )
 
@@ -1210,6 +1213,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         cover_eids: list[str],
         cover_result: CoverResult,
         mpc_active: bool,
+        ac_setpoint_limit: float | None = None,
         compressor_protection_reason: str | None = None,
     ) -> dict:
         """Build the final room state dictionary."""
@@ -1245,6 +1249,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 device_max_temp,
                 ac_device_max_temp,
                 direct_eids=_direct_eids,
+                ac_setpoint_limit=ac_setpoint_limit,
             )
             if heat_source_plan is not None
             else self._compute_device_setpoint(
@@ -1258,6 +1263,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 has_thermostats=bool(get_trv_eids(_room_devices)),
                 has_acs=bool(get_ac_eids(_room_devices)),
                 all_direct=_all_direct,
+                ac_setpoint_limit=ac_setpoint_limit,
             ),
             "window_open": window_open,
             **build_override_live(
@@ -1295,6 +1301,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         device_max_temp: float | None,
         ac_device_max_temp: float | None,
         direct_eids: set[str] | None = None,
+        ac_setpoint_limit: float | None = None,
     ) -> float | None:
         """Compute device setpoint from the orchestrated heat source plan."""
         if current_temp is None or target_temp is None:
@@ -1314,6 +1321,10 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         sp = round(current_temp + cmd.power_fraction * (boost - current_temp), 1)
         sp = max(target_temp, sp)
         sp = min(boost, sp)
+        # ACs are additionally bounded by the error-scaled setpoint limit, so
+        # the displayed value has to match what async_apply actually sends.
+        if cmd.device_type != "thermostat" and ac_setpoint_limit is not None:
+            sp = min(sp, target_temp + ac_setpoint_limit)
         return sp
 
     @staticmethod
@@ -1328,8 +1339,14 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         has_thermostats: bool = True,
         has_acs: bool = False,
         all_direct: bool = False,
+        ac_setpoint_limit: float | None = None,
     ) -> float | None:
-        """Compute the device setpoint for UI display (Full Control only)."""
+        """Compute the device setpoint for UI display (Full Control only).
+
+        Mirrors the clamps in MPCController.async_apply — including the
+        error-scaled AC limit — so the "Device set to" value the user reads is
+        the value the device is actually given.
+        """
         if not has_external_sensor or current_temp is None or target_temp is None:
             return None
         if all_direct:
@@ -1343,12 +1360,16 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             sp = round(current_temp + power_fraction * (boost - current_temp), 1)
             sp = max(target_temp, sp)
             sp = min(boost, sp)
+            if not has_thermostats and ac_setpoint_limit is not None:
+                sp = min(sp, target_temp + ac_setpoint_limit)
             return sp
 
         if mode == MODE_COOLING and has_acs:
             boost = device_min_temp if device_min_temp is not None else AC_COOLING_BOOST_TARGET
             sp = round(current_temp - power_fraction * (current_temp - boost), 1)
             sp = max(boost, sp)
+            if ac_setpoint_limit is not None:
+                sp = max(sp, target_temp - ac_setpoint_limit)
             sp = min(target_temp, sp)
             return sp
 

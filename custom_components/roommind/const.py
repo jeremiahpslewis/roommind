@@ -73,8 +73,15 @@ DEFAULT_COMFORT_WEIGHT = 70  # Default comfort_weight slider value
 APPROACH_RATE_MIN = 0.2  # Gentlest gap fraction closed per block, at comfort_weight=0 (full efficiency)
 AC_BOOST_DELTA_MIN = 3.0  # Tightest AC setpoint cap (°C above/below target) at comfort_weight=0
 AC_BOOST_DELTA_MAX = 50.0  # Comfort-end AC cap (°C); finite value above any real device range so the cap never binds (inf would break the linear slider interpolation)
-AC_SETPOINT_ERROR_GAIN = 3.0  # AC setpoint may overshoot the room target by this × the current control error
-AC_SETPOINT_ERROR_FLOOR_C = 0.5  # Minimum AC setpoint overshoot (°C) regardless of error, so the unit still runs
+# AC setpoint excursion past target, as a multiple of the control error. The
+# room→setpoint gap is what an AC's compressor and fan actually respond to, and
+# gap = error + excursion, so a gain of G produces a gap of (1+G)×error.
+# Interpolated over the full 0-100 comfort_weight range (not DEFAULT_COMFORT_WEIGHT)
+# so the comfort half of the slider stays live near target.
+AC_SETPOINT_ERROR_GAIN_MIN = 0.5  # At comfort_weight=0 (full efficiency): gap = 1.5 × error
+AC_SETPOINT_ERROR_GAIN_MAX = 1.5  # At comfort_weight=100 (full comfort): gap = 2.5 × error
+AC_SETPOINT_ERROR_FLOOR_MIN_C = 0.3  # Minimum excursion (°C) at full efficiency, so the unit still runs at target
+AC_SETPOINT_ERROR_FLOOR_MAX_C = 0.8  # Minimum excursion (°C) at full comfort
 PROPORTIONAL_DEADBAND_C = 0.5  # Minimum proportional setpoint change (°C) to resend, in the gentle regime
 PROPORTIONAL_DEADBAND_NEAR_TARGET_C = 0.2  # Finer proportional deadband (°C) within 1°C of target
 

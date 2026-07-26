@@ -13,13 +13,18 @@ This setting does **not** change your schedule targets, overrides, comfort tempe
 
 ## How Far AC Setpoints Are Pushed
 
-For climate devices RoomMind sends a setpoint past the room target to shape output (see `Proportional` below). Because an AC regulates against *its own* setpoint and runs until it reaches it, that excursion is bounded by the error RoomMind is actually correcting:
+For climate devices RoomMind sends a setpoint past the room target to shape output (see `Proportional` below). An AC's compressor speed and fan speed both rise with the gap between the room and the setpoint it was given — a unit told `19°C` in a `22°C` room does not ease toward it, it runs hard and loud. The same command is also the temperature the unit will eventually drive the room to.
 
-- at most `3 x` the current gap between room temperature and target
-- never less than `0.5°C`, so the unit still runs when the room is right at target
-- and never more than the `Priority` slider's own cap (`3°C` at full `Efficiency`)
+So the excursion past target is kept proportional to the error RoomMind is actually correcting, and the `Priority` slider sets how aggressive that proportion is:
 
-So a room sitting `0.1°C` above a `22°C` cooling target gets a `21.5°C` device setpoint, not the device minimum. A room `3°C` above target still gets the full pull-down setpoint.
+- toward `Efficiency`: a small excursion, so the unit runs quietly and takes longer
+- toward `Comfort`: a larger excursion, so the unit works harder and corrects sooner
+
+Only error in the direction being corrected counts — a room that has already overshot past target gets the minimum excursion, not the largest.
+
+For a room `0.1°C` above a `22°C` cooling target, the device is given roughly `21.7°C` at full `Efficiency` and `21.2°C` at full `Comfort`, rather than being sent to its minimum. A room several degrees above target still gets the full pull-down setpoint.
+
+On a device that only accepts whole-degree setpoints the excursion is rounded up to one whole step, because a fraction of a degree would round back onto the target and leave the unit with no demand at all.
 
 ## Thermostat vs Climate Device
 
