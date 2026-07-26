@@ -15,6 +15,7 @@ from ..const import (
     AC_BOOST_DELTA_MIN,
     AC_COOLING_BOOST_TARGET,
     AC_HEATING_BOOST_TARGET,
+    AC_MAX_HEAD_GAP_C,
     AC_SETPOINT_ERROR_FLOOR_MAX_C,
     AC_SETPOINT_ERROR_FLOOR_MIN_C,
     AC_SETPOINT_ERROR_GAIN_MAX,
@@ -50,6 +51,7 @@ from ..utils.device_utils import (
     has_reliable_hvac_modes,
 )
 from ..utils.temp_utils import celsius_delta_to_ha, celsius_to_ha_temp, ha_delta_to_celsius
+from .gap_response import GapResponseManager
 from .mpc_optimizer import MPCOptimizer, MPCPlan
 from .residual_heat import get_min_run_blocks
 from .thermal_model import RoomModelManager
@@ -740,6 +742,7 @@ class MPCController:
         mode_on_since: float | None = None,
         shading_factor: float = 1.0,
         q_occupancy: float = 0.0,
+        gap_manager: GapResponseManager | None = None,
     ) -> None:
         self.hass = hass
         self.room_config = room_config
@@ -753,6 +756,7 @@ class MPCController:
         self.previous_mode = previous_mode
         self.has_external_sensor = has_external_sensor
         self._model_manager = model_manager
+        self._gap_manager = gap_manager
         self._area_id = room_config.get("area_id", "unknown")
         self._target_resolver = target_resolver
         self.last_plan: MPCPlan | None = None
@@ -1596,16 +1600,24 @@ class MPCController:
                     await async_idle_device(self.hass, eid, self._devices, area_id=self._area_id, targets=targets)
                     continue
                 if self.has_external_sensor and current_temp is not None:
-                    ac_cool_target = round(
-                        current_temp - power_fraction * (current_temp - ac_cool_boost),
-                        1,
-                    )
-                    ac_cool_target = max(
-                        ac_cool_boost,
-                        effective_target - self.ac_setpoint_limit(current_temp, effective_target, mode, eid),
-                        ac_cool_target,
-                    )
-                    ac_cool_target = min(effective_target, ac_cool_target)
+                    learned = self.learned_cool_setpoint(eid, current_temp, power_fraction)
+                    if learned is not None:
+                        # Learned response: the gap is already sized from the
+                        # device's measured behaviour, so the heuristic clamps
+                        # (proportional map, error limit) do not apply. Only the
+                        # device's own range still binds.
+                        ac_cool_target = max(ac_cool_boost, learned)
+                    else:
+                        ac_cool_target = round(
+                            current_temp - power_fraction * (current_temp - ac_cool_boost),
+                            1,
+                        )
+                        ac_cool_target = max(
+                            ac_cool_boost,
+                            effective_target - self.ac_setpoint_limit(current_temp, effective_target, mode, eid),
+                            ac_cool_target,
+                        )
+                        ac_cool_target = min(effective_target, ac_cool_target)
                 else:
                     ac_cool_target = effective_target
                 ha_target = celsius_to_ha_temp(self.hass, ac_cool_target)
@@ -1672,6 +1684,49 @@ class MPCController:
                     targets=targets,
                     force_off=force_off,
                 )
+
+    def learned_cool_setpoint(self, eid: str, current_temp: float, power_fraction: float) -> float | None:
+        """AC cooling setpoint from the learned head-gap response, or None.
+
+        Inverts the device's own measured response instead of guessing a boost::
+
+            setpoint = (T_room + offset) - gap_for_rate(required_rate)
+
+        ``offset`` is the measured T_head - T_room bias, so the first term is
+        what the unit's own thermostat has to read for the room to be at
+        *current_temp*. Subtracting the gap the curve says delivers the rate the
+        optimizer asked for leaves a setpoint sized by measurement rather than
+        by a hand-tuned multiple — and because the curve saturates, it stops
+        asking for gap once more gap only buys noise.
+
+        Returns None when the curve has not been identified yet, so the caller
+        keeps the heuristic path.
+        """
+        if self._gap_manager is None:
+            return None
+        curve = self._gap_manager.curve(eid, MODE_COOLING)
+        if not curve.is_confident():
+            return None
+        model = self._model_manager.get_model(self._area_id)
+        required_rate = power_fraction * model.Q_cool
+        if required_rate <= 0:
+            return None
+        gap = curve.gap_for_rate(required_rate, AC_MAX_HEAD_GAP_C)
+        offset = self._gap_manager.offset(eid).commanding_offset()
+        setpoint = round(current_temp + offset - gap, 1)
+        _LOGGER.debug(
+            "gap-response: %s commanding room=%.2f offset=%+.2f required=%.2f°C/h "
+            "→ gap=%.2fK setpoint=%.1f (curve n=%d spread=%.1fK)",
+            eid,
+            current_temp,
+            offset,
+            required_rate,
+            gap,
+            setpoint,
+            curve.n_observations,
+            curve.gap_spread,
+        )
+        return setpoint
 
     def ac_setpoint_limit(
         self,

@@ -26,6 +26,24 @@ For a room `0.1°C` above a `22°C` cooling target, the device is given roughly 
 
 On a device that only accepts whole-degree setpoints the excursion is rounded up to one whole step, because a fraction of a degree would round back onto the target and leave the unit with no demand at all.
 
+### Learned Gap Response (beta)
+
+The rules above are a heuristic: they assume how much cooling a given gap buys. RoomMind can instead **measure** it, per device.
+
+Your AC reports two things HA can read — its own sensor (`current_temperature`) and the setpoint it is regulating against. The difference is the gap actually driving its compressor and fan. RoomMind compares the room's temperature change against the passive drift its thermal model predicts, and the residual is the work the unit did. That gives a curve of gap → °C/h, plus the `T_head − T_room` offset, which is why a "boost" was ever needed: the unit stops when *its* sensor reads the setpoint, not yours.
+
+Once identified, commanding becomes a measurement rather than a guess:
+
+```
+setpoint = (room temperature + offset) − gap_that_delivers_the_required_rate
+```
+
+Because the learned curve saturates, it also knows the point past which more gap buys noise instead of cooling — something no fixed rule can know per device.
+
+This is **observation-only until it has enough data**: it needs a spread of different gaps, not just many samples at one, so it activates after the room has been through some varied conditions. Until then the heuristic above stays in charge. Cooling only for now; heating is learned but still commanded by the heuristic.
+
+To inspect it, download diagnostics (`Settings → Devices & Services → RoomMind → ⋮ → Download diagnostics`) and look for `gap_response` under the room. `driving_setpoints` tells you whether the curve is in charge yet, `gap_spread_K` how much variety it has seen, and `rate_degC_per_h` is the curve itself. Set the `custom_components.roommind` logger to `debug` to watch each observation as it lands.
+
 ## Thermostat vs Climate Device
 
 Both options are Home Assistant `climate.*` entities, but RoomMind treats them differently:

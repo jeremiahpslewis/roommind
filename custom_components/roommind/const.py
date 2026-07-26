@@ -82,6 +82,11 @@ AC_SETPOINT_ERROR_GAIN_MIN = 0.5  # At comfort_weight=0 (full efficiency): gap =
 AC_SETPOINT_ERROR_GAIN_MAX = 1.5  # At comfort_weight=100 (full comfort): gap = 2.5 × error
 AC_SETPOINT_ERROR_FLOOR_MIN_C = 0.3  # Minimum excursion (°C) at full efficiency, so the unit still runs at target
 AC_SETPOINT_ERROR_FLOOR_MAX_C = 0.8  # Minimum excursion (°C) at full comfort
+# Single ceiling on the learned gap the AC may be commanded to open up. The
+# response curve saturates well before this on most units; this exists so an
+# unidentified or badly-fitted curve can never ask for an extreme setpoint.
+AC_MAX_HEAD_GAP_C = 6.0
+
 PROPORTIONAL_DEADBAND_C = 0.5  # Minimum proportional setpoint change (°C) to resend, in the gentle regime
 PROPORTIONAL_DEADBAND_NEAR_TARGET_C = 0.2  # Finer proportional deadband (°C) within 1°C of target
 

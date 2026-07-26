@@ -44,6 +44,12 @@ from .const import (
     is_override_suppressed,
     make_roommind_context,
 )
+from .control.gap_response import (
+    MAX_OBSERVATION_DT,
+    MIN_OBSERVATION_DT,
+    RUNNING_STATES,
+    GapResponseManager,
+)
 from .control.mpc_controller import (
     DEFAULT_OUTDOOR_TEMP_FALLBACK,
     MPCController,
@@ -147,6 +153,10 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         self._window_manager = WindowManager()
         self._previous_modes: dict[str, str] = {}
         self._model_manager: RoomModelManager = RoomModelManager()
+        self._gap_manager: GapResponseManager = GapResponseManager()
+        # Previous (room temp, monotonic timestamp, mode) per area, for deriving
+        # the incremental cooling rate a commanded head gap actually produced.
+        self._gap_prev: dict[str, tuple[float, float, str]] = {}
         self._model_loaded = False
         self._thermal_save_count: int = 0
         self._history_store: HistoryStore | None = None
@@ -239,6 +249,8 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 self._model_manager = RoomModelManager.from_dict(thermal_data)
                 self._ekf_training._model_manager = self._model_manager
                 self._cover_orchestrator._model_manager = self._model_manager
+                if thermal_data.get("gap_response"):
+                    self._gap_manager = GapResponseManager.from_dict(thermal_data["gap_response"])
             self._valve_manager.load_actuation_data(settings.get("valve_last_actuation", {}))
             self._model_loaded = True
 
@@ -357,7 +369,9 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         self._thermal_save_count += 1
         if self._thermal_save_count >= THERMAL_SAVE_CYCLES:
             self._thermal_save_count = 0
-            await store.async_save_thermal_data(self._model_manager.to_dict())
+            thermal_payload = self._model_manager.to_dict()
+            thermal_payload["gap_response"] = self._gap_manager.to_dict()
+            await store.async_save_thermal_data(thermal_payload)
 
         # Rotate history periodically
         self._history_rotate_count += 1
@@ -675,6 +689,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             heating_system_type=system_type,
             shading_factor=shading_factor,
             q_occupancy=q_occupancy,
+            gap_manager=self._gap_manager,
         )
         mode, power_fraction = await controller.async_evaluate(current_temp, targets)
 
@@ -951,6 +966,22 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 )
             except Exception:  # noqa: BLE001
                 mpc_active = False
+
+        # Learn what the commanded head gap actually bought. Observation only —
+        # it never affects the command issued this cycle.
+        try:
+            self._observe_gap_response(
+                area_id=area_id,
+                room=room,
+                current_temp=current_temp,
+                mode=mode,
+                has_external_sensor=has_external_sensor,
+                q_solar=self._current_q_solar * (shading_factor if shading_factor is not None else 1.0),
+                q_residual=q_residual,
+                q_occupancy=q_occupancy,
+            )
+        except Exception:  # noqa: BLE001 — learning must never break control
+            _LOGGER.debug("gap-response observation failed for '%s'", area_id, exc_info=True)
 
         display_mode, display_pf = await self._observe_and_train(
             area_id=area_id,
@@ -1374,6 +1405,82 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             return sp
 
         return None
+
+    def _observe_gap_response(
+        self,
+        *,
+        area_id: str,
+        room: dict,
+        current_temp: float | None,
+        mode: str,
+        has_external_sensor: bool,
+        q_solar: float,
+        q_residual: float,
+        q_occupancy: float,
+    ) -> None:
+        """Record what the head gap RoomMind commanded actually bought.
+
+        Runs every cycle in Full Control. The AC reports both its own sensor
+        (``current_temperature``) and the setpoint it is regulating against
+        (``temperature``), so the gap driving its compressor is directly
+        observable — no need to remember what was sent. The room's own change
+        over the interval, minus the passive drift the RC model predicts, is the
+        work the unit did.
+
+        Observation only: learning here never changes this cycle's command.
+        """
+        if not has_external_sensor or current_temp is None:
+            return
+
+        now = time.monotonic()
+        prev = self._gap_prev.get(area_id)
+        self._gap_prev[area_id] = (current_temp, now, mode)
+        if prev is None:
+            return
+        prev_temp, prev_ts, prev_mode = prev
+        dt_minutes = (now - prev_ts) / 60.0
+        if not (MIN_OBSERVATION_DT <= dt_minutes <= MAX_OBSERVATION_DT):
+            return
+        # A mode change mid-interval mixes two dynamics into one residual.
+        if prev_mode != mode or mode not in (MODE_HEATING, MODE_COOLING):
+            return
+
+        model = self._model_manager.get_model(area_id)
+        t_out = self.outdoor_temp_effective
+        if t_out is None:
+            return
+        passive = model.predict(
+            prev_temp,
+            t_out,
+            Q_active=0.0,
+            dt_minutes=dt_minutes,
+            q_solar=q_solar,
+            q_residual=q_residual,
+            q_occupancy=q_occupancy,
+        )
+        for eid in get_ac_eids(room.get("devices", [])):
+            state = self.hass.states.get(eid)
+            if state is None or state.state not in RUNNING_STATES.get(mode, frozenset()):
+                continue
+            head = state.attributes.get("current_temperature")
+            setpoint = state.attributes.get("temperature")
+            if head is None or setpoint is None:
+                continue
+            try:
+                head_c = ha_temp_to_celsius(self.hass, float(head), entity_id=eid)
+                setpoint_c = ha_temp_to_celsius(self.hass, float(setpoint), entity_id=eid)
+            except (TypeError, ValueError):
+                continue
+            self._gap_manager.observe_offset(eid, head_c, current_temp, is_running=True)
+            gap = head_c - setpoint_c if mode == MODE_COOLING else setpoint_c - head_c
+            self._gap_manager.observe_response(
+                eid,
+                mode,
+                gap=gap,
+                observed_temp_change=current_temp - prev_temp,
+                predicted_passive_change=passive - prev_temp,
+                dt_minutes=dt_minutes,
+            )
 
     def _read_device_temp(self, room: dict) -> float | None:
         """Read current_temperature from the first thermostat or AC entity."""
