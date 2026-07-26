@@ -1277,7 +1277,7 @@ class MPCController:
         ac_cool_boost = cooling_boost_target if cooling_boost_target is not None else AC_COOLING_BOOST_TARGET
 
         # How far past the room target an AC setpoint may be driven this cycle.
-        ac_setpoint_limit = self._ac_setpoint_limit(current_temp, effective_target)
+        ac_setpoint_limit = self._ac_setpoint_limit(current_temp, effective_target, mode)
 
         can_heat, can_cool = self._get_can_heat_cool()
 
@@ -1648,7 +1648,7 @@ class MPCController:
                     force_off=force_off,
                 )
 
-    def _ac_setpoint_limit(self, current_temp: float | None, effective_target: float) -> float:
+    def _ac_setpoint_limit(self, current_temp: float | None, effective_target: float, mode: str) -> float:
         """How far past the room target an AC setpoint may be pushed (°C).
 
         A climate entity's setpoint is not a power dial. Unlike a TRV — whose
@@ -1665,10 +1665,21 @@ class MPCController:
         authority for the unit to run at all when the room is right at target
         (device internal sensors are rarely in exact agreement with the room
         sensor).
+
+        Only the error *in the direction the mode is correcting* counts. A
+        signed error matters because a room that has already sailed past
+        target has a large absolute deviation while needing no excursion at
+        all — taking abs() there would hand the biggest allowance to exactly
+        the overshoot the limit exists to prevent.
         """
         if current_temp is None:
             return self._ac_boost_delta
-        error = abs(current_temp - effective_target)
+        if mode == MODE_COOLING:
+            error = max(0.0, current_temp - effective_target)
+        elif mode == MODE_HEATING:
+            error = max(0.0, effective_target - current_temp)
+        else:
+            error = abs(current_temp - effective_target)
         return min(
             self._ac_boost_delta,
             max(AC_SETPOINT_ERROR_FLOOR_C, AC_SETPOINT_ERROR_GAIN * error),

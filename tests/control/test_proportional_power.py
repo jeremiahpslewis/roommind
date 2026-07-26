@@ -846,3 +846,55 @@ async def test_ac_heating_setpoint_bounded_by_control_error():
     set_temp = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
     assert set_temp
     assert set_temp[-1][0][2]["temperature"] == 21.5
+
+
+@pytest.mark.asyncio
+async def test_cooling_setpoint_limit_ignores_overshoot_past_target():
+    """A room already below the cool target must not buy a larger excursion.
+
+    The limit is scaled by the error in the direction the mode is correcting.
+    Using abs() here would hand the widest allowance to exactly the overshoot
+    the limit exists to prevent.
+    """
+    hass = _cool_only_ac_hass()
+    room = make_room(thermostats=[], acs=["climate.ac"])
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=32.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    # Room 1°C *below* the cool target: |error| = 1.0, but the correcting
+    # error is 0, so only the floor applies.
+    await ctrl.async_apply("cooling", 22.0, power_fraction=1.0, current_temp=21.0)
+
+    set_temp = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert set_temp
+    assert set_temp[-1][0][2]["temperature"] == 21.5
+
+
+@pytest.mark.asyncio
+async def test_ac_heating_setpoint_limit_ignores_overshoot_past_target():
+    """Symmetric: a room already above the heat target gets only the floor."""
+    hass = build_hass()
+    ac_state = MagicMock()
+    ac_state.state = "off"
+    ac_state.attributes = {"hvac_modes": ["heat", "cool", "off"], "temperature": 21.0, "max_temp": 30.0}
+    hass.states.get = MagicMock(return_value=ac_state)
+
+    room = make_room(thermostats=[], acs=["climate.ac"])
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=5.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    await ctrl.async_apply("heating", 21.0, power_fraction=1.0, current_temp=22.0)
+
+    set_temp = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert set_temp
+    assert set_temp[-1][0][2]["temperature"] == 21.5
