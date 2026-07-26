@@ -11,6 +11,16 @@ In `Settings -> Control -> Priority`, the slider balances comfort against runtim
 
 This setting does **not** change your schedule targets, overrides, comfort temperature, or eco temperature. It only changes how aggressively MPC tries to reach and hold those targets.
 
+## How Far AC Setpoints Are Pushed
+
+For climate devices RoomMind sends a setpoint past the room target to shape output (see `Proportional` below). Because an AC regulates against *its own* setpoint and runs until it reaches it, that excursion is bounded by the error RoomMind is actually correcting:
+
+- at most `3 x` the current gap between room temperature and target
+- never less than `0.5°C`, so the unit still runs when the room is right at target
+- and never more than the `Priority` slider's own cap (`3°C` at full `Efficiency`)
+
+So a room sitting `0.1°C` above a `22°C` cooling target gets a `21.5°C` device setpoint, not the device minimum. A room `3°C` above target still gets the full pull-down setpoint.
+
 ## Thermostat vs Climate Device
 
 Both options are Home Assistant `climate.*` entities, but RoomMind treats them differently:

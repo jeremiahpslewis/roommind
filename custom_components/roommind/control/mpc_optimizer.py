@@ -189,8 +189,17 @@ class MPCOptimizer:
             )
             if best_action == MODE_IDLE:
                 pf = 0.0
-            elif best_action != MODE_IDLE and pf == 0.0:
-                pf = 1.0  # min_run_blocks enforcement: keep full power
+            elif pf == 0.0:
+                # The analytical power law sees no demand for this block (room
+                # already inside the band, or the energy bias cancelled the
+                # small residual demand) while the lookahead still wants the
+                # mode active — e.g. a min_run_blocks continuation, or a room
+                # sitting a hair past target on a hot day. Keep the device on
+                # at the minimum non-zero power instead of full blast: at low
+                # comfort_weight the energy bias zeroes Q_required for exactly
+                # the near-target cases, so "full power" made the efficiency
+                # end of the slider the *most* aggressive setting.
+                pf = MIN_POWER_FRACTION
 
             # Apply action with proportional Q for accurate forward prediction
             if best_action == MODE_HEATING:

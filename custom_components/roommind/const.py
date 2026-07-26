@@ -73,6 +73,8 @@ DEFAULT_COMFORT_WEIGHT = 70  # Default comfort_weight slider value
 APPROACH_RATE_MIN = 0.2  # Gentlest gap fraction closed per block, at comfort_weight=0 (full efficiency)
 AC_BOOST_DELTA_MIN = 3.0  # Tightest AC setpoint cap (°C above/below target) at comfort_weight=0
 AC_BOOST_DELTA_MAX = 50.0  # Comfort-end AC cap (°C); finite value above any real device range so the cap never binds (inf would break the linear slider interpolation)
+AC_SETPOINT_ERROR_GAIN = 3.0  # AC setpoint may overshoot the room target by this × the current control error
+AC_SETPOINT_ERROR_FLOOR_C = 0.5  # Minimum AC setpoint overshoot (°C) regardless of error, so the unit still runs
 PROPORTIONAL_DEADBAND_C = 0.5  # Minimum proportional setpoint change (°C) to resend, in the gentle regime
 PROPORTIONAL_DEADBAND_NEAR_TARGET_C = 0.2  # Finer proportional deadband (°C) within 1°C of target
 

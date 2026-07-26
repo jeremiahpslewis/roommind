@@ -210,7 +210,8 @@ async def test_heat_source_plan_active_ac_inactive_trv():
         active_sources="secondary",
         reason="test",
     )
-    # current=19, target=21, ac_boost=30 -> ac = 19 + 0.8*(30-19) = 27.8
+    # current=19, target=21, ac_boost=30 -> ac = 19 + 0.8*(30-19) = 27.8,
+    # capped by the error-scaled AC setpoint limit: 21 + 3.0*|19-21| = 27.0
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
@@ -239,7 +240,7 @@ async def test_heat_source_plan_active_ac_inactive_trv():
 
     ac_temp = [c for c in calls if c[0][1] == "set_temperature" and c[0][2]["entity_id"] == "climate.ac1"]
     assert len(ac_temp) == 1
-    assert ac_temp[0][0][2]["temperature"] == 27.8
+    assert ac_temp[0][0][2]["temperature"] == 27.0
 
 
 @pytest.mark.asyncio
@@ -431,7 +432,8 @@ async def test_heat_source_plan_both_active_different_fractions():
         reason="test",
     )
     # current=20, trv_boost=30: trv = 20 + 1.0*(30-20) = 30.0
-    # current=20, ac_boost=30:  ac  = 20 + 0.5*(30-20) = 25.0
+    # current=20, ac_boost=30:  ac  = 20 + 0.5*(30-20) = 25.0, capped by the
+    #                           error-scaled AC limit: 21 + 3.0*|20-21| = 24.0
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
@@ -448,7 +450,7 @@ async def test_heat_source_plan_both_active_different_fractions():
 
     ac_temp = [c for c in calls if c[0][1] == "set_temperature" and c[0][2]["entity_id"] == "climate.ac1"]
     assert len(ac_temp) == 1
-    assert ac_temp[0][0][2]["temperature"] == 25.0
+    assert ac_temp[0][0][2]["temperature"] == 24.0
 
 
 @pytest.mark.asyncio
@@ -591,7 +593,8 @@ async def test_heat_source_plan_ac_heat_cool_mode():
         active_sources="secondary",
         reason="test",
     )
-    # current=20, ac_boost=30 -> 20 + 0.5*(30-20) = 25.0
+    # current=20, ac_boost=30 -> 20 + 0.5*(30-20) = 25.0, capped by the
+    # error-scaled AC limit: 21 + 3.0*|20-21| = 24.0
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
@@ -607,7 +610,7 @@ async def test_heat_source_plan_ac_heat_cool_mode():
 
     ac_temp = [c for c in calls if c[0][1] == "set_temperature" and c[0][2]["entity_id"] == "climate.ac1"]
     assert len(ac_temp) == 1
-    assert ac_temp[0][0][2]["temperature"] == 25.0
+    assert ac_temp[0][0][2]["temperature"] == 24.0
 
 
 @pytest.mark.asyncio
@@ -643,7 +646,8 @@ async def test_heat_source_plan_ac_auto_mode():
         active_sources="secondary",
         reason="test",
     )
-    # current=20, ac_boost=30 -> 20 + 0.5*(30-20) = 25.0
+    # current=20, ac_boost=30 -> 20 + 0.5*(30-20) = 25.0, capped by the
+    # error-scaled AC limit: 21 + 3.0*|20-21| = 24.0
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
@@ -659,7 +663,7 @@ async def test_heat_source_plan_ac_auto_mode():
 
     ac_temp = [c for c in calls if c[0][1] == "set_temperature" and c[0][2]["entity_id"] == "climate.ac1"]
     assert len(ac_temp) == 1
-    assert ac_temp[0][0][2]["temperature"] == 25.0
+    assert ac_temp[0][0][2]["temperature"] == 24.0
     assert ac_temp[0][0][2]["hvac_mode"] == "auto"
 
 

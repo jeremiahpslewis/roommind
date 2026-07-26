@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from custom_components.roommind.const import TargetTemps
 from custom_components.roommind.control.mpc_controller import (
     MPCController,
 )
@@ -157,8 +158,9 @@ async def test_proportional_ac_heating_half_power():
 
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
-    # 20 + 0.5*(30-20) = 25.0
-    assert any(c[0][2]["temperature"] == 25.0 for c in temp_calls)
+    # 20 + 0.5*(30-20) = 25.0, capped by the error-scaled AC setpoint limit:
+    # 21 + 3.0*|20-21| = 24.0
+    assert any(c[0][2]["temperature"] == 24.0 for c in temp_calls)
 
 
 @pytest.mark.asyncio
@@ -464,7 +466,9 @@ async def test_dynamic_ac_heating_boost():
         settings={},
         has_external_sensor=True,
     )
-    await ctrl.async_apply("heating", 21.0, power_fraction=1.0, current_temp=20.0, ac_heating_boost_target=28.0)
+    # Room 4°C below target so the error-scaled setpoint limit (21 + 3.0*4)
+    # leaves the device boost target as the binding constraint.
+    await ctrl.async_apply("heating", 21.0, power_fraction=1.0, current_temp=17.0, ac_heating_boost_target=28.0)
 
     temp_calls = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
     assert any(c[0][2]["temperature"] == 28.0 for c in temp_calls)
@@ -716,3 +720,129 @@ async def test_call_deadband_converts_to_fahrenheit_units():
     )
     sent = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
     assert len(sent) == 1
+
+
+def _cool_only_ac_hass(min_temp=16.0):
+    hass = build_hass()
+    ac_state = MagicMock()
+    ac_state.state = "cool"
+    ac_state.attributes = {
+        "hvac_modes": ["cool", "off"],
+        "temperature": 22.0,
+        "min_temp": min_temp,
+        "max_temp": 30.0,
+    }
+    hass.states.get = MagicMock(return_value=ac_state)
+    return hass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cw", [0, 20, 50, 70, 100])
+async def test_cooling_setpoint_bounded_by_control_error(cw):
+    """A 0.1°C excursion above target must never command a multi-degree AC dip.
+
+    The AC regulates against its own setpoint, so 17°C means "cool the room to
+    17", not "cool gently" — at every slider position the commanded setpoint
+    stays within the error-scaled limit of the target.
+    """
+    hass = _cool_only_ac_hass()
+    room = make_room(thermostats=[], acs=["climate.ac"])
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=32.0,
+        settings={"comfort_weight": cw},
+        has_external_sensor=True,
+    )
+    # Full power request, room a hair above target: floor is target - 0.5
+    await ctrl.async_apply("cooling", 22.0, power_fraction=1.0, current_temp=22.1)
+
+    set_temp = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert set_temp
+    assert set_temp[-1][0][2]["temperature"] == 21.5
+
+
+@pytest.mark.asyncio
+async def test_cooling_setpoint_error_limit_scales_with_error():
+    """A larger error buys a proportionally larger excursion below target."""
+    room = make_room(thermostats=[], acs=["climate.ac"])
+
+    async def commanded(current_temp):
+        hass = _cool_only_ac_hass()
+        ctrl = MPCController(
+            hass,
+            room,
+            model_manager=RoomModelManager(),
+            outdoor_temp=32.0,
+            settings={},
+            has_external_sensor=True,
+        )
+        await ctrl.async_apply("cooling", 22.0, power_fraction=1.0, current_temp=current_temp)
+        set_temp = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+        return set_temp[-1][0][2]["temperature"]
+
+    # error 0.5 → 22 - 1.5 = 20.5;  error 1.0 → 22 - 3.0 = 19.0
+    assert await commanded(22.5) == 20.5
+    assert await commanded(23.0) == 19.0
+    # error 3.0 → limit 9.0 is no longer binding, the pf mapping wins
+    assert await commanded(25.0) == 16.0
+
+
+@pytest.mark.asyncio
+async def test_efficiency_slider_does_not_blast_ac_near_target():
+    """Full-efficiency slider, room 0.1°C over target on a hot day → gentle setpoint.
+
+    Regression: the analytical power law returns "no demand" once the energy
+    bias dominates, which used to fall back to *full* power and drive the AC to
+    its minimum setpoint — making the efficiency end of the slider the most
+    aggressive setting.
+    """
+    hass = _cool_only_ac_hass()
+    room = make_room(thermostats=[], acs=["climate.ac"], climate_mode="cool_only")
+    model_mgr = RoomModelManager()
+    model_mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
+    model_mgr.get_prediction_std = MagicMock(return_value=0.1)
+    model_mgr.get_mode_counts = MagicMock(return_value=(100, 0, 40))
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=model_mgr,
+        outdoor_temp=32.0,
+        settings={"comfort_weight": 0},
+        has_external_sensor=True,
+    )
+    targets = TargetTemps(heat=None, cool=22.0)
+    mode, pf = await ctrl.async_evaluate(current_temp=22.1, targets=targets)
+    assert mode == "cooling"
+    assert pf < 1.0
+
+    await ctrl.async_apply(mode, targets, power_fraction=pf, current_temp=22.1)
+    set_temp = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert set_temp
+    assert set_temp[-1][0][2]["temperature"] >= 21.0
+
+
+@pytest.mark.asyncio
+async def test_ac_heating_setpoint_bounded_by_control_error():
+    """The error-scaled limit is symmetric: small deficit → small heat boost."""
+    hass = build_hass()
+    ac_state = MagicMock()
+    ac_state.state = "off"
+    ac_state.attributes = {"hvac_modes": ["heat", "cool", "off"], "temperature": 21.0, "max_temp": 30.0}
+    hass.states.get = MagicMock(return_value=ac_state)
+
+    room = make_room(thermostats=[], acs=["climate.ac"])
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=5.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    await ctrl.async_apply("heating", 21.0, power_fraction=1.0, current_temp=20.9)
+
+    set_temp = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert set_temp
+    assert set_temp[-1][0][2]["temperature"] == 21.5

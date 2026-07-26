@@ -15,6 +15,8 @@ from ..const import (
     AC_BOOST_DELTA_MIN,
     AC_COOLING_BOOST_TARGET,
     AC_HEATING_BOOST_TARGET,
+    AC_SETPOINT_ERROR_FLOOR_C,
+    AC_SETPOINT_ERROR_GAIN,
     APPROACH_RATE_MIN,
     BANGBANG_COOL_HYSTERESIS,
     BANGBANG_HEAT_HYSTERESIS,
@@ -774,7 +776,7 @@ class MPCController:
         self._w_comfort = max(1.0, cw / 10.0)
         self._w_energy = max(1.0, (100 - cw) / 10.0)
         self._approach_rate = min(1.0, APPROACH_RATE_MIN + (1.0 - APPROACH_RATE_MIN) * cw / DEFAULT_COMFORT_WEIGHT)
-        self._ac_boost_delta = min(
+        self._ac_boost_delta: float = min(
             AC_BOOST_DELTA_MAX,
             AC_BOOST_DELTA_MIN + (AC_BOOST_DELTA_MAX - AC_BOOST_DELTA_MIN) * cw / DEFAULT_COMFORT_WEIGHT,
         )
@@ -1274,6 +1276,9 @@ class MPCController:
         ac_heat_boost = ac_heating_boost_target if ac_heating_boost_target is not None else AC_HEATING_BOOST_TARGET
         ac_cool_boost = cooling_boost_target if cooling_boost_target is not None else AC_COOLING_BOOST_TARGET
 
+        # How far past the room target an AC setpoint may be driven this cycle.
+        ac_setpoint_limit = self._ac_setpoint_limit(current_temp, effective_target)
+
         can_heat, can_cool = self._get_can_heat_cool()
 
         _exclude = exclude_eids or set()
@@ -1453,7 +1458,7 @@ class MPCController:
                                 1,
                             )
                             t = max(effective_target, t)
-                            t = min(ac_heat_boost, effective_target + self._ac_boost_delta, t)
+                            t = min(ac_heat_boost, effective_target + ac_setpoint_limit, t)
                         else:
                             t = effective_target
                         t_final = effective_target if cmd.entity_id in self._direct_eids else t
@@ -1533,7 +1538,7 @@ class MPCController:
                     1,
                 )
                 ac_heat_target = max(effective_target, ac_heat_target)
-                ac_heat_target = min(ac_heat_boost, effective_target + self._ac_boost_delta, ac_heat_target)
+                ac_heat_target = min(ac_heat_boost, effective_target + ac_setpoint_limit, ac_heat_target)
             else:
                 ac_heat_target = effective_target
             ha_ac_target = celsius_to_ha_temp(self.hass, ac_heat_target)
@@ -1569,7 +1574,7 @@ class MPCController:
                     current_temp - power_fraction * (current_temp - ac_cool_boost),
                     1,
                 )
-                ac_cool_target = max(ac_cool_boost, effective_target - self._ac_boost_delta, ac_cool_target)
+                ac_cool_target = max(ac_cool_boost, effective_target - ac_setpoint_limit, ac_cool_target)
                 ac_cool_target = min(effective_target, ac_cool_target)
             else:
                 ac_cool_target = effective_target
@@ -1642,6 +1647,32 @@ class MPCController:
                     targets=targets,
                     force_off=force_off,
                 )
+
+    def _ac_setpoint_limit(self, current_temp: float | None, effective_target: float) -> float:
+        """How far past the room target an AC setpoint may be pushed (°C).
+
+        A climate entity's setpoint is not a power dial. Unlike a TRV — whose
+        valve position really does track the setpoint — an AC has its own
+        thermostat and runs its compressor flat out until *that* setpoint is
+        reached. Commanding 17°C because the room sits 0.1°C above a 22°C
+        target therefore does not mean "a bit of cooling", it means "cool the
+        room to 17", and the room overshoots the target before the next
+        evaluation pulls the setpoint back.
+
+        So the excursion is bounded by the error actually being corrected,
+        on top of the comfort/efficiency cap: a small error may only ever buy
+        a small excursion, at any slider position. The floor keeps enough
+        authority for the unit to run at all when the room is right at target
+        (device internal sensors are rarely in exact agreement with the room
+        sensor).
+        """
+        if current_temp is None:
+            return self._ac_boost_delta
+        error = abs(current_temp - effective_target)
+        return min(
+            self._ac_boost_delta,
+            max(AC_SETPOINT_ERROR_FLOOR_C, AC_SETPOINT_ERROR_GAIN * error),
+        )
 
     def _proportional_deadband(self, eid: str, current_temp: float | None, effective_target: float) -> float | None:
         """Deadband threshold for a proportional setpoint send, or None to disable.
