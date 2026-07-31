@@ -954,14 +954,22 @@ class MPCController:
 
         min_run = get_min_run_blocks(self._heating_system_type, PLAN_DT_MINUTES)
 
+        # Outdoor gating on an *unknown* outdoor temperature would gate on
+        # DEFAULT_OUTDOOR_TEMP_FALLBACK, which sits below the cooling minimum —
+        # a room with no outdoor sensor would be permanently barred from
+        # cooling on the strength of a placeholder. get_can_heat_cool() already
+        # declines to gate when the reading is absent; match it here.
+        gate_cooling_min = self.outdoor_cooling_min if self.outdoor_temp is not None else float("-inf")
+        gate_heating_max = self.outdoor_heating_max if self.outdoor_temp is not None else float("inf")
+
         optimizer = MPCOptimizer(
             model=model,
             can_heat=can_heat,
             can_cool=can_cool,
             w_comfort=self._w_comfort,
             w_energy=self._w_energy,
-            outdoor_cooling_min=self.outdoor_cooling_min,
-            outdoor_heating_max=self.outdoor_heating_max,
+            outdoor_cooling_min=gate_cooling_min,
+            outdoor_heating_max=gate_heating_max,
             min_run_blocks=min_run,
             override_active=is_override_active(self.room_config),
             heating_system_type=self._heating_system_type,

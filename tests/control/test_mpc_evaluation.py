@@ -1066,3 +1066,25 @@ async def test_both_targets_absent_still_idles():
     mode, pf = await ctrl.async_evaluate(current_temp=22.6, targets=TargetTemps(heat=None, cool=None))
     assert mode == MODE_IDLE
     assert pf == 0.0
+
+
+@pytest.mark.asyncio
+async def test_unknown_outdoor_temp_does_not_gate_cooling():
+    """No outdoor sensor must not mean "never cool".
+
+    The MPC horizon falls back to DEFAULT_OUTDOOR_TEMP_FALLBACK (10 °C), which
+    is below DEFAULT_OUTDOOR_COOLING_MIN (16 °C), so gating on it barred any
+    room without an outdoor sensor from ever cooling.
+    """
+    ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=None)
+    mode, pf = await ctrl.async_evaluate(current_temp=22.6, targets=TargetTemps(heat=None, cool=22.0))
+    assert mode == MODE_COOLING
+    assert pf > 0.0
+
+
+@pytest.mark.asyncio
+async def test_known_cold_outdoor_temp_still_gates_cooling():
+    """A real reading below the cooling minimum must still block cooling."""
+    ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=10.0)
+    mode, _ = await ctrl.async_evaluate(current_temp=22.6, targets=TargetTemps(heat=None, cool=22.0))
+    assert mode == MODE_IDLE
