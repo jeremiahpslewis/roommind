@@ -178,6 +178,13 @@ class MPCOptimizer:
             # Compute proportional power fraction for this block
             # Use heat target for heating power, cool target for cooling power
             pf_target = heat_tgt if best_action == MODE_HEATING else cool_tgt
+            if not math.isfinite(pf_target):
+                # The side this action serves has no target at all (open
+                # dead-band edge). Reachable only via a min_run continuation
+                # into a block where the schedule has since turned this side
+                # off — there is nothing to aim at, so stop acting.
+                best_action = MODE_IDLE
+                pf_target = current_temp
             pf, _ = self.compute_optimal_power(
                 current_temp,
                 T_out,

@@ -6,7 +6,14 @@ import math
 
 import pytest
 
-from custom_components.roommind.const import MIN_POWER_FRACTION, MODE_COOLING, MODE_HEATING
+from custom_components.roommind.const import (
+    MIN_POWER_FRACTION,
+    MODE_COOLING,
+    MODE_HEATING,
+    MODE_IDLE,
+    NO_COOL_TARGET,
+    NO_HEAT_TARGET,
+)
 from custom_components.roommind.control.mpc_optimizer import MPCOptimizer, MPCPlan
 from custom_components.roommind.control.thermal_model import RCModel
 
@@ -851,3 +858,53 @@ def test_efficiency_slider_is_not_more_aggressive_than_comfort():
         )
         fractions.append(plan.get_current_power_fraction())
     assert fractions == sorted(fractions)
+
+
+def test_absent_heat_target_does_not_drag_the_cool_target_up():
+    """The inversion clamp must not fire against an open dead-band edge."""
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    opt = MPCOptimizer(model=model, can_heat=False, can_cool=True, min_run_blocks=2)
+    n = 24
+    plan = opt.optimize(
+        T_room=24.0,
+        T_outdoor_series=[30.0] * n,
+        heat_target_series=[NO_HEAT_TARGET] * n,
+        cool_target_series=[21.5] * n,
+        dt_minutes=5.0,
+    )
+    assert plan.get_current_action() == MODE_COOLING
+    assert plan.get_current_power_fraction() > 0.0
+
+
+def test_open_edges_on_both_sides_idle():
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    opt = MPCOptimizer(model=model, min_run_blocks=2)
+    n = 12
+    plan = opt.optimize(
+        T_room=24.0,
+        T_outdoor_series=[30.0] * n,
+        heat_target_series=[NO_HEAT_TARGET] * n,
+        cool_target_series=[NO_COOL_TARGET] * n,
+        dt_minutes=5.0,
+    )
+    assert plan.get_current_action() == MODE_IDLE
+    assert plan.get_current_power_fraction() == 0.0
+    assert all(math.isfinite(t) for t in plan.temperatures)
+
+
+def test_target_turning_off_mid_horizon_produces_finite_plan():
+    """A min_run continuation into an untargeted block must not emit inf/NaN."""
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    opt = MPCOptimizer(model=model, can_heat=False, can_cool=True, min_run_blocks=4)
+    n = 12
+    plan = opt.optimize(
+        T_room=25.0,
+        T_outdoor_series=[32.0] * n,
+        heat_target_series=[NO_HEAT_TARGET] * n,
+        # Cooling is demanded for one block, then the schedule turns it off.
+        cool_target_series=[21.0] + [NO_COOL_TARGET] * (n - 1),
+        dt_minutes=5.0,
+    )
+    assert all(math.isfinite(t) for t in plan.temperatures)
+    assert all(math.isfinite(p) for p in plan.power_fractions)
+    assert all(0.0 <= p <= 1.0 for p in plan.power_fractions)

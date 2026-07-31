@@ -32,6 +32,8 @@ from ..const import (
     MODE_COOLING,
     MODE_HEATING,
     MODE_IDLE,
+    NO_COOL_TARGET,
+    NO_HEAT_TARGET,
     PROPORTIONAL_DEADBAND_C,
     PROPORTIONAL_DEADBAND_NEAR_TARGET_C,
     TargetTemps,
@@ -916,8 +918,17 @@ class MPCController:
         occupancy_series = [self.q_occupancy] * horizon_blocks
 
         # Build dual target series with schedule lookahead for pre-heating/pre-cooling.
-        # None values (from "off" action) are replaced with current_temp so the
-        # optimizer sees "no deviation needed = idle optimal".
+        #
+        # An absent target means "never act on this side", which is an *open*
+        # dead-band edge: -inf below (never too cold) or +inf above (never too
+        # warm). It must not be filled with current_temp. A synthesized heat
+        # target that tracks the room feeds the optimizer's "cool must be >=
+        # heat" clamp, which then drags the real cool target up to the room's
+        # own temperature — the room can never be above target, so a cool-only
+        # room idles forever while sitting above its setpoint.
+        #
+        # Infinities keep both the clamp and the dead-band cost correct, and
+        # both-absent still reduces to "no deviation anywhere = idle optimal".
         if self._target_resolver is not None:
             now = time.time()
             dt_seconds = PLAN_DT_MINUTES * 60
@@ -925,16 +936,17 @@ class MPCController:
             # Extract separate heat and cool series from TargetTemps
             if raw_targets and isinstance(raw_targets[0], TargetTemps):
                 tt_targets = cast(list[TargetTemps], raw_targets)
-                heat_target_series = [t.heat if t.heat is not None else current_temp for t in tt_targets]
-                cool_target_series = [t.cool if t.cool is not None else current_temp for t in tt_targets]
+                heat_target_series = [t.heat if t.heat is not None else NO_HEAT_TARGET for t in tt_targets]
+                cool_target_series = [t.cool if t.cool is not None else NO_COOL_TARGET for t in tt_targets]
             else:
-                # Legacy resolver returning float|None
+                # Legacy resolver returning float|None — a single target drives
+                # both sides, so an absent value opens both edges.
                 float_targets = cast(list[float | None], raw_targets)
-                heat_target_series = [t if t is not None else current_temp for t in float_targets]
-                cool_target_series = list(heat_target_series)
+                heat_target_series = [t if t is not None else NO_HEAT_TARGET for t in float_targets]
+                cool_target_series = [t if t is not None else NO_COOL_TARGET for t in float_targets]
         else:
-            fallback_h = targets.heat if targets.heat is not None else current_temp
-            fallback_c = targets.cool if targets.cool is not None else current_temp
+            fallback_h = targets.heat if targets.heat is not None else NO_HEAT_TARGET
+            fallback_c = targets.cool if targets.cool is not None else NO_COOL_TARGET
             heat_target_series = [fallback_h] * horizon_blocks
             cool_target_series = [fallback_c] * horizon_blocks
 

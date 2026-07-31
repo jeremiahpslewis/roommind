@@ -82,6 +82,13 @@ AC_SETPOINT_ERROR_GAIN_MIN = 0.5  # At comfort_weight=0 (full efficiency): gap =
 AC_SETPOINT_ERROR_GAIN_MAX = 1.5  # At comfort_weight=100 (full comfort): gap = 2.5 × error
 AC_SETPOINT_ERROR_FLOOR_MIN_C = 0.3  # Minimum excursion (°C) at full efficiency, so the unit still runs at target
 AC_SETPOINT_ERROR_FLOOR_MAX_C = 0.8  # Minimum excursion (°C) at full comfort
+# Sentinels for an absent heat/cool target. An absent target is an *open*
+# dead-band edge ("never act on this side"), not a target equal to the room
+# temperature — a moving sentinel gets dragged into the "cool must be >= heat"
+# clamp and silently rewrites the real target on the other side.
+NO_HEAT_TARGET = float("-inf")  # never too cold -> heating never demanded
+NO_COOL_TARGET = float("inf")  # never too warm -> cooling never demanded
+
 # Single ceiling on the learned gap the AC may be commanded to open up. The
 # response curve saturates well before this on most units; this exists so an
 # unidentified or badly-fitted curve can never ask for an extreme setpoint.
