@@ -716,3 +716,145 @@ async def test_call_deadband_converts_to_fahrenheit_units():
     )
     sent = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
     assert len(sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# Release-position anchoring (cold-evening AC overshoot fix)
+# ---------------------------------------------------------------------------
+
+
+def _make_cooling_ctrl():
+    hass = build_hass()
+    ac_state = MagicMock()
+    ac_state.state = "cool"
+    ac_state.attributes = {"hvac_modes": ["cool", "off"], "temperature": 20.0, "min_temp": 16.0, "max_temp": 30.0}
+    hass.states.get = MagicMock(return_value=ac_state)
+    room = make_room(thermostats=[], acs=["climate.ac"])
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=18.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    return hass, ctrl
+
+
+@pytest.mark.asyncio
+async def test_ac_cooling_releases_when_room_below_target():
+    """Room below cool target with low power: setpoint anchors at target, above room temp.
+
+    Cold-evening scenario: ventilation already cools the room below the target
+    while the AC is held in a cooling run. The old anchor (current_temp) kept
+    the commanded setpoint at or below the falling room temperature, so the AC
+    could never release and chased the room downward.
+    """
+    hass, ctrl = _make_cooling_ctrl()
+    # anchor = max(20.0, 21.0) = 21.0 → 21.0 - 0.1*(21.0-16) = 20.5
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.1, current_temp=20.0)
+
+    calls = hass.services.async_call.call_args_list
+    temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
+    assert temp_calls
+    sp = temp_calls[0][0][2]["temperature"]
+    assert sp == 20.5
+    # The commanded setpoint must sit above the room temperature so the AC can stop
+    assert sp > 20.0
+
+
+@pytest.mark.asyncio
+async def test_ac_cooling_zero_power_releases_at_target():
+    """Zero cooling demand while below target: setpoint == target (full release)."""
+    hass, ctrl = _make_cooling_ctrl()
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
+
+    calls = hass.services.async_call.call_args_list
+    temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
+    assert any(c[0][2]["temperature"] == 21.0 for c in temp_calls)
+
+
+@pytest.mark.asyncio
+async def test_ac_cooling_full_power_below_target_still_boosts():
+    """Deliberate pre-cooling (pf=1.0) below target still commands the boost setpoint."""
+    hass, ctrl = _make_cooling_ctrl()
+    await ctrl.async_apply("cooling", 21.0, power_fraction=1.0, current_temp=20.0)
+
+    calls = hass.services.async_call.call_args_list
+    temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
+    # anchor - 1.0*(anchor - boost) = boost = device min_temp (16.0)
+    assert any(c[0][2]["temperature"] == 16.0 for c in temp_calls)
+
+
+@pytest.mark.asyncio
+async def test_trv_heating_releases_when_room_above_target():
+    """Heating mirror: room above heat target with zero power → setpoint == target."""
+    hass = build_hass()
+    trv_state = MagicMock()
+    trv_state.state = "heat"
+    trv_state.attributes = {"hvac_modes": ["heat", "off"], "temperature": 22.0, "min_temp": 5.0, "max_temp": 30.0}
+    hass.states.get = MagicMock(return_value=trv_state)
+    room = make_room()
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=5.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    # Old anchor kept the setpoint at the room temp (22.0), continuing to heat past target
+    await ctrl.async_apply("heating", 21.0, power_fraction=0.0, current_temp=22.0)
+
+    calls = hass.services.async_call.call_args_list
+    temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
+    assert any(c[0][2]["temperature"] == 21.0 for c in temp_calls)
+
+
+@pytest.mark.asyncio
+async def test_ac_heating_releases_when_room_above_target():
+    """Heating mirror for ACs: room above heat target with zero power → setpoint == target."""
+    hass = build_hass()
+    ac_state = MagicMock()
+    ac_state.state = "heat"
+    ac_state.attributes = {"hvac_modes": ["heat", "off"], "temperature": 22.0, "min_temp": 16.0, "max_temp": 30.0}
+    hass.states.get = MagicMock(return_value=ac_state)
+    room = make_room(thermostats=[], acs=["climate.ac"])
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=5.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    await ctrl.async_apply("heating", 21.0, power_fraction=0.0, current_temp=22.0)
+
+    calls = hass.services.async_call.call_args_list
+    temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
+    assert any(c[0][2]["temperature"] == 21.0 for c in temp_calls)
+
+
+@pytest.mark.asyncio
+async def test_trv_heating_full_power_above_target_still_boosts():
+    """Deliberate pre-heating (pf=1.0) above target still commands the boost setpoint."""
+    hass = build_hass()
+    trv_state = MagicMock()
+    trv_state.state = "heat"
+    trv_state.attributes = {"hvac_modes": ["heat", "off"], "temperature": 22.0, "min_temp": 5.0, "max_temp": 30.0}
+    hass.states.get = MagicMock(return_value=trv_state)
+    room = make_room()
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=5.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    await ctrl.async_apply("heating", 21.0, power_fraction=1.0, current_temp=22.0)
+
+    calls = hass.services.async_call.call_args_list
+    temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
+    # anchor + 1.0*(boost - anchor) = boost = device max_temp (30.0)
+    assert any(c[0][2]["temperature"] == 30.0 for c in temp_calls)

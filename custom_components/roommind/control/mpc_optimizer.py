@@ -144,9 +144,11 @@ class MPCOptimizer:
                 available.append(MODE_COOLING)
 
             # If in a run and below min_run_blocks, must continue
+            forced_continuation = False
             if current_mode != MODE_IDLE and blocks_in_mode < self.min_run_blocks:
                 if current_mode in available:
                     best_action = current_mode
+                    forced_continuation = True
                 else:
                     best_action = MODE_IDLE  # forced off by constraint
             else:
@@ -178,7 +180,7 @@ class MPCOptimizer:
             # Compute proportional power fraction for this block
             # Use heat target for heating power, cool target for cooling power
             pf_target = heat_tgt if best_action == MODE_HEATING else cool_tgt
-            pf, _ = self.compute_optimal_power(
+            pf, pf_mode = self.compute_optimal_power(
                 current_temp,
                 T_out,
                 pf_target,
@@ -189,8 +191,17 @@ class MPCOptimizer:
             )
             if best_action == MODE_IDLE:
                 pf = 0.0
-            elif best_action != MODE_IDLE and pf == 0.0:
-                pf = 1.0  # min_run_blocks enforcement: keep full power
+            elif pf_mode != best_action:
+                # No same-direction analytic demand this block. Opposite-direction
+                # demand means the room is already past the target in the action's
+                # direction (e.g. AC still in a min-run hold while a cold evening
+                # drifts the room below the cool target) — command zero power so
+                # the device self-regulates at the target instead of being driven
+                # further past it. Zero (idle) demand on a deliberately chosen
+                # active block is future-driven pre-heating/pre-cooling and keeps
+                # full power.
+                opposite = MODE_COOLING if best_action == MODE_HEATING else MODE_HEATING
+                pf = 0.0 if (forced_continuation or pf_mode == opposite) else 1.0
 
             # Apply action with proportional Q for accurate forward prediction
             if best_action == MODE_HEATING:

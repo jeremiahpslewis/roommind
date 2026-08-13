@@ -1340,14 +1340,18 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             boost = device_max_temp if device_max_temp is not None else default_boost
             if not has_thermostats and not has_acs:
                 return None
-            sp = round(current_temp + power_fraction * (boost - current_temp), 1)
+            # Release-position anchor — must mirror mpc_controller.async_apply
+            anchor = min(current_temp, target_temp)
+            sp = round(anchor + power_fraction * (boost - anchor), 1)
             sp = max(target_temp, sp)
             sp = min(boost, sp)
             return sp
 
         if mode == MODE_COOLING and has_acs:
             boost = device_min_temp if device_min_temp is not None else AC_COOLING_BOOST_TARGET
-            sp = round(current_temp - power_fraction * (current_temp - boost), 1)
+            # Release-position anchor — must mirror mpc_controller.async_apply
+            anchor = max(current_temp, target_temp)
+            sp = round(anchor - power_fraction * (anchor - boost), 1)
             sp = max(boost, sp)
             sp = min(target_temp, sp)
             return sp

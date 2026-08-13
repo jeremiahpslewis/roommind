@@ -1502,8 +1502,14 @@ class MPCController:
         if mode == MODE_HEATING:
             # Proportional TRV setpoint for Full Control mode
             if self.has_external_sensor and current_temp is not None:
+                # Anchor at the release position: when the room is already at or
+                # above the target, the zero-power setpoint is the target itself
+                # (below the room temperature, so the device can actually stop
+                # heating) instead of the room temperature, which would keep the
+                # device running and chase the room upward during min-run holds.
+                heat_anchor = min(current_temp, effective_target)
                 trv_target = round(
-                    current_temp + power_fraction * (trv_heat_boost - current_temp),
+                    heat_anchor + power_fraction * (trv_heat_boost - heat_anchor),
                     1,
                 )
                 # Floor: never below target (TRV must always aim to heat toward target)
@@ -1528,8 +1534,9 @@ class MPCController:
                 )
             # ACs: proportional setpoint in Full Control, actual target otherwise
             if self.has_external_sensor and current_temp is not None:
+                heat_anchor = min(current_temp, effective_target)
                 ac_heat_target = round(
-                    current_temp + power_fraction * (ac_heat_boost - current_temp),
+                    heat_anchor + power_fraction * (ac_heat_boost - heat_anchor),
                     1,
                 )
                 ac_heat_target = max(effective_target, ac_heat_target)
@@ -1565,8 +1572,15 @@ class MPCController:
                     await self._call("set_hvac_mode", {"entity_id": eid, "hvac_mode": "off"})
         elif mode == MODE_COOLING:
             if self.has_external_sensor and current_temp is not None:
+                # Anchor at the release position: when the room is already at or
+                # below the target (cold evening, ventilation providing cooling),
+                # the zero-power setpoint is the target itself — above the room
+                # temperature, so the AC can actually stop cooling. Anchoring at
+                # the room temperature would keep the setpoint at or below it and
+                # chase the falling room downward, exacerbating overshoot.
+                cool_anchor = max(current_temp, effective_target)
                 ac_cool_target = round(
-                    current_temp - power_fraction * (current_temp - ac_cool_boost),
+                    cool_anchor - power_fraction * (cool_anchor - ac_cool_boost),
                     1,
                 )
                 ac_cool_target = max(ac_cool_boost, effective_target - self._ac_boost_delta, ac_cool_target)

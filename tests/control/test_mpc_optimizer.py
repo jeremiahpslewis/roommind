@@ -792,3 +792,58 @@ def test_approach_rate_widens_cooling_band_symmetrically():
     assert m1 == MODE_COOLING and m2 == MODE_COOLING
     assert pf_gentle < pf_full
     assert pf_gentle >= MIN_POWER_FRACTION
+
+
+# ---------------------------------------------------------------------------
+# Counter-demand power fraction (cold-evening AC overshoot fix)
+# ---------------------------------------------------------------------------
+
+
+def test_min_run_hold_with_counter_demand_gets_zero_power():
+    """A forced min-run cooling continuation with the room already below the
+    cool target must command zero power, not full power.
+
+    Cold-evening scenario: the room starts just above the cool target, one
+    cooling block drives it below target, and min_run forces the run to
+    continue. The analytic demand now points the other way (heating), which
+    previously was either misapplied as a cooling fraction or bumped to full
+    power — driving the room further below target.
+    """
+    # C=1-normalized model (as the EKF produces) with a strong AC:
+    # one full-power block drives the room past the cool target.
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=14.0)
+    opt = MPCOptimizer(model, can_heat=True, can_cool=True, min_run_blocks=3)
+    plan = opt.optimize(
+        T_room=22.0,
+        T_outdoor_series=[20.5] * 12,
+        heat_target_series=[19.0] * 12,
+        cool_target_series=[21.0] * 12,
+        dt_minutes=5,
+    )
+    assert plan.actions[0] == "cooling"
+    assert plan.power_fractions[0] > 0.0
+    # Proportional power lands the room at the target after one block
+    assert plan.temperatures[1] == pytest.approx(21.0, abs=0.1)
+    # The forced min-run continuation must not keep cooling the room down:
+    # the run stays alive, but at zero power. The old code bumped pf to 1.0
+    # here, driving the planned trajectory ~1°C+ below target per block.
+    assert plan.actions[1] == "cooling"
+    assert plan.power_fractions[1] == 0.0
+    assert min(plan.temperatures) > 20.5
+
+
+def test_preheat_zero_demand_keeps_full_power():
+    """A deliberately chosen heating block with zero instantaneous demand
+    (schedule-driven pre-heating) keeps full power."""
+    model = RCModel(C=200.0, U=50.0, Q_heat=1000.0, Q_cool=1500.0)
+    opt = MPCOptimizer(model)
+    targets = [17.0] * 6 + [21.0] * 18
+    plan = opt.optimize(
+        T_room=17.0,
+        T_outdoor_series=[17.0] * 24,
+        heat_target_series=targets,
+        dt_minutes=5,
+    )
+    first_heat = next(i for i, a in enumerate(plan.actions) if a == "heating")
+    assert first_heat < 6  # pre-heating starts before the target rises
+    assert plan.power_fractions[first_heat] == 1.0
