@@ -51,6 +51,13 @@ def celsius_delta_to_ha(hass: HomeAssistant, delta: float) -> float:
     return delta
 
 
+def ha_delta_to_celsius(hass: HomeAssistant, delta: float) -> float:
+    """Convert a temperature delta from the HA unit system to Celsius (factor only)."""
+    if hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
+        return delta * 5 / 9
+    return delta
+
+
 def ha_temp_unit_str(hass: HomeAssistant) -> str:
     """Return '°C' or '°F' based on HA config."""
     if hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:

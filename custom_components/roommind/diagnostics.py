@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, VERSION
 from .control.mpc_controller import _last_commands
+from .utils.device_utils import get_ac_eids
 
 
 def _build_model_info(estimator: Any) -> dict[str, Any]:
@@ -232,6 +233,38 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
             "config": dict(config),
             "live": live_diag,
         }
+
+        # Learned AC head-gap response, per device and mode. This is what
+        # decides the commanded setpoint once identified, so it needs to be
+        # inspectable: the knot values are the curve, gap_spread says whether it
+        # has seen enough different operating points to be invertible, and
+        # driving_setpoints reports whether it is actually in charge yet.
+        if coordinator:
+            gap_diag: dict[str, Any] = {}
+            for eid in get_ac_eids(config.get("devices", [])):
+                offset = coordinator._gap_manager.offset(eid)
+                per_mode: dict[str, Any] = {}
+                for gap_mode in ("cooling", "heating"):
+                    curve = coordinator._gap_manager.curve(eid, gap_mode)
+                    if curve.n_observations == 0:
+                        continue
+                    per_mode[gap_mode] = {
+                        "knots_K": curve.knots,
+                        "rate_degC_per_h": [round(v, 3) for v in curve.values],
+                        "samples_per_knot": curve.counts,
+                        "n_observations": curve.n_observations,
+                        "gap_spread_K": round(curve.gap_spread, 2),
+                        "identified_knots": curve.identified_knots,
+                        "driving_setpoints": curve.is_confident(),
+                    }
+                if per_mode or offset.n_running or offset.n_idle:
+                    gap_diag[eid] = {
+                        "head_offset": offset.to_dict(),
+                        "commanding_offset_C": offset.commanding_offset(),
+                        "response": per_mode,
+                    }
+            if gap_diag:
+                room_diag["gap_response"] = gap_diag
 
         # Device entity states
         devices = config.get("devices", [])

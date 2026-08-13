@@ -6,7 +6,14 @@ import math
 
 import pytest
 
-from custom_components.roommind.const import MIN_POWER_FRACTION, MODE_COOLING, MODE_HEATING
+from custom_components.roommind.const import (
+    MIN_POWER_FRACTION,
+    MODE_COOLING,
+    MODE_HEATING,
+    MODE_IDLE,
+    NO_COOL_TARGET,
+    NO_HEAT_TARGET,
+)
 from custom_components.roommind.control.mpc_optimizer import MPCOptimizer, MPCPlan
 from custom_components.roommind.control.thermal_model import RCModel
 
@@ -847,3 +854,112 @@ def test_preheat_zero_demand_keeps_full_power():
     first_heat = next(i for i, a in enumerate(plan.actions) if a == "heating")
     assert first_heat < 6  # pre-heating starts before the target rises
     assert plan.power_fractions[first_heat] == 1.0
+
+
+def test_zero_demand_block_falls_back_to_min_power_not_full_power():
+    """A block the analytical power law prices at zero must not run at full power.
+
+    At the efficiency end of the slider the energy bias cancels the small
+    residual demand of a near-target block, so compute_optimal_power returns
+    IDLE while the lookahead still wants COOLING. Falling back to 1.0 there
+    made maximum efficiency the most aggressive setting.
+    """
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    opt = MPCOptimizer(
+        model=model,
+        can_heat=False,
+        can_cool=True,
+        w_comfort=1.0,  # comfort_weight = 0
+        w_energy=10.0,
+        min_run_blocks=2,
+        approach_rate=0.2,
+    )
+    n = 24
+    plan = opt.optimize(
+        T_room=22.1,
+        T_outdoor_series=[30.0] * n,
+        heat_target_series=[18.0] * n,
+        cool_target_series=[22.0] * n,
+        dt_minutes=5.0,
+    )
+    # Sanity: the block really does exercise the zero-demand path
+    pf_analytic, _ = opt.compute_optimal_power(22.1, 30.0, 22.0, 5.0)
+    assert pf_analytic == 0.0
+
+    assert plan.get_current_action() == MODE_COOLING
+    assert plan.get_current_power_fraction() == MIN_POWER_FRACTION
+
+
+def test_efficiency_slider_is_not_more_aggressive_than_comfort():
+    """Power demand for a near-target block must be monotone in comfort_weight."""
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    n = 24
+    fractions = []
+    for w_comfort, w_energy, approach in ((1.0, 10.0, 0.2), (5.0, 5.0, 0.77), (10.0, 1.0, 1.0)):
+        plan = MPCOptimizer(
+            model=model,
+            can_heat=False,
+            can_cool=True,
+            w_comfort=w_comfort,
+            w_energy=w_energy,
+            min_run_blocks=2,
+            approach_rate=approach,
+        ).optimize(
+            T_room=22.1,
+            T_outdoor_series=[30.0] * n,
+            heat_target_series=[18.0] * n,
+            cool_target_series=[22.0] * n,
+            dt_minutes=5.0,
+        )
+        fractions.append(plan.get_current_power_fraction())
+    assert fractions == sorted(fractions)
+
+
+def test_absent_heat_target_does_not_drag_the_cool_target_up():
+    """The inversion clamp must not fire against an open dead-band edge."""
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    opt = MPCOptimizer(model=model, can_heat=False, can_cool=True, min_run_blocks=2)
+    n = 24
+    plan = opt.optimize(
+        T_room=24.0,
+        T_outdoor_series=[30.0] * n,
+        heat_target_series=[NO_HEAT_TARGET] * n,
+        cool_target_series=[21.5] * n,
+        dt_minutes=5.0,
+    )
+    assert plan.get_current_action() == MODE_COOLING
+    assert plan.get_current_power_fraction() > 0.0
+
+
+def test_open_edges_on_both_sides_idle():
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    opt = MPCOptimizer(model=model, min_run_blocks=2)
+    n = 12
+    plan = opt.optimize(
+        T_room=24.0,
+        T_outdoor_series=[30.0] * n,
+        heat_target_series=[NO_HEAT_TARGET] * n,
+        cool_target_series=[NO_COOL_TARGET] * n,
+        dt_minutes=5.0,
+    )
+    assert plan.get_current_action() == MODE_IDLE
+    assert plan.get_current_power_fraction() == 0.0
+    assert all(math.isfinite(t) for t in plan.temperatures)
+
+
+def test_target_turning_off_mid_horizon_produces_finite_plan():
+    """A min_run continuation into an untargeted block must not emit inf/NaN."""
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    opt = MPCOptimizer(model=model, can_heat=False, can_cool=True, min_run_blocks=4)
+    n = 12
+    plan = opt.optimize(
+        T_room=25.0,
+        T_outdoor_series=[32.0] * n,
+        heat_target_series=[NO_HEAT_TARGET] * n,
+        # Cooling is demanded for one block, then the schedule turns it off.
+        cool_target_series=[21.0] + [NO_COOL_TARGET] * (n - 1),
+        dt_minutes=5.0,
+    )
+    assert all(math.isfinite(t) for t in plan.temperatures)
+    assert all(math.isfinite(p) for p in plan.power_fractions)
+    assert all(0.0 <= p <= 1.0 for p in plan.power_fractions)

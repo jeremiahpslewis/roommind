@@ -180,6 +180,13 @@ class MPCOptimizer:
             # Compute proportional power fraction for this block
             # Use heat target for heating power, cool target for cooling power
             pf_target = heat_tgt if best_action == MODE_HEATING else cool_tgt
+            if not math.isfinite(pf_target):
+                # The side this action serves has no target at all (open
+                # dead-band edge). Reachable only via a min_run continuation
+                # into a block where the schedule has since turned this side
+                # off — there is nothing to aim at, so stop acting.
+                best_action = MODE_IDLE
+                pf_target = current_temp
             pf, pf_mode = self.compute_optimal_power(
                 current_temp,
                 T_out,
@@ -192,16 +199,25 @@ class MPCOptimizer:
             if best_action == MODE_IDLE:
                 pf = 0.0
             elif pf_mode != best_action:
-                # No same-direction analytic demand this block. Opposite-direction
-                # demand means the room is already past the target in the action's
-                # direction (e.g. AC still in a min-run hold while a cold evening
-                # drifts the room below the cool target) — command zero power so
-                # the device self-regulates at the target instead of being driven
-                # further past it. Zero (idle) demand on a deliberately chosen
-                # active block is future-driven pre-heating/pre-cooling and keeps
-                # full power.
+                # No same-direction analytic demand this block.
+                # Forced min-run continuations and opposite-direction demand
+                # (the room is already past the target in the action's
+                # direction — e.g. a cold evening drifting the room below the
+                # cool target during an AC min-run hold) command zero power:
+                # the device stays in its run and self-regulates at target.
+                # A deliberately chosen active block with zero (idle) demand
+                # is future-driven: schedule pre-heating needs full power to
+                # charge slow thermal mass, while cooling holds at the minimum
+                # non-zero power — the energy bias zeroes Q_required in
+                # exactly the near-target cases, where full power made the
+                # efficiency end of the slider the *most* aggressive setting.
                 opposite = MODE_COOLING if best_action == MODE_HEATING else MODE_HEATING
-                pf = 0.0 if (forced_continuation or pf_mode == opposite) else 1.0
+                if forced_continuation or pf_mode == opposite:
+                    pf = 0.0
+                elif best_action == MODE_HEATING:
+                    pf = 1.0
+                else:
+                    pf = MIN_POWER_FRACTION
 
             # Apply action with proportional Q for accurate forward prediction
             if best_action == MODE_HEATING:

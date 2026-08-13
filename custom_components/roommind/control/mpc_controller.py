@@ -15,6 +15,11 @@ from ..const import (
     AC_BOOST_DELTA_MIN,
     AC_COOLING_BOOST_TARGET,
     AC_HEATING_BOOST_TARGET,
+    AC_MAX_HEAD_GAP_C,
+    AC_SETPOINT_ERROR_FLOOR_MAX_C,
+    AC_SETPOINT_ERROR_FLOOR_MIN_C,
+    AC_SETPOINT_ERROR_GAIN_MAX,
+    AC_SETPOINT_ERROR_GAIN_MIN,
     APPROACH_RATE_MIN,
     BANGBANG_COOL_HYSTERESIS,
     BANGBANG_HEAT_HYSTERESIS,
@@ -27,6 +32,8 @@ from ..const import (
     MODE_COOLING,
     MODE_HEATING,
     MODE_IDLE,
+    NO_COOL_TARGET,
+    NO_HEAT_TARGET,
     PROPORTIONAL_DEADBAND_C,
     PROPORTIONAL_DEADBAND_NEAR_TARGET_C,
     TargetTemps,
@@ -45,7 +52,8 @@ from ..utils.device_utils import (
     get_trv_eids,
     has_reliable_hvac_modes,
 )
-from ..utils.temp_utils import celsius_delta_to_ha, celsius_to_ha_temp
+from ..utils.temp_utils import celsius_delta_to_ha, celsius_to_ha_temp, ha_delta_to_celsius
+from .gap_response import GapResponseManager
 from .mpc_optimizer import MPCOptimizer, MPCPlan
 from .residual_heat import get_min_run_blocks
 from .thermal_model import RoomModelManager
@@ -736,6 +744,7 @@ class MPCController:
         mode_on_since: float | None = None,
         shading_factor: float = 1.0,
         q_occupancy: float = 0.0,
+        gap_manager: GapResponseManager | None = None,
     ) -> None:
         self.hass = hass
         self.room_config = room_config
@@ -749,6 +758,7 @@ class MPCController:
         self.previous_mode = previous_mode
         self.has_external_sensor = has_external_sensor
         self._model_manager = model_manager
+        self._gap_manager = gap_manager
         self._area_id = room_config.get("area_id", "unknown")
         self._target_resolver = target_resolver
         self.last_plan: MPCPlan | None = None
@@ -774,9 +784,20 @@ class MPCController:
         self._w_comfort = max(1.0, cw / 10.0)
         self._w_energy = max(1.0, (100 - cw) / 10.0)
         self._approach_rate = min(1.0, APPROACH_RATE_MIN + (1.0 - APPROACH_RATE_MIN) * cw / DEFAULT_COMFORT_WEIGHT)
-        self._ac_boost_delta = min(
+        self._ac_boost_delta: float = min(
             AC_BOOST_DELTA_MAX,
             AC_BOOST_DELTA_MIN + (AC_BOOST_DELTA_MAX - AC_BOOST_DELTA_MIN) * cw / DEFAULT_COMFORT_WEIGHT,
+        )
+        # Near-target AC setpoint authority. Interpolated over the full slider
+        # range: _ac_boost_delta and _approach_rate both saturate at
+        # DEFAULT_COMFORT_WEIGHT, which left the comfort half of the slider with
+        # no effect at all on the setpoint a room close to target receives.
+        cw_frac = max(0.0, min(1.0, cw / 100.0))
+        self._ac_setpoint_gain: float = (
+            AC_SETPOINT_ERROR_GAIN_MIN + (AC_SETPOINT_ERROR_GAIN_MAX - AC_SETPOINT_ERROR_GAIN_MIN) * cw_frac
+        )
+        self._ac_setpoint_floor: float = (
+            AC_SETPOINT_ERROR_FLOOR_MIN_C + (AC_SETPOINT_ERROR_FLOOR_MAX_C - AC_SETPOINT_ERROR_FLOOR_MIN_C) * cw_frac
         )
 
     async def async_evaluate(
@@ -897,8 +918,17 @@ class MPCController:
         occupancy_series = [self.q_occupancy] * horizon_blocks
 
         # Build dual target series with schedule lookahead for pre-heating/pre-cooling.
-        # None values (from "off" action) are replaced with current_temp so the
-        # optimizer sees "no deviation needed = idle optimal".
+        #
+        # An absent target means "never act on this side", which is an *open*
+        # dead-band edge: -inf below (never too cold) or +inf above (never too
+        # warm). It must not be filled with current_temp. A synthesized heat
+        # target that tracks the room feeds the optimizer's "cool must be >=
+        # heat" clamp, which then drags the real cool target up to the room's
+        # own temperature — the room can never be above target, so a cool-only
+        # room idles forever while sitting above its setpoint.
+        #
+        # Infinities keep both the clamp and the dead-band cost correct, and
+        # both-absent still reduces to "no deviation anywhere = idle optimal".
         if self._target_resolver is not None:
             now = time.time()
             dt_seconds = PLAN_DT_MINUTES * 60
@@ -906,16 +936,17 @@ class MPCController:
             # Extract separate heat and cool series from TargetTemps
             if raw_targets and isinstance(raw_targets[0], TargetTemps):
                 tt_targets = cast(list[TargetTemps], raw_targets)
-                heat_target_series = [t.heat if t.heat is not None else current_temp for t in tt_targets]
-                cool_target_series = [t.cool if t.cool is not None else current_temp for t in tt_targets]
+                heat_target_series = [t.heat if t.heat is not None else NO_HEAT_TARGET for t in tt_targets]
+                cool_target_series = [t.cool if t.cool is not None else NO_COOL_TARGET for t in tt_targets]
             else:
-                # Legacy resolver returning float|None
+                # Legacy resolver returning float|None — a single target drives
+                # both sides, so an absent value opens both edges.
                 float_targets = cast(list[float | None], raw_targets)
-                heat_target_series = [t if t is not None else current_temp for t in float_targets]
-                cool_target_series = list(heat_target_series)
+                heat_target_series = [t if t is not None else NO_HEAT_TARGET for t in float_targets]
+                cool_target_series = [t if t is not None else NO_COOL_TARGET for t in float_targets]
         else:
-            fallback_h = targets.heat if targets.heat is not None else current_temp
-            fallback_c = targets.cool if targets.cool is not None else current_temp
+            fallback_h = targets.heat if targets.heat is not None else NO_HEAT_TARGET
+            fallback_c = targets.cool if targets.cool is not None else NO_COOL_TARGET
             heat_target_series = [fallback_h] * horizon_blocks
             cool_target_series = [fallback_c] * horizon_blocks
 
@@ -923,14 +954,22 @@ class MPCController:
 
         min_run = get_min_run_blocks(self._heating_system_type, PLAN_DT_MINUTES)
 
+        # Outdoor gating on an *unknown* outdoor temperature would gate on
+        # DEFAULT_OUTDOOR_TEMP_FALLBACK, which sits below the cooling minimum —
+        # a room with no outdoor sensor would be permanently barred from
+        # cooling on the strength of a placeholder. get_can_heat_cool() already
+        # declines to gate when the reading is absent; match it here.
+        gate_cooling_min = self.outdoor_cooling_min if self.outdoor_temp is not None else float("-inf")
+        gate_heating_max = self.outdoor_heating_max if self.outdoor_temp is not None else float("inf")
+
         optimizer = MPCOptimizer(
             model=model,
             can_heat=can_heat,
             can_cool=can_cool,
             w_comfort=self._w_comfort,
             w_energy=self._w_energy,
-            outdoor_cooling_min=self.outdoor_cooling_min,
-            outdoor_heating_max=self.outdoor_heating_max,
+            outdoor_cooling_min=gate_cooling_min,
+            outdoor_heating_max=gate_heating_max,
             min_run_blocks=min_run,
             override_active=is_override_active(self.room_config),
             heating_system_type=self._heating_system_type,
@@ -1453,7 +1492,12 @@ class MPCController:
                                 1,
                             )
                             t = max(effective_target, t)
-                            t = min(ac_heat_boost, effective_target + self._ac_boost_delta, t)
+                            t = min(
+                                ac_heat_boost,
+                                effective_target
+                                + self.ac_setpoint_limit(current_temp, effective_target, mode, cmd.entity_id),
+                                t,
+                            )
                         else:
                             t = effective_target
                         t_final = effective_target if cmd.entity_id in self._direct_eids else t
@@ -1532,23 +1576,35 @@ class MPCController:
                     temp_intent="heat",
                     deadband=self._proportional_deadband(eid, current_temp, effective_target),
                 )
-            # ACs: proportional setpoint in Full Control, actual target otherwise
-            if self.has_external_sensor and current_temp is not None:
-                heat_anchor = min(current_temp, effective_target)
-                ac_heat_target = round(
-                    heat_anchor + power_fraction * (ac_heat_boost - heat_anchor),
-                    1,
-                )
-                ac_heat_target = max(effective_target, ac_heat_target)
-                ac_heat_target = min(ac_heat_boost, effective_target + self._ac_boost_delta, ac_heat_target)
-            else:
-                ac_heat_target = effective_target
-            ha_ac_target = celsius_to_ha_temp(self.hass, ac_heat_target)
+            # ACs: proportional setpoint in Full Control, actual target otherwise.
+            # The excursion limit is per-entity because it depends on the
+            # device's own setpoint step.
             ha_ac_direct = celsius_to_ha_temp(self.hass, effective_target)
             for eid in self.acs:
                 if eid in _forced_off:
                     await async_idle_device(self.hass, eid, self._devices, area_id=self._area_id, targets=targets)
                     continue
+                if self.has_external_sensor and current_temp is not None:
+                    # Anchor at the release position: when the room is already
+                    # at or above the target, the zero-power setpoint is the
+                    # target itself (below the room temperature, so the device
+                    # can actually stop heating) instead of the room
+                    # temperature, which would chase the room upward during
+                    # min-run holds.
+                    heat_anchor = min(current_temp, effective_target)
+                    ac_heat_target = round(
+                        heat_anchor + power_fraction * (ac_heat_boost - heat_anchor),
+                        1,
+                    )
+                    ac_heat_target = max(effective_target, ac_heat_target)
+                    ac_heat_target = min(
+                        ac_heat_boost,
+                        effective_target + self.ac_setpoint_limit(current_temp, effective_target, mode, eid),
+                        ac_heat_target,
+                    )
+                else:
+                    ac_heat_target = effective_target
+                ha_ac_target = celsius_to_ha_temp(self.hass, ac_heat_target)
                 ha_t = ha_ac_direct if eid in self._direct_eids else ha_ac_target
                 ac_state = self.hass.states.get(eid)
                 ac_modes = _effective_ac_modes(ac_state)
@@ -1571,28 +1627,42 @@ class MPCController:
                 else:
                     await self._call("set_hvac_mode", {"entity_id": eid, "hvac_mode": "off"})
         elif mode == MODE_COOLING:
-            if self.has_external_sensor and current_temp is not None:
-                # Anchor at the release position: when the room is already at or
-                # below the target (cold evening, ventilation providing cooling),
-                # the zero-power setpoint is the target itself — above the room
-                # temperature, so the AC can actually stop cooling. Anchoring at
-                # the room temperature would keep the setpoint at or below it and
-                # chase the falling room downward, exacerbating overshoot.
-                cool_anchor = max(current_temp, effective_target)
-                ac_cool_target = round(
-                    cool_anchor - power_fraction * (cool_anchor - ac_cool_boost),
-                    1,
-                )
-                ac_cool_target = max(ac_cool_boost, effective_target - self._ac_boost_delta, ac_cool_target)
-                ac_cool_target = min(effective_target, ac_cool_target)
-            else:
-                ac_cool_target = effective_target
-            ha_target = celsius_to_ha_temp(self.hass, ac_cool_target)
             ha_cool_direct = celsius_to_ha_temp(self.hass, effective_target)
             for eid in self.acs:
                 if eid in _forced_off:
                     await async_idle_device(self.hass, eid, self._devices, area_id=self._area_id, targets=targets)
                     continue
+                if self.has_external_sensor and current_temp is not None:
+                    learned = self.learned_cool_setpoint(eid, current_temp, power_fraction)
+                    if learned is not None:
+                        # Learned response: the gap is already sized from the
+                        # device's measured behaviour, so the heuristic clamps
+                        # (proportional map, error limit) do not apply. Only the
+                        # device's own range still binds.
+                        ac_cool_target = max(ac_cool_boost, learned)
+                    else:
+                        # Anchor at the release position: when the room is
+                        # already at or below the target (cold evening,
+                        # ventilation providing cooling), the zero-power
+                        # setpoint is the target itself — above the room
+                        # temperature, so the AC can actually stop cooling.
+                        # Anchoring at the room temperature would keep the
+                        # setpoint at or below it and chase the falling room
+                        # downward, exacerbating overshoot.
+                        cool_anchor = max(current_temp, effective_target)
+                        ac_cool_target = round(
+                            cool_anchor - power_fraction * (cool_anchor - ac_cool_boost),
+                            1,
+                        )
+                        ac_cool_target = max(
+                            ac_cool_boost,
+                            effective_target - self.ac_setpoint_limit(current_temp, effective_target, mode, eid),
+                            ac_cool_target,
+                        )
+                        ac_cool_target = min(effective_target, ac_cool_target)
+                else:
+                    ac_cool_target = effective_target
+                ha_target = celsius_to_ha_temp(self.hass, ac_cool_target)
                 ha_t = ha_cool_direct if eid in self._direct_eids else ha_target
                 await self._call("set_hvac_mode", {"entity_id": eid, "hvac_mode": "cool"})
                 await self._call(
@@ -1656,6 +1726,120 @@ class MPCController:
                     targets=targets,
                     force_off=force_off,
                 )
+
+    def learned_cool_setpoint(self, eid: str, current_temp: float, power_fraction: float) -> float | None:
+        """AC cooling setpoint from the learned head-gap response, or None.
+
+        Inverts the device's own measured response instead of guessing a boost::
+
+            setpoint = (T_room + offset) - gap_for_rate(required_rate)
+
+        ``offset`` is the measured T_head - T_room bias, so the first term is
+        what the unit's own thermostat has to read for the room to be at
+        *current_temp*. Subtracting the gap the curve says delivers the rate the
+        optimizer asked for leaves a setpoint sized by measurement rather than
+        by a hand-tuned multiple — and because the curve saturates, it stops
+        asking for gap once more gap only buys noise.
+
+        Returns None when the curve has not been identified yet, so the caller
+        keeps the heuristic path.
+        """
+        if self._gap_manager is None:
+            return None
+        curve = self._gap_manager.curve(eid, MODE_COOLING)
+        if not curve.is_confident():
+            return None
+        model = self._model_manager.get_model(self._area_id)
+        required_rate = power_fraction * model.Q_cool
+        if required_rate <= 0:
+            return None
+        gap = curve.gap_for_rate(required_rate, AC_MAX_HEAD_GAP_C)
+        offset = self._gap_manager.offset(eid).commanding_offset()
+        setpoint = round(current_temp + offset - gap, 1)
+        _LOGGER.debug(
+            "gap-response: %s commanding room=%.2f offset=%+.2f required=%.2f°C/h "
+            "→ gap=%.2fK setpoint=%.1f (curve n=%d spread=%.1fK)",
+            eid,
+            current_temp,
+            offset,
+            required_rate,
+            gap,
+            setpoint,
+            curve.n_observations,
+            curve.gap_spread,
+        )
+        return setpoint
+
+    def ac_setpoint_limit(
+        self,
+        current_temp: float | None,
+        effective_target: float,
+        mode: str,
+        eid: str | None = None,
+    ) -> float:
+        """How far past the room target an AC setpoint may be pushed (°C).
+
+        An AC's compressor speed and fan speed both scale with the gap between
+        the room and the setpoint it has been given: a unit told 19°C in a 22°C
+        room does not cool gently on its way there, it runs hard and loud. The
+        gap is the output dial, and it is also the temperature the unit will
+        eventually drive the room to — one command, both effects.
+
+        RoomMind's proportional map spans from the room temperature down to the
+        device's own minimum, so without a bound a 0.1°C excursion above target
+        buys a multi-degree gap: full output, for an error a gentle nudge would
+        fix. Bounding the excursion by the error being corrected keeps the two
+        proportional to each other. Note the gap the unit reacts to is
+        ``error + excursion``, so a gain of G yields a gap of (1+G)x the error —
+        the gain is chosen against that, not against the excursion alone.
+
+        Only the error *in the direction the mode is correcting* counts. A
+        signed error matters because a room that has already sailed past target
+        has a large absolute deviation while needing no excursion at all —
+        taking abs() there would hand the biggest allowance to exactly the
+        overshoot the limit exists to prevent.
+
+        The floor keeps enough authority for the unit to run at all when the
+        room is right at target (device internal sensors rarely agree exactly
+        with the room sensor). On a device with a coarse setpoint step the floor
+        is rounded up to a whole step: half a degree of intent is worth nothing
+        to a unit that only accepts whole degrees — it snaps back to the target
+        and the AC is handed no demand at all.
+        """
+        if current_temp is None:
+            return self._ac_boost_delta
+        if mode == MODE_COOLING:
+            error = max(0.0, current_temp - effective_target)
+        elif mode == MODE_HEATING:
+            error = max(0.0, effective_target - current_temp)
+        else:
+            error = abs(current_temp - effective_target)
+
+        limit = max(self._ac_setpoint_floor, self._ac_setpoint_gain * error)
+        step = self._setpoint_step(eid)
+        if step:
+            # Whole steps, rounded down so the excursion is never widened past
+            # what the error justifies, but never below one step or the command
+            # snaps back onto the target and delivers nothing.
+            limit = max(step, math.floor(round(limit / step, 6)) * step)
+        # 0.1 °C granularity, matching every other setpoint in the controller.
+        return round(min(self._ac_boost_delta, limit), 1)
+
+    def _setpoint_step(self, eid: str | None) -> float | None:
+        """Device target_temp_step in °C, or None when it is unknown/fine."""
+        if not eid:
+            return None
+        state = self.hass.states.get(eid)
+        if state is None:
+            return None
+        raw = state.attributes.get("target_temp_step")
+        try:
+            step = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if step <= 0:
+            return None
+        return ha_delta_to_celsius(self.hass, step)
 
     def _proportional_deadband(self, eid: str, current_temp: float | None, effective_target: float) -> float | None:
         """Deadband threshold for a proportional setpoint send, or None to disable.

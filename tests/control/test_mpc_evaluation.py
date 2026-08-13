@@ -989,3 +989,102 @@ def test_mpc_guard_horizon_extended_for_ufh(monkeypatch):
     )
     mode, _ = ctrl._evaluate_mpc(21.0, TargetTemps(heat=21.0, cool=25.0))
     assert mode == MODE_HEATING, "Extended guard horizon for UFH should allow heating at mild outdoor=19°C"
+
+
+# --- absent targets must not invert the dead band -----------------------------
+
+
+def _cool_only_ctrl(hass, outdoor_temp=25.0, trained=True, **room_kw):
+    room = make_room(thermostats=[], acs=["climate.ac"], climate_mode="cool_only", **room_kw)
+    model_mgr = RoomModelManager()
+    model_mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
+    model_mgr.get_prediction_std = MagicMock(return_value=0.1 if trained else 0.9)
+    model_mgr.get_mode_counts = MagicMock(return_value=(100, 0, 40) if trained else (5, 0, 0))
+    return MPCController(
+        hass,
+        room,
+        model_manager=model_mgr,
+        outdoor_temp=outdoor_temp,
+        settings={},
+        has_external_sensor=True,
+    )
+
+
+def _ac_hass():
+    hass = build_hass()
+    ac = MagicMock()
+    ac.state = "cool"
+    ac.attributes = {
+        "hvac_modes": ["cool", "off"],
+        "temperature": 22.0,
+        "current_temperature": 22.6,
+        "min_temp": 16.0,
+        "max_temp": 30.0,
+    }
+    hass.states.get = MagicMock(return_value=ac)
+    return hass
+
+
+@pytest.mark.asyncio
+async def test_absent_heat_target_does_not_raise_the_cool_target():
+    """A cool-only room above its cool target must cool.
+
+    Regression: an absent heat target used to be filled with current_temp, and
+    the optimizer's "cool must be >= heat" clamp then dragged the real cool
+    target up to the room's own temperature. The room could never be above
+    target, so it idled forever while sitting above its setpoint.
+    """
+    ctrl = _cool_only_ctrl(_ac_hass())
+    mode, pf = await ctrl.async_evaluate(current_temp=22.6, targets=TargetTemps(heat=None, cool=22.0))
+    assert mode == MODE_COOLING
+    assert pf > 0.0
+
+
+@pytest.mark.asyncio
+async def test_absent_cool_target_does_not_lower_the_heat_target():
+    """Symmetric: a heat-only room below its heat target must heat."""
+    hass = build_hass()
+    trv = MagicMock()
+    trv.state = "heat"
+    trv.attributes = {"hvac_modes": ["heat", "off"], "temperature": 21.0, "min_temp": 5.0, "max_temp": 30.0}
+    hass.states.get = MagicMock(return_value=trv)
+    room = make_room(thermostats=["climate.trv"], acs=[], climate_mode="heat_only")
+    model_mgr = RoomModelManager()
+    model_mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
+    model_mgr.get_prediction_std = MagicMock(return_value=0.1)
+    model_mgr.get_mode_counts = MagicMock(return_value=(100, 40, 0))
+    ctrl = MPCController(hass, room, model_manager=model_mgr, outdoor_temp=5.0, settings={}, has_external_sensor=True)
+    mode, pf = await ctrl.async_evaluate(current_temp=19.5, targets=TargetTemps(heat=21.0, cool=None))
+    assert mode == MODE_HEATING
+    assert pf > 0.0
+
+
+@pytest.mark.asyncio
+async def test_both_targets_absent_still_idles():
+    """The "room is off" case must keep working: no target anywhere -> idle."""
+    ctrl = _cool_only_ctrl(_ac_hass())
+    mode, pf = await ctrl.async_evaluate(current_temp=22.6, targets=TargetTemps(heat=None, cool=None))
+    assert mode == MODE_IDLE
+    assert pf == 0.0
+
+
+@pytest.mark.asyncio
+async def test_unknown_outdoor_temp_does_not_gate_cooling():
+    """No outdoor sensor must not mean "never cool".
+
+    The MPC horizon falls back to DEFAULT_OUTDOOR_TEMP_FALLBACK (10 °C), which
+    is below DEFAULT_OUTDOOR_COOLING_MIN (16 °C), so gating on it barred any
+    room without an outdoor sensor from ever cooling.
+    """
+    ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=None)
+    mode, pf = await ctrl.async_evaluate(current_temp=22.6, targets=TargetTemps(heat=None, cool=22.0))
+    assert mode == MODE_COOLING
+    assert pf > 0.0
+
+
+@pytest.mark.asyncio
+async def test_known_cold_outdoor_temp_still_gates_cooling():
+    """A real reading below the cooling minimum must still block cooling."""
+    ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=10.0)
+    mode, _ = await ctrl.async_evaluate(current_temp=22.6, targets=TargetTemps(heat=None, cool=22.0))
+    assert mode == MODE_IDLE
