@@ -57,7 +57,7 @@ from ..utils.device_utils import (
     get_trv_eids,
     has_reliable_hvac_modes,
 )
-from ..utils.temp_utils import celsius_delta_to_ha, celsius_to_ha_temp, ha_delta_to_celsius
+from ..utils.temp_utils import celsius_delta_to_ha, celsius_to_ha_temp, ha_delta_to_celsius, ha_temp_to_celsius
 from .gap_response import GapResponseManager
 from .mpc_optimizer import MPCOptimizer, MPCPlan
 from .residual_heat import get_min_run_blocks
@@ -504,6 +504,7 @@ async def async_idle_device(
     targets: TargetTemps | None = None,
     force_off: bool = False,
     use_setpoint_offset: bool = True,
+    current_temp: float | None = None,
 ) -> None:
     """Idle a climate device per its configured idle_action.
 
@@ -515,6 +516,10 @@ async def async_idle_device(
 
     ``use_setpoint_offset`` lets the setback keep a direct device's sensor
     offset (#369); the controller turns it off in Managed mode.
+
+    ``current_temp`` is the room temperature from the external sensor (°C),
+    when the caller has one.  The setback branch uses it to correct for the
+    device's own sensor bias so the idle setpoint genuinely idles the device.
 
     ``force_off`` marks an explicit user request to shut the room down
     (schedule_off_action / presence_away_action = "off").  It outranks the
@@ -578,6 +583,29 @@ async def async_idle_device(
         else:
             await async_turn_off_climate(hass, entity_id, area_id=area_id, fallback_setpoint=fallback_temp)
             return
+
+        # The device regulates against its OWN sensor, not the room sensor the
+        # setback offset was computed from.  A head that reads warmer than the
+        # room keeps the compressor running below the room target even with the
+        # +offset setpoint (an AC head near the ceiling easily reads several
+        # degrees high), so the idle setpoint never actually idles the unit.
+        # Widen the setback by the measured head-vs-room bias — only in the
+        # adverse direction, capped so a broken head sensor cannot command an
+        # absurd setpoint.  The idle setpoint must be far enough past the
+        # device's own reading that it genuinely switches off.  A configured
+        # direct-mode offset already states that bias, so it is not counted twice.
+        if current_temp is not None and not sensor_offset:
+            head_raw = state.attributes.get("current_temperature")
+            try:
+                head_c = ha_temp_to_celsius(hass, float(head_raw)) if head_raw is not None else None
+            except (TypeError, ValueError):
+                head_c = None
+            if head_c is not None:
+                head_offset = head_c - current_temp
+                if current_hvac == "cool" and head_offset > 0:
+                    setback_temp += min(head_offset, AC_MAX_HEAD_GAP_C)
+                elif current_hvac == "heat" and head_offset < 0:
+                    setback_temp -= min(-head_offset, AC_MAX_HEAD_GAP_C)
 
         # Convert to HA units FIRST, then clamp to device min/max
         # (device attributes min_temp/max_temp are in HA units, not Celsius)
@@ -915,6 +943,7 @@ class MPCController:
         self._shading_factor = shading_factor
         self.q_occupancy = q_occupancy
         self._idle_targets: TargetTemps | None = None
+        self._idle_current_temp: float | None = None
         self._force_off = False
 
         s = settings or {}
@@ -1446,6 +1475,7 @@ class MPCController:
         # Store targets for _call delegation (setback idle_action) — must be
         # after backward-compat conversion so legacy callers get a TargetTemps.
         self._idle_targets = targets
+        self._idle_current_temp = current_temp
         self._force_off = force_off
         for eid in self.thermostats + self.acs:
             if eid not in _forced_on:
@@ -1499,6 +1529,7 @@ class MPCController:
                         area_id=self._area_id,
                         targets=targets,
                         use_setpoint_offset=self.has_external_sensor,
+                        current_temp=current_temp,
                     )
                     continue
                 if can_heat and ha_heat_target is not None:
@@ -1519,6 +1550,7 @@ class MPCController:
                         area_id=self._area_id,
                         targets=targets,
                         use_setpoint_offset=self.has_external_sensor,
+                        current_temp=current_temp,
                     )
                     continue
                 ac_state = self.hass.states.get(eid)
@@ -1704,6 +1736,7 @@ class MPCController:
                             area_id=self._area_id,
                             targets=targets,
                             use_setpoint_offset=self.has_external_sensor,
+                            current_temp=current_temp,
                         )
                     else:
                         # ACs can be turned off without boiler cycling concerns
@@ -1738,6 +1771,7 @@ class MPCController:
                         area_id=self._area_id,
                         targets=targets,
                         use_setpoint_offset=self.has_external_sensor,
+                        current_temp=current_temp,
                     )
                     continue
                 ha_t = self._heating_setpoint_ha(eid, trv_target, effective_target)
@@ -1760,6 +1794,7 @@ class MPCController:
                         area_id=self._area_id,
                         targets=targets,
                         use_setpoint_offset=self.has_external_sensor,
+                        current_temp=current_temp,
                     )
                     continue
                 if self.has_external_sensor and current_temp is not None:
@@ -1813,6 +1848,7 @@ class MPCController:
                         area_id=self._area_id,
                         targets=targets,
                         use_setpoint_offset=self.has_external_sensor,
+                        current_temp=current_temp,
                     )
                     continue
                 if self.has_external_sensor and current_temp is not None:
@@ -1863,6 +1899,7 @@ class MPCController:
                         area_id=self._area_id,
                         targets=targets,
                         use_setpoint_offset=self.has_external_sensor,
+                        current_temp=current_temp,
                     )
                     continue
                 await self._call("set_hvac_mode", {"entity_id": eid, "hvac_mode": "off"})
@@ -1889,6 +1926,7 @@ class MPCController:
                     targets=targets,
                     use_setpoint_offset=self.has_external_sensor,
                     force_off=force_off,
+                    current_temp=current_temp,
                 )
 
     async def _call_and_record(
@@ -2216,6 +2254,7 @@ class MPCController:
                 targets=self._idle_targets,
                 use_setpoint_offset=self.has_external_sensor,
                 force_off=self._force_off,
+                current_temp=self._idle_current_temp,
             )
             return _CALL_SKIPPED
 
