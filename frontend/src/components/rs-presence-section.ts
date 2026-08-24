@@ -153,10 +153,46 @@ export class RsPresenceSection extends LitElement {
       color: var(--secondary-text-color);
       font-size: 12px;
     }
+
+    .presence-card.missing {
+      border-color: var(--warning-color, #ff9800);
+    }
+
+    .missing-icon {
+      --mdc-icon-size: 16px;
+      color: var(--warning-color, #ff9800);
+      flex-shrink: 0;
+    }
+
+    .missing-hint {
+      margin-top: 8px;
+      color: var(--secondary-text-color);
+      font-size: 12px;
+    }
   `;
 
+  /**
+   * Global persons plus any entries the room still references on its own.
+   *
+   * Entries can drop out of the global list (or out of Home Assistant
+   * entirely) while a room still references them. They would stay in the room
+   * config forever unless the UI keeps offering them for deselection (#397).
+   */
+  private get _allPersons(): string[] {
+    const extra = this.selectedPresencePersons.filter((pid) => !this.presencePersons.includes(pid));
+    return [...this.presencePersons, ...extra];
+  }
+
+  /** True when the entity is gone from Home Assistant, i.e. dead config. */
+  private _isMissing(pid: string): boolean {
+    return !this.hass.states[pid];
+  }
+
   render() {
-    if (!this.presenceEnabled || this.presencePersons.length === 0) return nothing;
+    if (!this.presenceEnabled) return nothing;
+    // Keep the editor mounted while open, even after the last entry was
+    // unchecked - otherwise the dialog body collapses mid-cleanup.
+    if (!this.editing && this._allPersons.length === 0) return nothing;
 
     if (!this.editing) {
       if (this.ignorePresence) {
@@ -181,15 +217,18 @@ export class RsPresenceSection extends LitElement {
   }
 
   private _renderEditMode() {
+    const persons = this._allPersons;
+    const hasMissing = persons.some((pid) => this._isMissing(pid));
     return html`
       <div class="presence-grid">
-        ${this.presencePersons.map((pid) => {
+        ${persons.map((pid) => {
           const active = this.selectedPresencePersons.includes(pid);
+          const missing = this._isMissing(pid);
           const name =
             this.hass.states[pid]?.attributes?.friendly_name ?? pid.split(".").slice(1).join(".");
           return html`
             <div
-              class="presence-card ${active ? "active" : ""}"
+              class="presence-card ${active ? "active" : ""} ${missing ? "missing" : ""}"
               role="checkbox"
               tabindex="0"
               aria-checked=${active}
@@ -209,11 +248,25 @@ export class RsPresenceSection extends LitElement {
               ></ha-checkbox>
               <ha-icon class="person-icon" icon="mdi:account"></ha-icon>
               <span class="person-name">${name}</span>
+              ${missing ? this._renderMissingIcon() : nothing}
             </div>
           `;
         })}
       </div>
+      ${hasMissing
+        ? html`<div class="missing-hint">
+            ${localize("presence.missing_entity_hint", this.language)}
+          </div>`
+        : nothing}
     `;
+  }
+
+  private _renderMissingIcon() {
+    return html`<ha-icon
+      class="missing-icon"
+      icon="mdi:alert-circle-outline"
+      title=${localize("presence.missing_entity_hint", this.language)}
+    ></ha-icon>`;
   }
 
   private _renderViewMode() {
@@ -236,6 +289,7 @@ export class RsPresenceSection extends LitElement {
             <div class="presence-row ${isHome ? "home" : "away"}">
               <span class="presence-dot"></span>
               <span class="presence-name">${name}</span>
+              ${this._isMissing(pid) ? this._renderMissingIcon() : nothing}
               <span class="presence-state"
                 >${isHome
                   ? localize("presence.state_home", this.language)

@@ -428,6 +428,7 @@
   "presence.state_home": "À la maison",
   "presence.state_away": "Absent",
   "presence.room_none_assigned": "Règle globale — éco lorsqu'aucun occupant n'est présent",
+  "presence.missing_entity_hint": "Cette entité n'existe plus dans Home Assistant — décochez-la pour la retirer de cette pièce.",
   "presence.ignore_toggle": "Ignorer la présence",
   "presence.ignore_hint": "Contrôle la façon dont cette pièce réagit à la présence. Vous pouvez attribuer des personnes spécifiques ci-dessous. La pièce passe à l'éco lorsqu'aucune des personnes assignées n'est à la maison. Utilisez le commutateur ci-dessus pour ignorer totalement la détection et suivre toujours le planning.",
   "presence.help_ignore_title": "Que fait « Ignorer la présence » ?",

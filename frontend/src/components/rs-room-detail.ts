@@ -506,7 +506,8 @@ export class RsRoomDetail extends LitElement {
                   ></rs-sensor-section>
                 </rs-section-card>
 
-                ${this.presenceEnabled && this.presencePersons.length > 0
+                ${this.presenceEnabled &&
+                (this.presencePersons.length > 0 || this._selectedPresencePersons.length > 0)
                   ? html`<rs-section-card
                       icon="mdi:home-account"
                       .heading=${localize("room.section.presence", this.hass.language)}

@@ -428,6 +428,7 @@
   "presence.state_home": "Zu Hause",
   "presence.state_away": "Abwesend",
   "presence.room_none_assigned": "Globale Regel — Eco wenn niemand zu Hause ist",
+  "presence.missing_entity_hint": "Diese Entity existiert nicht mehr in Home Assistant — abwählen, um sie aus diesem Raum zu entfernen.",
   "presence.ignore_toggle": "Anwesenheit ignorieren",
   "presence.ignore_hint": "Hier wird festgelegt, wie dieser Raum auf Anwesenheit reagiert. Unten kannst du einzelne Personen zuweisen. Der Raum wechselt auf Eco, wenn keine der zugewiesenen Personen zu Hause ist. Mit dem Toggle oben wird die Erkennung komplett übersprungen und der Raum heizt immer nach Zeitplan.",
   "presence.help_ignore_title": "Was bewirkt \"Ignore presence\"?",

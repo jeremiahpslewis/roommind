@@ -428,6 +428,7 @@
   "presence.state_home": "Home",
   "presence.state_away": "Away",
   "presence.room_none_assigned": "Global rule — eco when nobody is home",
+  "presence.missing_entity_hint": "This entity no longer exists in Home Assistant — uncheck it to remove it from this room.",
   "presence.ignore_toggle": "Ignore presence",
   "presence.ignore_hint": "Controls how this room reacts to presence. You can assign specific persons below. The room switches to eco when none of the assigned persons are home. Use the toggle above to skip detection entirely and always follow the schedule.",
   "presence.help_ignore_title": "What does \"Ignore presence\" do?",
