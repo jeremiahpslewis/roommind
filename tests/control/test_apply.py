@@ -4386,3 +4386,79 @@ async def test_apply_idle_forced_on_set_temperature_has_no_hvac_mode():
     temp_calls = _temp_calls(hass, "climate.ac")
     assert temp_calls
     assert "hvac_mode" not in temp_calls[0][0][2]
+
+
+def _setback_ac_state(hvac_mode: str, head_temp: float | None):
+    state = MagicMock()
+    state.state = hvac_mode
+    state.attributes = {
+        "hvac_modes": ["heat", "cool", "off"],
+        "min_temp": 5.0,
+        "max_temp": 30.0,
+        "temperature": None,
+        "current_temperature": head_temp,
+    }
+    return state
+
+
+async def _setback_sent_temp(hvac_mode, targets, head_temp, current_temp):
+    hass = build_hass()
+    hass.states.get = MagicMock(return_value=_setback_ac_state(hvac_mode, head_temp))
+    devices = [
+        {"entity_id": "climate.ac", "type": "ac", "role": "auto", "idle_action": "setback", "idle_fan_mode": "low"}
+    ]
+    _last_commands.clear()
+    await async_idle_device(
+        hass,
+        "climate.ac",
+        devices,
+        area_id="test",
+        targets=targets,
+        current_temp=current_temp,
+    )
+    temp_calls = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert len(temp_calls) == 1
+    return temp_calls[0][0][2]["temperature"]
+
+
+@pytest.mark.asyncio
+async def test_setback_cooling_widens_for_warm_head_sensor():
+    """A head sensor reading warmer than the room widens the cool setback.
+
+    The device regulates on its own sensor: with room 19.0 but head 23.0, a
+    setpoint of target+2 (22.5) keeps the compressor running all night. The
+    idle setpoint must clear the head reading so the unit actually stops.
+    """
+    temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=23.0, current_temp=19.0)
+    # 20.5 + 2.0 + (23.0 - 19.0) = 26.5
+    assert temp == 26.5
+
+
+@pytest.mark.asyncio
+async def test_setback_cooling_head_offset_capped():
+    """A wildly-biased head sensor cannot push the setback past the cap."""
+    temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=27.0, current_temp=19.0)
+    # offset 8.0 capped at AC_MAX_HEAD_GAP_C (6.0): 20.5 + 2.0 + 6.0 = 28.5
+    assert temp == 28.5
+
+
+@pytest.mark.asyncio
+async def test_setback_cooling_ignores_cool_reading_head():
+    """A head reading cooler than the room must not lower the setback setpoint."""
+    temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=18.0, current_temp=19.0)
+    assert temp == 22.5  # plain target + offset
+
+
+@pytest.mark.asyncio
+async def test_setback_without_room_temp_unchanged():
+    """No external reading available: legacy setback behavior."""
+    temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=23.0, current_temp=None)
+    assert temp == 22.5
+
+
+@pytest.mark.asyncio
+async def test_setback_heating_widens_for_cold_head_sensor():
+    """Heating mirror: a head reading colder than the room lowers the setback."""
+    temp = await _setback_sent_temp("heat", TargetTemps(heat=21.0, cool=None), head_temp=18.0, current_temp=21.0)
+    # 21.0 - 2.0 - (21.0 - 18.0) = 16.0
+    assert temp == 16.0
