@@ -8,6 +8,7 @@ import pytest
 
 from custom_components.roommind.control.mpc_controller import (
     MPCController,
+    TargetTemps,
 )
 from custom_components.roommind.control.thermal_model import RCModel, RoomModelManager
 
@@ -1027,3 +1028,108 @@ async def test_ac_heating_setpoint_limit_ignores_overshoot_past_target():
     set_temp = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
     assert set_temp
     assert set_temp[-1][0][2]["temperature"] == 21.6
+
+
+# ---------------------------------------------------------------------------
+# Head-frame setpoint translation (coarse/biased AC head sensor)
+# ---------------------------------------------------------------------------
+
+
+def _head_ctrl(head_temp, step=None, state_mode="cool", modes=("cool", "off")):
+    hass = build_hass()
+    ac_state = MagicMock()
+    ac_state.state = state_mode
+    attrs = {
+        "hvac_modes": list(modes),
+        "temperature": None,
+        "min_temp": 16.0,
+        "max_temp": 30.0,
+        "current_temperature": head_temp,
+    }
+    if step is not None:
+        attrs["target_temp_step"] = step
+    ac_state.attributes = attrs
+    hass.states.get = MagicMock(return_value=ac_state)
+    ctrl = MPCController(
+        hass,
+        make_room(thermostats=[], acs=["climate.ac"]),
+        model_manager=RoomModelManager(),
+        outdoor_temp=18.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    return hass, ctrl
+
+
+def _sent_temps(hass):
+    return [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+
+
+@pytest.mark.asyncio
+async def test_cooling_release_clears_warm_head():
+    """Release below target must land above the head's own reading.
+
+    Room 20.0 (below the 21.0 target) with the head reading 23.0: the old
+    release at 21.0 kept the compressor running until the head — and so the
+    room — fell a degree past target (the 1 K sawtooth).
+    """
+    hass, ctrl = _head_ctrl(head_temp=23.0)
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
+    assert 24.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0)
+
+
+@pytest.mark.asyncio
+async def test_cooling_release_ignores_favourable_head():
+    """A head reading cooler than the room already releases — no shift."""
+    hass, ctrl = _head_ctrl(head_temp=19.0)
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
+    assert 21.0 in _sent_temps(hass)
+
+
+@pytest.mark.asyncio
+async def test_cooling_active_command_takes_full_shift():
+    """Active commands translate fully so the delivered gap matches the intent."""
+    hass, ctrl = _head_ctrl(head_temp=25.0)
+    # Room 26, target 23, pf 0.5 → room-frame 21.0; head reads 1.0 cold → 20.0
+    await ctrl.async_apply("cooling", 23.0, power_fraction=0.5, current_temp=26.0)
+    assert 20.0 in _sent_temps(hass)
+
+
+@pytest.mark.asyncio
+async def test_cooling_hold_at_target_shifts_for_warm_head():
+    """Room just above target, setpoint clamped to target: still an active
+    command, so the warm head bias applies in full — without it the unit
+    cools the room a degree past target chasing its own sensor."""
+    hass, ctrl = _head_ctrl(head_temp=22.2)
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=21.2)
+    assert 22.0 in _sent_temps(hass)  # 21.0 + (22.2 - 21.2)
+
+
+@pytest.mark.asyncio
+async def test_cooling_release_snaps_up_on_coarse_step():
+    """On a whole-degree device the release rounds AWAY from demand."""
+    hass, ctrl = _head_ctrl(head_temp=21.4, step=1.0)
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.6)
+    assert 22.0 in _sent_temps(hass)  # 21.0 + 0.8 → ceil to step
+
+
+@pytest.mark.asyncio
+async def test_heating_release_clears_cold_head():
+    """Heating mirror: a head reading colder than the room lowers the release."""
+    hass, ctrl = _head_ctrl(head_temp=20.0, state_mode="heat", modes=("heat", "off"))
+    await ctrl.async_apply("heating", 21.0, power_fraction=0.0, current_temp=22.0)
+    assert 19.0 in _sent_temps(hass)  # 21.0 + (20.0 - 22.0)
+
+
+@pytest.mark.asyncio
+async def test_compressor_hold_translates_to_head_frame():
+    """A min-run hold parks the AC at the target as the DEVICE perceives it."""
+    hass, ctrl = _head_ctrl(head_temp=23.0)
+    await ctrl.async_apply(
+        "idle",
+        TargetTemps(heat=None, cool=21.0),
+        power_fraction=0.0,
+        current_temp=20.0,
+        compressor_forced_on={"climate.ac"},
+    )
+    assert 24.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0)

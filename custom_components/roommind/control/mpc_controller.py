@@ -1640,6 +1640,10 @@ class MPCController:
                         effective_target + self.ac_setpoint_limit(current_temp, effective_target, mode, eid),
                         ac_heat_target,
                     )
+                    # Deliver in the device's sensor frame (head bias)
+                    ac_heat_target = self._to_device_frame(
+                        eid, ac_heat_target, current_temp, release_bound=effective_target, intent="heat"
+                    )
                 else:
                     ac_heat_target = effective_target
                 ha_ac_target = celsius_to_ha_temp(self.hass, ac_heat_target)
@@ -1700,6 +1704,10 @@ class MPCController:
                             ac_cool_target,
                         )
                         ac_cool_target = min(effective_target, ac_cool_target)
+                        # Deliver in the device's sensor frame (head bias)
+                        ac_cool_target = self._to_device_frame(
+                            eid, ac_cool_target, current_temp, release_bound=effective_target, intent="cool"
+                        )
                 else:
                     ac_cool_target = effective_target
                 ha_target = celsius_to_ha_temp(self.hass, ac_cool_target)
@@ -1725,15 +1733,23 @@ class MPCController:
                     # instead of overshooting at the old boost setpoint.
                     dev_state = self.hass.states.get(eid)
                     current_hvac = dev_state.state if dev_state else None
+
+                    def _hold_setpoint(t: float, intent: str, _eid: str = eid) -> float:
+                        # ACs get the hold translated into the device's sensor
+                        # frame so a biased head genuinely idles at the target.
+                        if _eid in self.acs:
+                            return self._to_device_frame(_eid, t, current_temp, release_bound=t, intent=intent)
+                        return t
+
                     if current_hvac == "heat" and targets.heat is not None:
-                        ha_t = celsius_to_ha_temp(self.hass, targets.heat)
+                        ha_t = celsius_to_ha_temp(self.hass, _hold_setpoint(targets.heat, "heat"))
                         await self._call(
                             "set_temperature",
                             {"entity_id": eid, "temperature": ha_t},
                             temp_intent="heat",
                         )
                     elif current_hvac == "cool" and targets.cool is not None:
-                        ha_t = celsius_to_ha_temp(self.hass, targets.cool)
+                        ha_t = celsius_to_ha_temp(self.hass, _hold_setpoint(targets.cool, "cool"))
                         await self._call(
                             "set_temperature",
                             {"entity_id": eid, "temperature": ha_t},
@@ -1741,14 +1757,14 @@ class MPCController:
                         )
                     elif current_hvac in ("heat_cool", "auto"):
                         if targets.heat is not None:
-                            ha_t = celsius_to_ha_temp(self.hass, targets.heat)
+                            ha_t = celsius_to_ha_temp(self.hass, _hold_setpoint(targets.heat, "heat"))
                             await self._call(
                                 "set_temperature",
                                 {"entity_id": eid, "temperature": ha_t},
                                 temp_intent="heat",
                             )
                         elif targets.cool is not None:
-                            ha_t = celsius_to_ha_temp(self.hass, targets.cool)
+                            ha_t = celsius_to_ha_temp(self.hass, _hold_setpoint(targets.cool, "cool"))
                             await self._call(
                                 "set_temperature",
                                 {"entity_id": eid, "temperature": ha_t},
@@ -1812,6 +1828,86 @@ class MPCController:
             curve.gap_spread,
         )
         return setpoint
+
+    def head_frame_shift(self, eid: str, current_temp: float | None) -> float:
+        """Head-sensor bias (°C) between the device's own reading and the room.
+
+        Prefers the gap-response learned commanding offset when identified;
+        falls back to the instantaneous head-vs-room delta from the device's
+        ``current_temperature`` attribute. Clamped to ±AC_MAX_HEAD_GAP_C so a
+        broken head sensor cannot command an absurd setpoint. 0.0 without data.
+        """
+        if current_temp is None:
+            return 0.0
+        offset = 0.0
+        if self._gap_manager is not None:
+            offset = self._gap_manager.offset(eid).commanding_offset()
+        if not offset:
+            state = self.hass.states.get(eid)
+            raw = state.attributes.get("current_temperature") if state else None
+            try:
+                head_c = ha_temp_to_celsius(self.hass, float(raw)) if raw is not None else None
+            except (TypeError, ValueError):
+                head_c = None
+            if head_c is not None:
+                offset = head_c - current_temp
+        return round(max(-AC_MAX_HEAD_GAP_C, min(AC_MAX_HEAD_GAP_C, offset)), 2)
+
+    def _to_device_frame(
+        self,
+        eid: str,
+        value: float,
+        current_temp: float | None,
+        *,
+        release_bound: float,
+        intent: str,
+    ) -> float:
+        """Translate a room-frame AC setpoint into the device's sensor frame.
+
+        The unit regulates against its own head sensor, which can sit a degree
+        or more from the external room sensor. Commanding room-frame values
+        delivers the wrong gap: a "release at target" that a warm-reading head
+        still sees as demand keeps the compressor running until the room is a
+        degree past target (the 1 K sawtooth), and an active command's
+        excursion lands deeper or shallower than the error-scaled limit
+        intended.
+
+        Active commands take the full measured bias in either direction; a
+        release command takes only the adverse component, so a favourably
+        biased (or coarse, flickering) head cannot toggle the release point.
+        On coarse-step devices the release is snapped away from the demand
+        side, because device rounding toward demand would re-arm the
+        compressor. The result is clamped to the device's own range.
+        """
+        shift = self.head_frame_shift(eid, current_temp)
+        # Release = the setpoint sits at the no-demand bound AND the room is
+        # already past it. A setpoint clamped to the target while the room
+        # still has a deficit is an active command and needs the full shift.
+        if intent == "cool":
+            is_release = value >= release_bound and (current_temp is None or current_temp <= release_bound)
+            if is_release:
+                shift = max(0.0, shift)
+        else:
+            is_release = value <= release_bound and (current_temp is None or current_temp >= release_bound)
+            if is_release:
+                shift = min(0.0, shift)
+        shifted = value + shift
+        step = self._setpoint_step(eid)
+        if step and is_release:
+            n = round(shifted / step, 6)
+            shifted = (math.ceil(n) if intent == "cool" else math.floor(n)) * step
+        state = self.hass.states.get(eid)
+        if state:
+            try:
+                min_t = state.attributes.get("min_temp")
+                max_t = state.attributes.get("max_temp")
+                if min_t is not None:
+                    shifted = max(shifted, ha_temp_to_celsius(self.hass, float(min_t)))
+                if max_t is not None:
+                    shifted = min(shifted, ha_temp_to_celsius(self.hass, float(max_t)))
+            except (TypeError, ValueError):
+                pass
+        return round(shifted, 1)
 
     def ac_setpoint_limit(
         self,
