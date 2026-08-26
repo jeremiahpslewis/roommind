@@ -1202,6 +1202,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             compressor_hold=bool(compressor_forced_on),
         )
 
+        _first_ac = next(iter(get_ac_eids(room.get("devices", []))), None)
         return self._build_room_state_dict(
             area_id=area_id,
             room=room,
@@ -1237,6 +1238,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             ac_setpoint_limit=(
                 controller.ac_setpoint_limit(current_temp, target_temp, mode) if target_temp is not None else None
             ),
+            head_frame_shift=(controller.head_frame_shift(_first_ac, current_temp) if _first_ac is not None else None),
             compressor_protection_reason=compressor_protection_reason,
             coil_dry=coil_dry,
         )
@@ -1484,6 +1486,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         cover_result: CoverResult,
         mpc_active: bool,
         ac_setpoint_limit: float | None = None,
+        head_frame_shift: float | None = None,
         compressor_protection_reason: str | None = None,
         coil_dry: CoilDryRoomResult | None = None,
     ) -> dict:
@@ -1563,6 +1566,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 direct_target=direct_target,
                 head_offset=_head_shift,
                 ac_setpoint_limit=ac_setpoint_limit,
+                head_frame_shift=head_frame_shift,
             ),
             "window_open": window_open,
             **build_override_live(
@@ -1656,13 +1660,13 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         direct_target: float | None = None,
         head_offset: float = 0.0,
         ac_setpoint_limit: float | None = None,
+        head_frame_shift: float | None = None,
     ) -> float | None:
         """Compute the device setpoint for UI display (Full Control only).
 
         Mirrors the clamps in MPCController.async_apply — including the
-        error-scaled AC limit — so the "Device set to" value the user reads is
-        the value the device is actually given. head_offset is the learned AC
-        sensor offset; it moves an AC-only room's value into the device's frame.
+        error-scaled AC limit and the head-frame shift — so the "Device set to"
+        value the user reads is the value the device is actually given.
         """
         if not has_external_sensor or current_temp is None or target_temp is None:
             return None
@@ -1681,8 +1685,10 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             sp = min(boost, sp)
             if not has_thermostats and ac_setpoint_limit is not None:
                 sp = min(sp, target_temp + ac_setpoint_limit)
-            if not has_thermostats:
-                sp = min(boost, round(sp + head_offset, 1))
+            if not has_thermostats and head_frame_shift:
+                # Release (no deficit) takes only the adverse component
+                shift = min(0.0, head_frame_shift) if sp <= target_temp <= current_temp else head_frame_shift
+                sp = round(sp + shift, 1)
             return sp
 
         if mode == MODE_COOLING and has_acs:
@@ -1694,7 +1700,10 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             if ac_setpoint_limit is not None:
                 sp = max(sp, target_temp - ac_setpoint_limit)
             sp = min(target_temp, sp)
-            return max(boost, round(sp + head_offset, 1))
+            if head_frame_shift:
+                shift = max(0.0, head_frame_shift) if sp >= target_temp >= current_temp else head_frame_shift
+                sp = round(sp + shift, 1)
+            return sp
 
         return None
 
