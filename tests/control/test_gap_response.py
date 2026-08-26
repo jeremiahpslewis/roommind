@@ -68,15 +68,20 @@ def test_gap_for_rate_inverts_the_curve():
 
 
 def test_gap_for_rate_stops_at_saturation_instead_of_extrapolating():
-    """Past saturation, more gap buys noise — return where the curve flattens."""
+    """Past saturation, more gap buys noise — return where the curve flattens,
+    not the last knot: an over-demanded rate must land at the knee."""
     curve = _train(GapResponse(), _saturating)
     gap = curve.gap_for_rate(50.0, max_gap=8.0)
-    assert gap == curve.knots[-1]
+    assert gap < curve.knots[-1]
+    # The knee already delivers (nearly) everything the curve ever measured
+    assert curve.rate_for_gap(gap) >= 0.9 * curve.rate_for_gap(curve.knots[-1])
 
 
 def test_gap_for_rate_respects_the_max_gap_cap():
     curve = _train(GapResponse(), _saturating)
-    assert curve.gap_for_rate(50.0, max_gap=2.0) == 2.0
+    gap = curve.gap_for_rate(50.0, max_gap=2.0)
+    assert gap <= 2.0
+    assert curve.rate_for_gap(gap) >= 0.9 * curve.rate_for_gap(2.0)
 
 
 def test_small_rate_requests_yield_small_gaps():
@@ -273,3 +278,98 @@ async def test_learned_path_never_exceeds_the_single_gap_ceiling():
     sp = await _commanded(gap_mgr, pf=1.0)
     # Ceiling respected before the device's own 0.5°C step quantization.
     assert 22.1 - sp <= AC_MAX_HEAD_GAP_C + 0.5
+
+
+# ---------------------------------------------------------------------------
+# Saturation knee + release offset selection
+# ---------------------------------------------------------------------------
+
+
+def test_gap_for_rate_saturates_at_the_knee_not_the_cap():
+    """An over-demanded rate lands where the curve stops climbing.
+
+    With a plateau from 3 K onward, requesting an unattainable rate (e.g.
+    from a model whose Q_cool is still inflated) must return ~the knee, not
+    the 6 K cap — otherwise every saturated request slams the deepest
+    possible setpoint.
+    """
+    curve = GapResponse.from_dict(
+        {
+            "knots": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            "values": [0.5, 1.0, 1.5, 2.0, 2.5, 2.5, 2.5],
+            "counts": [5, 5, 5, 5, 5, 5, 5],
+            "n_observations": 40,
+            "gap_min": 0.5,
+            "gap_max": 4.0,
+        }
+    )
+    knee = curve.gap_for_rate(10.0, AC_MAX_HEAD_GAP_C)
+    assert knee < 3.5, f"saturated request returned {knee}, expected the ~3K knee"
+    assert knee >= 2.0
+    # Within the measured range the inversion is unchanged
+    assert abs(curve.gap_for_rate(1.0, AC_MAX_HEAD_GAP_C) - 1.0) < 0.1
+
+
+def test_release_offset_prefers_most_adverse_reading():
+    ho = HeadOffset()
+    ho.running, ho.n_running = -2.0, 10
+    ho.idle, ho.n_idle = 1.0, 10
+    assert ho.commanding_offset() == -2.0  # active: return-air value
+    assert ho.release_offset("cool") == 1.0  # release must clear the idle reading
+    assert ho.release_offset("heat") == -2.0
+    assert HeadOffset().release_offset("cool") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_release_clears_idle_offset_not_running():
+    """A cooling release must use the idle offset, not the running one.
+
+    Running (return-air) offset is -2 K while idle (stratified) is +1 K: the
+    old commanding_offset preference under-shot the release by 3 K and the
+    unit re-armed as soon as its fan slowed.
+    """
+    gap_mgr = GapResponseManager()
+    ho = gap_mgr.offset("climate.ac")
+    ho.running, ho.n_running = -2.0, 10
+    ho.idle, ho.n_idle = 1.0, 10
+    hass = _ac_hass(head_temp=20.9)
+    mgr = RoomModelManager()
+    mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
+    ctrl = MPCController(
+        hass,
+        _ac_room(),
+        model_manager=mgr,
+        outdoor_temp=32.0,
+        settings={},
+        has_external_sensor=True,
+        gap_manager=gap_mgr,
+    )
+    # Room below target → release; base 21.0 + idle offset 1.0 = 22.0
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.5)
+    sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert 22.0 in sent
+
+
+@pytest.mark.asyncio
+async def test_active_command_keeps_running_offset():
+    """Active runs still translate with the running (return-air) offset."""
+    gap_mgr = GapResponseManager()
+    ho = gap_mgr.offset("climate.ac")
+    ho.running, ho.n_running = -2.0, 10
+    ho.idle, ho.n_idle = 1.0, 10
+    hass = _ac_hass(head_temp=24.0)
+    mgr = RoomModelManager()
+    mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
+    ctrl = MPCController(
+        hass,
+        _ac_room(),
+        model_manager=mgr,
+        outdoor_temp=32.0,
+        settings={},
+        has_external_sensor=True,
+        gap_manager=gap_mgr,
+    )
+    # Room 26, target 23, pf 0.5 → room-frame 21.0; running offset -2 → 19.0
+    await ctrl.async_apply("cooling", 23.0, power_fraction=0.5, current_temp=26.0)
+    sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert 19.0 in sent
