@@ -218,7 +218,9 @@ def _ac_room():
 
 
 async def _commanded(gap_mgr, pf, current_temp=22.1, target=22.0):
-    hass = _ac_hass()
+    # Head reads the same as the room so the head-frame shift is zero and
+    # these tests isolate the learned-curve gating from the bias translation.
+    hass = _ac_hass(head_temp=current_temp)
     mgr = RoomModelManager()
     mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
     ctrl = MPCController(
