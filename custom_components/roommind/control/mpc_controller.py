@@ -1829,11 +1829,14 @@ class MPCController:
         )
         return setpoint
 
-    def head_frame_shift(self, eid: str, current_temp: float | None) -> float:
+    def head_frame_shift(self, eid: str, current_temp: float | None, *, release_intent: str | None = None) -> float:
         """Head-sensor bias (°C) between the device's own reading and the room.
 
-        Prefers the gap-response learned commanding offset when identified;
-        falls back to the instantaneous head-vs-room delta from the device's
+        Prefers the gap-response learned offsets when identified — the running
+        (return-air) offset for active commands, the most adverse of the known
+        offsets for releases (``release_intent`` = "cool"/"heat"), because a
+        release must clear the reading the head settles to once the fan slows.
+        Falls back to the instantaneous head-vs-room delta from the device's
         ``current_temperature`` attribute. Clamped to ±AC_MAX_HEAD_GAP_C so a
         broken head sensor cannot command an absurd setpoint. 0.0 without data.
         """
@@ -1841,7 +1844,8 @@ class MPCController:
             return 0.0
         offset = 0.0
         if self._gap_manager is not None:
-            offset = self._gap_manager.offset(eid).commanding_offset()
+            tracker = self._gap_manager.offset(eid)
+            offset = tracker.release_offset(release_intent) if release_intent else tracker.commanding_offset()
         if not offset:
             state = self.hass.states.get(eid)
             raw = state.attributes.get("current_temperature") if state else None
@@ -1879,18 +1883,16 @@ class MPCController:
         side, because device rounding toward demand would re-arm the
         compressor. The result is clamped to the device's own range.
         """
-        shift = self.head_frame_shift(eid, current_temp)
         # Release = the setpoint sits at the no-demand bound AND the room is
         # already past it. A setpoint clamped to the target while the room
         # still has a deficit is an active command and needs the full shift.
         if intent == "cool":
             is_release = value >= release_bound and (current_temp is None or current_temp <= release_bound)
-            if is_release:
-                shift = max(0.0, shift)
         else:
             is_release = value <= release_bound and (current_temp is None or current_temp >= release_bound)
-            if is_release:
-                shift = min(0.0, shift)
+        shift = self.head_frame_shift(eid, current_temp, release_intent=intent if is_release else None)
+        if is_release:
+            shift = max(0.0, shift) if intent == "cool" else min(0.0, shift)
         shifted = value + shift
         step = self._setpoint_step(eid)
         if step and is_release:

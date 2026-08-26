@@ -58,6 +58,10 @@ MIN_TOTAL_SAMPLES = 30
 # which gap to pick. Only a spread of gaps identifies a slope.
 MIN_GAP_SPREAD = 1.0
 
+# Fraction of the plateau rate used to locate the saturation knee when a
+# requested rate exceeds what the curve ever measured.
+SATURATION_KNEE_FRACTION = 0.95
+
 # Observations outside these bounds are rejected as unphysical / confounded.
 MAX_PLAUSIBLE_RATE = 20.0  # °C/h of incremental cooling or heating
 MIN_OBSERVATION_DT = 1.0  # minutes
@@ -223,8 +227,16 @@ class GapResponse:
         if rate <= 0:
             return 0.0
         ceiling = min(max_gap, self.knots[-1])
-        if rate >= self.rate_for_gap(ceiling):
-            return ceiling
+        ceiling_rate = self.rate_for_gap(ceiling)
+        if rate >= ceiling_rate:
+            # Honest saturation: an over-demanded rate lands at the knee —
+            # the smallest gap already delivering (nearly) the plateau rate —
+            # not at the cap. Past the knee more gap buys noise, and an
+            # optimizer whose model overestimates the unit would otherwise
+            # slam every saturated request to the deepest possible setpoint.
+            if ceiling_rate <= 0:
+                return ceiling
+            rate = ceiling_rate * SATURATION_KNEE_FRACTION
         lo, hi = 0.0, ceiling
         for _ in range(40):  # bisection to well under head resolution
             mid = (lo + hi) / 2.0
@@ -297,6 +309,26 @@ class HeadOffset:
         if self.idle is not None and self.n_idle >= MIN_KNOT_SAMPLES:
             return round(self.idle, 2)
         return 0.0
+
+    def release_offset(self, intent: str) -> float:
+        """Offset to apply when commanding a release or hold setpoint.
+
+        A release must clear the reading the head settles to once the fan
+        slows — the idle (stratified) value, which on a high wall unit sits
+        well above the running (return-air) value. Using the running offset
+        there under-shoots the release and re-arms the compressor the moment
+        the fan stops moving air. Take the most adverse of the known
+        estimates for the given intent ("cool": warmest, "heat": coldest);
+        degrade to zero like commanding_offset.
+        """
+        candidates = []
+        if self.running is not None and self.n_running >= MIN_KNOT_SAMPLES:
+            candidates.append(self.running)
+        if self.idle is not None and self.n_idle >= MIN_KNOT_SAMPLES:
+            candidates.append(self.idle)
+        if not candidates:
+            return 0.0
+        return round(max(candidates) if intent == "cool" else min(candidates), 2)
 
     def to_dict(self) -> dict:
         return {
