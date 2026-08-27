@@ -202,7 +202,8 @@ async def test_fahrenheit_setpoint_matching_whole_degree_device_is_not_resent():
         model_manager=RoomModelManager(),
         outdoor_temp=30.0,
         settings={},
-        has_external_sensor=True,
+        # Managed Mode sends the plain target, so the °F conversion is what is under test
+        has_external_sensor=False,
     )
     # 24.4 °C is 75.92 °F, which the device shows as 76
     await ctrl.async_apply("cooling", TargetTemps(heat=None, cool=24.4), power_fraction=0.0, current_temp=24.4)
@@ -229,7 +230,8 @@ async def test_fahrenheit_setpoint_is_snapped_to_whole_degrees_without_step():
         model_manager=RoomModelManager(),
         outdoor_temp=30.0,
         settings={},
-        has_external_sensor=True,
+        # Managed Mode sends the plain target, so the °F conversion is what is under test
+        has_external_sensor=False,
     )
     await ctrl.async_apply("cooling", TargetTemps(heat=None, cool=24.4), power_fraction=0.0, current_temp=24.4)
 
@@ -255,7 +257,8 @@ async def test_fahrenheit_device_reporting_tenths_keeps_its_resolution():
         model_manager=RoomModelManager(),
         outdoor_temp=30.0,
         settings={},
-        has_external_sensor=True,
+        # Managed Mode sends the plain target, so the °F conversion is what is under test
+        has_external_sensor=False,
     )
     await ctrl.async_apply("cooling", TargetTemps(heat=None, cool=24.4), power_fraction=0.0, current_temp=24.4)
 
@@ -280,7 +283,8 @@ async def test_fahrenheit_device_without_setpoint_attribute_is_not_snapped():
         model_manager=RoomModelManager(),
         outdoor_temp=30.0,
         settings={},
-        has_external_sensor=True,
+        # Managed Mode sends the plain target, so the °F conversion is what is under test
+        has_external_sensor=False,
     )
     await ctrl.async_apply("cooling", TargetTemps(heat=None, cool=24.4), power_fraction=0.0, current_temp=24.4)
 
