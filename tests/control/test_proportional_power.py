@@ -784,7 +784,8 @@ async def test_ac_cooling_zero_power_releases_at_target():
 
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
-    assert any(c[0][2]["temperature"] == 21.0 for c in temp_calls)
+    # Parked at the setback position: target + 2.0 (no head data)
+    assert any(c[0][2]["temperature"] == 23.0 for c in temp_calls)
 
 
 @pytest.mark.asyncio
@@ -850,7 +851,8 @@ async def test_ac_heating_releases_when_room_above_target():
 
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
-    assert any(c[0][2]["temperature"] == 21.0 for c in temp_calls)
+    # Parked at the setback position: target - 2.0 (no head data)
+    assert any(c[0][2]["temperature"] == 19.0 for c in temp_calls)
 
 
 @pytest.mark.asyncio
@@ -1075,15 +1077,15 @@ async def test_cooling_release_clears_warm_head():
     """
     hass, ctrl = _head_ctrl(head_temp=23.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 24.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0)
+    assert 26.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0) + 2.0 setback parking
 
 
 @pytest.mark.asyncio
 async def test_cooling_release_ignores_favourable_head():
-    """A head reading cooler than the room already releases — no shift."""
+    """A head reading cooler than the room adds no shift — setback parking only."""
     hass, ctrl = _head_ctrl(head_temp=19.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 21.0 in _sent_temps(hass)
+    assert 23.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1110,7 +1112,7 @@ async def test_cooling_release_snaps_up_on_coarse_step():
     """On a whole-degree device the release rounds AWAY from demand."""
     hass, ctrl = _head_ctrl(head_temp=21.4, step=1.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.6)
-    assert 22.0 in _sent_temps(hass)  # 21.0 + 0.8 → ceil to step
+    assert 24.0 in _sent_temps(hass)  # 21.0 + 0.8 + 2.0 parking → ceil to step
 
 
 @pytest.mark.asyncio
@@ -1118,12 +1120,13 @@ async def test_heating_release_clears_cold_head():
     """Heating mirror: a head reading colder than the room lowers the release."""
     hass, ctrl = _head_ctrl(head_temp=20.0, state_mode="heat", modes=("heat", "off"))
     await ctrl.async_apply("heating", 21.0, power_fraction=0.0, current_temp=22.0)
-    assert 19.0 in _sent_temps(hass)  # 21.0 + (20.0 - 22.0)
+    assert 17.0 in _sent_temps(hass)  # 21.0 + (20.0 - 22.0) - 2.0 setback parking
 
 
 @pytest.mark.asyncio
 async def test_compressor_hold_translates_to_head_frame():
-    """A min-run hold parks the AC at the target as the DEVICE perceives it."""
+    """A min-run hold keeps the AC engaged at the target as the DEVICE
+    perceives it — head-frame shift, but no setback parking."""
     hass, ctrl = _head_ctrl(head_temp=23.0)
     await ctrl.async_apply(
         "idle",
@@ -1132,7 +1135,7 @@ async def test_compressor_hold_translates_to_head_frame():
         current_temp=20.0,
         compressor_forced_on={"climate.ac"},
     )
-    assert 24.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0)
+    assert 24.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0), no parking
 
 
 @pytest.mark.asyncio

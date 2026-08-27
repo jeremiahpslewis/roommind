@@ -74,6 +74,7 @@ from .managers.valve_manager import ValveManager
 from .managers.weather_manager import WeatherManager
 from .managers.window_manager import WindowManager
 from .utils.device_utils import (
+    DEFAULT_IDLE_SETBACK_OFFSET,
     build_rooms_devices_map,
     get_ac_eids,
     get_all_entity_ids,
@@ -1400,9 +1401,12 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             sp = min(boost, sp)
             if not has_thermostats and ac_setpoint_limit is not None:
                 sp = min(sp, target_temp + ac_setpoint_limit)
-            if not has_thermostats and head_frame_shift:
-                # Release (no deficit) takes only the adverse component
-                shift = min(0.0, head_frame_shift) if sp <= target_temp <= current_temp else head_frame_shift
+            if not has_thermostats and head_frame_shift is not None:
+                # Release (no deficit): adverse component + setback parking
+                if sp <= target_temp <= current_temp:
+                    shift = min(0.0, head_frame_shift) - DEFAULT_IDLE_SETBACK_OFFSET
+                else:
+                    shift = head_frame_shift
                 sp = round(sp + shift, 1)
             return sp
 
@@ -1415,8 +1419,12 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             if ac_setpoint_limit is not None:
                 sp = max(sp, target_temp - ac_setpoint_limit)
             sp = min(target_temp, sp)
-            if head_frame_shift:
-                shift = max(0.0, head_frame_shift) if sp >= target_temp >= current_temp else head_frame_shift
+            if head_frame_shift is not None:
+                # Release (no deficit): adverse component + setback parking
+                if sp >= target_temp >= current_temp:
+                    shift = max(0.0, head_frame_shift) + DEFAULT_IDLE_SETBACK_OFFSET
+                else:
+                    shift = head_frame_shift
                 sp = round(sp + shift, 1)
             return sp
 

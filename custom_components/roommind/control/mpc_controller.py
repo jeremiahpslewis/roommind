@@ -1736,9 +1736,12 @@ class MPCController:
 
                     def _hold_setpoint(t: float, intent: str, _eid: str = eid) -> float:
                         # ACs get the hold translated into the device's sensor
-                        # frame so a biased head genuinely idles at the target.
+                        # frame so a biased head holds at the true target. No
+                        # setback parking: a forced-on head stays engaged.
                         if _eid in self.acs:
-                            return self._to_device_frame(_eid, t, current_temp, release_bound=t, intent=intent)
+                            return self._to_device_frame(
+                                _eid, t, current_temp, release_bound=t, intent=intent, park_on_release=False
+                            )
                         return t
 
                     if current_hvac == "heat" and targets.heat is not None:
@@ -1865,6 +1868,7 @@ class MPCController:
         *,
         release_bound: float,
         intent: str,
+        park_on_release: bool = True,
     ) -> float:
         """Translate a room-frame AC setpoint into the device's sensor frame.
 
@@ -1892,7 +1896,19 @@ class MPCController:
             is_release = value <= release_bound and (current_temp is None or current_temp >= release_bound)
         shift = self.head_frame_shift(eid, current_temp, release_intent=intent if is_release else None)
         if is_release:
-            shift = max(0.0, shift) if intent == "cool" else min(0.0, shift)
+            # Park at the full setback position, not at head parity. Many
+            # units keep the compressor trickling until the setpoint clears
+            # their reading by a real margin, and in Full Control the release
+            # level is not a thermostat anyway — RoomMind decides when the
+            # next run starts — so there is no cost to parking well clear of
+            # the unit's stop threshold. Compressor-group holds opt out
+            # (park_on_release=False): a forced-on head must stay gently
+            # engaged at the head-frame target, not be parked off.
+            park = DEFAULT_IDLE_SETBACK_OFFSET if park_on_release else 0.0
+            if intent == "cool":
+                shift = max(0.0, shift) + park
+            else:
+                shift = min(0.0, shift) - park
         shifted = value + shift
         step = self._setpoint_step(eid)
         if step:
