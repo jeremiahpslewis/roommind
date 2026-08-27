@@ -1133,3 +1133,24 @@ async def test_compressor_hold_translates_to_head_frame():
         compressor_forced_on={"climate.ac"},
     )
     assert 24.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0)
+
+
+@pytest.mark.asyncio
+async def test_active_command_quantized_by_controller_not_device():
+    """Active commands land on exact device steps, ties toward demand.
+
+    Sending 0.1°-precision values lets the device round them unpredictably,
+    so consecutive commands a few tenths apart could jump two whole degrees.
+    """
+    hass, ctrl = _head_ctrl(head_temp=22.0, step=1.0)
+    # Hold at target with room above it: 21.0 + (22.0 - 21.2) = 21.8 → 22.0
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=21.2)
+    assert 22.0 in _sent_temps(hass)
+
+
+@pytest.mark.asyncio
+async def test_active_command_tie_rounds_toward_demand():
+    hass, ctrl = _head_ctrl(head_temp=21.7, step=1.0)
+    # 21.0 + (21.7 - 21.2) = 21.5 → tie → 21.0 (deeper, the demand side)
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=21.2)
+    assert 21.0 in _sent_temps(hass)
