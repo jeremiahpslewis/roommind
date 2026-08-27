@@ -1895,9 +1895,19 @@ class MPCController:
             shift = max(0.0, shift) if intent == "cool" else min(0.0, shift)
         shifted = value + shift
         step = self._setpoint_step(eid)
-        if step and is_release:
+        if step:
             n = round(shifted / step, 6)
-            shifted = (math.ceil(n) if intent == "cool" else math.floor(n)) * step
+            if is_release:
+                # Away from the demand side: device rounding toward demand
+                # would re-arm the compressor.
+                shifted = (math.ceil(n) if intent == "cool" else math.floor(n)) * step
+            else:
+                # Quantize active commands ourselves, ties toward demand.
+                # Sending 0.1°-precision values lets the DEVICE round them,
+                # and two commands a few tenths apart can land two whole
+                # degrees apart — the command ladder must be deterministic
+                # so levels shift one step at a time.
+                shifted = (math.ceil(n - 0.5) if intent == "cool" else math.floor(n + 0.5)) * step
         state = self.hass.states.get(eid)
         if state:
             try:
