@@ -756,23 +756,24 @@ def _make_cooling_ctrl():
 
 @pytest.mark.asyncio
 async def test_ac_cooling_releases_when_room_below_target():
-    """Room below cool target with low power: setpoint anchors at target, above room temp.
+    """Room below cool target with holding-level power: parked release.
 
     Cold-evening scenario: ventilation already cools the room below the target
-    while the AC is held in a cooling run. The old anchor (current_temp) kept
-    the commanded setpoint at or below the falling room temperature, so the AC
-    could never release and chased the room downward.
+    while demand is at/below the holding minimum. The old anchor (current_temp)
+    kept the commanded setpoint at or below the falling room temperature, so
+    the AC could never release and chased the room downward. Now: holding
+    regime → parity value = target; room below target → release → setback
+    parking (21.0 + 2.0 with no head data).
     """
     hass, ctrl = _make_cooling_ctrl()
-    # anchor = max(20.0, 21.0) = 21.0 → 21.0 - 0.1*(21.0-16) = 20.5
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.1, current_temp=20.0)
 
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
     assert temp_calls
     sp = temp_calls[0][0][2]["temperature"]
-    assert sp == 20.5
-    # The commanded setpoint must sit above the room temperature so the AC can stop
+    assert sp == 23.0
+    # The commanded setpoint must sit well above the room temperature
     assert sp > 20.0
 
 
@@ -1157,3 +1158,18 @@ async def test_active_command_tie_rounds_toward_demand():
     # 21.0 + (21.7 - 21.2) = 21.5 → tie → 21.0 (deeper, the demand side)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=21.2)
     assert 21.0 in _sent_temps(hass)
+
+
+@pytest.mark.asyncio
+async def test_holding_power_commands_parity():
+    """Holding-level demand parks the setpoint at parity — the quasi-equilibrium.
+
+    A modulating unit balances a small load by trickling at "target as its
+    own sensor sees it". Forcing the one-step excursion here overcools past
+    the holding load and bounces the ladder between park and demand.
+    """
+    hass, ctrl = _head_ctrl(head_temp=22.3, step=1.0)
+    # Room slightly above target, pf at the holding minimum:
+    # parity = 21.0 + (22.3 - 21.3) = 22.0 → exactly the head's reading
+    await ctrl.async_apply("cooling", 21.0, power_fraction=0.15, current_temp=21.3)
+    assert 22.0 in _sent_temps(hass)
