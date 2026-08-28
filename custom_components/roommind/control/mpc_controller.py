@@ -29,6 +29,7 @@ from ..const import (
     DEFAULT_OUTDOOR_COOLING_MIN,
     DEFAULT_OUTDOOR_HEATING_MAX,
     HEATING_BOOST_TARGET,
+    MIN_POWER_FRACTION,
     MODE_COOLING,
     MODE_HEATING,
     MODE_IDLE,
@@ -1622,7 +1623,14 @@ class MPCController:
                         self.hass, eid, self._devices, area_id=self._area_id, targets=targets, current_temp=current_temp
                     )
                     continue
-                if self.has_external_sensor and current_temp is not None:
+                if self.has_external_sensor and current_temp is not None and power_fraction <= MIN_POWER_FRACTION:
+                    # Holding regime: parity in the device's frame — let the
+                    # unit's own modulation trickle at the quasi-equilibrium
+                    # (see the cooling branch).
+                    ac_heat_target = self._to_device_frame(
+                        eid, effective_target, current_temp, release_bound=effective_target, intent="heat"
+                    )
+                elif self.has_external_sensor and current_temp is not None:
                     # Anchor at the release position: when the room is already
                     # at or above the target, the zero-power setpoint is the
                     # target itself (below the room temperature, so the device
@@ -1684,6 +1692,17 @@ class MPCController:
                         # (proportional map, error limit) do not apply. Only the
                         # device's own range still binds.
                         ac_cool_target = max(ac_cool_boost, learned)
+                    elif power_fraction <= MIN_POWER_FRACTION:
+                        # Holding regime: hand the unit the target in its own
+                        # sensor frame and let its internal modulation trickle
+                        # at the quasi-equilibrium. Forcing the one-step
+                        # excursion here overshoots the tiny holding load and
+                        # bounces the command ladder between park and demand,
+                        # skipping the parity rung where a modulating unit
+                        # balances the room on its own.
+                        ac_cool_target = self._to_device_frame(
+                            eid, effective_target, current_temp, release_bound=effective_target, intent="cool"
+                        )
                     else:
                         # Anchor at the release position: when the room is
                         # already at or below the target (cold evening,

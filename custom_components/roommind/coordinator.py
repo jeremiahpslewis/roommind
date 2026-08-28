@@ -30,6 +30,7 @@ from .const import (
     HISTORY_WRITE_CYCLES,
     MAX_PREDICTION_DELTA,
     MAX_SENSOR_STALENESS,
+    MIN_POWER_FRACTION,
     MODE_COOLING,
     MODE_HEATING,
     MODE_IDLE,
@@ -1395,12 +1396,15 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             if not has_thermostats and not has_acs:
                 return None
             # Release-position anchor — must mirror mpc_controller.async_apply
-            anchor = min(current_temp, target_temp)
-            sp = round(anchor + power_fraction * (boost - anchor), 1)
-            sp = max(target_temp, sp)
-            sp = min(boost, sp)
-            if not has_thermostats and ac_setpoint_limit is not None:
-                sp = min(sp, target_temp + ac_setpoint_limit)
+            if not has_thermostats and power_fraction <= MIN_POWER_FRACTION:
+                sp = target_temp  # holding regime: parity
+            else:
+                anchor = min(current_temp, target_temp)
+                sp = round(anchor + power_fraction * (boost - anchor), 1)
+                sp = max(target_temp, sp)
+                sp = min(boost, sp)
+                if not has_thermostats and ac_setpoint_limit is not None:
+                    sp = min(sp, target_temp + ac_setpoint_limit)
             if not has_thermostats and head_frame_shift is not None:
                 # Release (no deficit): adverse component + setback parking
                 if sp <= target_temp <= current_temp:
@@ -1413,12 +1417,15 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         if mode == MODE_COOLING and has_acs:
             boost = device_min_temp if device_min_temp is not None else AC_COOLING_BOOST_TARGET
             # Release-position anchor — must mirror mpc_controller.async_apply
-            anchor = max(current_temp, target_temp)
-            sp = round(anchor - power_fraction * (anchor - boost), 1)
-            sp = max(boost, sp)
-            if ac_setpoint_limit is not None:
-                sp = max(sp, target_temp - ac_setpoint_limit)
-            sp = min(target_temp, sp)
+            if power_fraction <= MIN_POWER_FRACTION:
+                sp = target_temp  # holding regime: parity
+            else:
+                anchor = max(current_temp, target_temp)
+                sp = round(anchor - power_fraction * (anchor - boost), 1)
+                sp = max(boost, sp)
+                if ac_setpoint_limit is not None:
+                    sp = max(sp, target_temp - ac_setpoint_limit)
+                sp = min(target_temp, sp)
             if head_frame_shift is not None:
                 # Release (no deficit): adverse component + setback parking
                 if sp >= target_temp >= current_temp:
