@@ -40,7 +40,16 @@ _LOGGER = logging.getLogger(__name__)
 
 # Knots in K of head gap. Dense where a 0.5 °C-resolution head can still
 # resolve differences, sparse out where the compressor is saturating anyway.
-DEFAULT_KNOTS: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+# The domain extends into NEGATIVE gaps (setpoint above the head's reading):
+# many inverter units keep trickling there instead of stopping, and that
+# trickle is often exactly the holding output a small steady-state load needs —
+# the quasi-equilibrium setpoint can sit a step ABOVE the head. Whether a unit
+# trickles at negative gap is learned, not assumed.
+DEFAULT_KNOTS: tuple[float, ...] = (-2.0, -1.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+# Pre-negative-domain knot layout, migrated transparently in from_dict.
+_LEGACY_KNOTS: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+# Observations below this gap are rejected (deeply parked; nothing to learn).
+NEGATIVE_GAP_LIMIT = -3.0
 
 # Kernel width (K) for attributing an observation to neighbouring knots.
 KERNEL_WIDTH = 0.75
@@ -131,7 +140,7 @@ class GapResponse:
 
         Returns True if the observation was accepted.
         """
-        if gap <= 0 or not (0.0 <= rate <= MAX_PLAUSIBLE_RATE):
+        if gap < NEGATIVE_GAP_LIMIT or not (0.0 <= rate <= MAX_PLAUSIBLE_RATE):
             return False
 
         weights = [self._kernel(gap, k) for k in self.knots]
@@ -197,11 +206,15 @@ class GapResponse:
         return max(self.values) > 0.0
 
     def rate_for_gap(self, gap: float) -> float:
-        """Evaluate the monotone spline at *gap* (K)."""
+        """Evaluate the monotone spline at *gap* (K).
+
+        No zero-at-zero axiom: whether the unit still trickles at gap <= 0
+        (setpoint at or above its own reading) is learned from observation.
+        Below the first knot the curve is flat at its learned floor.
+        """
         xs, ys = self.knots, self.values
         if gap <= xs[0]:
-            # Linear from the origin: zero gap must mean zero incremental rate.
-            return ys[0] * (gap / xs[0]) if xs[0] > 0 else 0.0
+            return ys[0]
         if gap >= xs[-1]:
             return ys[-1]
         slopes = _monotone_slopes(xs, ys)
@@ -225,7 +238,13 @@ class GapResponse:
         an extrapolation, because past that point more gap is only noise.
         """
         if rate <= 0:
-            return 0.0
+            return self.knots[0]
+        floor_rate = self.rate_for_gap(self.knots[0])
+        if rate <= floor_rate:
+            # The unit's gentlest engaged output already exceeds the request:
+            # the most-negative measured gap is the closest achievable — the
+            # decision to park entirely belongs to the optimizer.
+            return self.knots[0]
         ceiling = min(max_gap, self.knots[-1])
         ceiling_rate = self.rate_for_gap(ceiling)
         if rate >= ceiling_rate:
@@ -237,7 +256,7 @@ class GapResponse:
             if ceiling_rate <= 0:
                 return ceiling
             rate = ceiling_rate * SATURATION_KNEE_FRACTION
-        lo, hi = 0.0, ceiling
+        lo, hi = self.knots[0], ceiling
         for _ in range(40):  # bisection to well under head resolution
             mid = (lo + hi) / 2.0
             if self.rate_for_gap(mid) < rate:
@@ -261,9 +280,18 @@ class GapResponse:
     @classmethod
     def from_dict(cls, data: dict) -> GapResponse:
         knots = tuple(data.get("knots") or DEFAULT_KNOTS)
+        values = list(data.get("values") or [])
+        counts = list(data.get("counts") or [])
+        if knots == _LEGACY_KNOTS:
+            # Migrate a positive-domain curve: prepend the negative knots as
+            # unidentified (value 0, count 0) and keep everything learned.
+            pad = len(DEFAULT_KNOTS) - len(_LEGACY_KNOTS)
+            knots = DEFAULT_KNOTS
+            if len(values) == len(_LEGACY_KNOTS):
+                values = [0.0] * pad + values
+            if len(counts) == len(_LEGACY_KNOTS):
+                counts = [0] * pad + counts
         obj = cls(knots)
-        values = data.get("values") or []
-        counts = data.get("counts") or []
         if len(values) == len(obj.knots):
             obj.values = [float(v) for v in values]
         if len(counts) == len(obj.knots):

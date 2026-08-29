@@ -46,7 +46,7 @@ def test_curve_learns_a_saturating_response():
 def test_curve_stays_monotone_under_noisy_observations():
     """A dip in the data is noise: more gap can never buy less cooling."""
     curve = GapResponse()
-    noisy = [3.0, 1.0, 3.5, 0.5, 3.8, 2.0, 4.0]
+    noisy = [0.4, 0.1, 0.9, 3.0, 1.0, 3.5, 0.5, 3.8, 2.0, 4.0]
     for _ in range(10):
         for gap, rate in zip(curve.knots, noisy, strict=True):
             curve.observe(gap, rate)
@@ -55,8 +55,14 @@ def test_curve_stays_monotone_under_noisy_observations():
     assert all(b >= a - 1e-9 for a, b in zip(sampled, sampled[1:], strict=False)), sampled
 
 
-def test_zero_gap_means_zero_incremental_rate():
-    curve = _train(GapResponse(), _saturating)
+def test_below_domain_gap_returns_learned_floor():
+    """No zero-at-zero axiom: the rate at and below the first knot is learned.
+
+    A fresh curve reports 0.0 there; whether a unit trickles at negative
+    gaps (setpoint above its own reading) is measured, not assumed.
+    """
+    curve = GapResponse()
+    assert curve.rate_for_gap(-5.0) == 0.0
     assert curve.rate_for_gap(0.0) == 0.0
 
 
@@ -92,10 +98,12 @@ def test_small_rate_requests_yield_small_gaps():
 
 def test_rejects_unphysical_observations():
     curve = GapResponse()
-    assert not curve.observe(gap=-1.0, rate=2.0)
+    assert not curve.observe(gap=-5.0, rate=2.0)  # deeper than any parked setpoint
     assert not curve.observe(gap=1.0, rate=-5.0)
     assert not curve.observe(gap=1.0, rate=1e6)
     assert curve.n_observations == 0
+    # Negative gaps within the parked range ARE physical: trickling units
+    assert curve.observe(gap=-1.0, rate=0.4)
 
 
 def test_curve_survives_a_round_trip():
@@ -373,3 +381,72 @@ async def test_active_command_keeps_running_offset():
     await ctrl.async_apply("cooling", 23.0, power_fraction=0.5, current_temp=26.0)
     sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
     assert 19.0 in sent
+
+
+# ---------------------------------------------------------------------------
+# Negative-gap domain: the quasi-equilibrium above the head's reading
+# ---------------------------------------------------------------------------
+
+_TRICKLE_TRUTH = {-2.0: 0.3, -1.0: 0.5, 0.0: 0.9, 0.5: 1.2, 1.0: 1.6, 1.5: 2.0, 2.0: 2.4, 3.0: 3.0, 4.0: 3.4, 6.0: 3.6}
+
+
+def _train_trickling(curve: GapResponse, rounds=12):
+    for _ in range(rounds):
+        for g, r in _TRICKLE_TRUTH.items():
+            curve.observe(g, r)
+    return curve
+
+
+def test_inversion_can_choose_a_setpoint_above_the_head():
+    """An inverter that trickles at negative gaps gets a negative-gap answer.
+
+    A tiny holding rate must invert to a setpoint ABOVE the unit's own
+    reading — the '22 when the head reads 21' rung — instead of the
+    controller duty-cycling between demand (21) and park (23).
+    """
+    curve = _train_trickling(GapResponse())
+    assert curve.is_confident()
+    gap = curve.gap_for_rate(0.6, AC_MAX_HEAD_GAP_C)
+    assert gap < 0.0, f"expected a negative gap for a trickle-level rate, got {gap}"
+    # A rate below the gentlest engaged output lands at the domain floor
+    assert curve.gap_for_rate(0.05, AC_MAX_HEAD_GAP_C) == curve.knots[0]
+
+
+def test_legacy_positive_domain_curve_migrates():
+    """A stored positive-domain curve keeps its learning after migration."""
+    legacy = {
+        "knots": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        "values": [0.5, 1.0, 1.5, 2.0, 2.5, 2.5, 2.5],
+        "counts": [5, 5, 5, 5, 5, 5, 5],
+        "n_observations": 40,
+        "gap_min": 0.5,
+        "gap_max": 4.0,
+    }
+    curve = GapResponse.from_dict(legacy)
+    assert list(curve.knots) == list(GapResponse().knots)
+    assert abs(curve.rate_for_gap(2.0) - 2.0) < 0.05
+    assert curve.rate_for_gap(-2.0) == 0.0  # negative knots start unlearned
+
+
+@pytest.mark.asyncio
+async def test_learned_holding_command_sits_above_the_head():
+    """End to end: trickle-level demand commands a setpoint above the room/head."""
+    gap_mgr = GapResponseManager()
+    _train_trickling(gap_mgr.curve("climate.ac", "cooling"))
+    hass = _ac_hass(head_temp=20.3, setpoint=24.0)
+    mgr = RoomModelManager()
+    mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
+    ctrl = MPCController(
+        hass,
+        _ac_room(),
+        model_manager=mgr,
+        outdoor_temp=28.0,
+        settings={},
+        has_external_sensor=True,
+        gap_manager=gap_mgr,
+    )
+    # pf 0.15 × Q_cool 4.0 = 0.6 °C/h — a holding-level rate
+    await ctrl.async_apply("cooling", 20.0, power_fraction=0.15, current_temp=20.3)
+    sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert sent
+    assert sent[-1] > 20.3, f"expected a setpoint above the head reading, got {sent[-1]}"

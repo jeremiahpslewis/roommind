@@ -1473,7 +1473,11 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         if not (MIN_OBSERVATION_DT <= dt_minutes <= MAX_OBSERVATION_DT):
             return
         # A mode change mid-interval mixes two dynamics into one residual.
-        if prev_mode != mode or mode not in (MODE_HEATING, MODE_COOLING):
+        # MODE_IDLE intervals are observed too: a parked or holding unit left
+        # in cool/heat can keep trickling at a NEGATIVE gap (setpoint past its
+        # own reading), and that trickle — the gentlest output the unit has —
+        # is exactly what the negative-gap end of the curve must learn.
+        if prev_mode != mode or mode not in (MODE_HEATING, MODE_COOLING, MODE_IDLE):
             return
 
         model = self._model_manager.get_model(area_id)
@@ -1491,8 +1495,22 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         )
         for eid in get_ac_eids(room.get("devices", [])):
             state = self.hass.states.get(eid)
-            if state is None or state.state not in RUNNING_STATES.get(mode, frozenset()):
+            if state is None:
                 continue
+            if mode == MODE_IDLE:
+                # Derive the observation direction from the device's own
+                # engaged state; a genuinely off/fan-only unit has nothing
+                # to teach here.
+                if state.state in RUNNING_STATES.get(MODE_COOLING, frozenset()):
+                    obs_mode = MODE_COOLING
+                elif state.state in RUNNING_STATES.get(MODE_HEATING, frozenset()):
+                    obs_mode = MODE_HEATING
+                else:
+                    continue
+            else:
+                if state.state not in RUNNING_STATES.get(mode, frozenset()):
+                    continue
+                obs_mode = mode
             head = state.attributes.get("current_temperature")
             setpoint = state.attributes.get("temperature")
             if head is None or setpoint is None:
@@ -1502,11 +1520,13 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 setpoint_c = ha_temp_to_celsius(self.hass, float(setpoint), entity_id=eid)
             except (TypeError, ValueError):
                 continue
-            self._gap_manager.observe_offset(eid, head_c, current_temp, is_running=True)
-            gap = head_c - setpoint_c if mode == MODE_COOLING else setpoint_c - head_c
+            # Parked intervals feed the idle offset bucket — the reading the
+            # head settles to when the fan slows, which sizes releases.
+            self._gap_manager.observe_offset(eid, head_c, current_temp, is_running=mode != MODE_IDLE)
+            gap = head_c - setpoint_c if obs_mode == MODE_COOLING else setpoint_c - head_c
             self._gap_manager.observe_response(
                 eid,
-                mode,
+                obs_mode,
                 gap=gap,
                 observed_temp_change=current_temp - prev_temp,
                 predicted_passive_change=passive - prev_temp,
