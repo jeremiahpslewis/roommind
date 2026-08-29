@@ -5,7 +5,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from ..const import HEATING_SYSTEM_PROFILES, MIN_POWER_FRACTION, MODE_COOLING, MODE_HEATING, MODE_IDLE
+from ..const import (
+    HEATING_SYSTEM_PROFILES,
+    MIN_POWER_FRACTION,
+    MODE_COOLING,
+    MODE_HEATING,
+    MODE_IDLE,
+    MODE_START_PENALTY,
+)
 from .residual_heat import compute_residual_heat
 from .thermal_model import RCModel
 
@@ -81,6 +88,7 @@ class MPCOptimizer:
         solar_series: list[float] | None = None,
         residual_series: list[float] | None = None,
         occupancy_series: list[float] | None = None,
+        initial_mode: str = MODE_IDLE,
     ) -> MPCPlan:
         """Find optimal action sequence over the planning horizon.
 
@@ -90,6 +98,13 @@ class MPCOptimizer:
         Accepts dual target series (heat_target_series + cool_target_series)
         for dead-band-aware optimization. If cool_target_series is None,
         it defaults to heat_target_series (single-target behavior).
+
+        ``initial_mode`` is the mode actually running when the plan is built.
+        Continuing it is free; STARTING a different active mode is charged
+        MODE_START_PENALTY (comfort-equivalent), so near steady state runs
+        consolidate instead of duty-cycling at the min-run floor. The real
+        cross-cycle min-run is enforced by the controller, so the pre-existing
+        run is treated as having satisfied the plan's internal min_run.
         """
         if cool_target_series is None:
             cool_target_series = list(heat_target_series)
@@ -125,8 +140,12 @@ class MPCOptimizer:
         temperatures: list[float] = [T_room]
         power_fractions: list[float] = []
         current_temp = T_room
-        current_mode = MODE_IDLE
-        blocks_in_mode = 0
+        if initial_mode in (MODE_HEATING, MODE_COOLING):
+            current_mode = initial_mode
+            blocks_in_mode = self.min_run_blocks  # real min-run is the controller's job
+        else:
+            current_mode = MODE_IDLE
+            blocks_in_mode = 0
 
         for i in range(n_blocks):
             T_out = T_outdoor_series[i]
@@ -173,6 +192,10 @@ class MPCOptimizer:
                         future_residual=future_residual,
                         future_occupancy=future_occupancy,
                     )
+                    if action != MODE_IDLE and action != current_mode:
+                        # Starting a run costs wear and noise; charging it in
+                        # comfort currency keeps steady-state cycling slow.
+                        cost += self.w_comfort * MODE_START_PENALTY
                     if cost < best_cost:
                         best_cost = cost
                         best_action = action

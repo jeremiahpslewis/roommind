@@ -10,6 +10,7 @@ from custom_components.roommind.const import (
     MIN_POWER_FRACTION,
     MODE_COOLING,
     MODE_HEATING,
+    MODE_IDLE,
 )
 from custom_components.roommind.control.mpc_optimizer import MPCOptimizer, MPCPlan
 from custom_components.roommind.control.thermal_model import RCModel
@@ -910,3 +911,62 @@ def test_efficiency_slider_is_not_more_aggressive_than_comfort():
         )
         fractions.append(plan.get_current_power_fraction())
     assert fractions == sorted(fractions)
+
+
+# ---------------------------------------------------------------------------
+# Mode-start penalty (steady-state cycling rate)
+# ---------------------------------------------------------------------------
+
+
+def _steady_state_opt():
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    return MPCOptimizer(model, can_heat=False, can_cool=True, min_run_blocks=2)
+
+
+def test_small_deviation_does_not_start_a_run():
+    """A few tenths above target must not fire the compressor.
+
+    Without a start cost the optimizer duty-cycles at whatever rate the
+    min-run floor permits — a run every 25 minutes, forever, to harvest
+    0.05°C² of comfort.
+    """
+    opt = _steady_state_opt()
+    plan = opt.optimize(
+        T_room=20.2,
+        T_outdoor_series=[22.0] * 12,
+        heat_target_series=[18.0] * 12,
+        cool_target_series=[20.0] * 12,
+        dt_minutes=5,
+        initial_mode=MODE_IDLE,
+    )
+    assert plan.actions[0] == "idle"
+
+
+def test_larger_deviation_still_starts_a_run():
+    """The start cost delays, not disables: a real deviation fires promptly."""
+    opt = _steady_state_opt()
+    plan = opt.optimize(
+        T_room=21.2,
+        T_outdoor_series=[28.0] * 12,
+        heat_target_series=[18.0] * 12,
+        cool_target_series=[20.0] * 12,
+        dt_minutes=5,
+        initial_mode=MODE_IDLE,
+    )
+    assert plan.actions[0] == "cooling"
+
+
+def test_continuing_the_running_mode_is_not_charged():
+    """A pre-existing run continues without paying the start penalty."""
+    opt = _steady_state_opt()
+    plan = opt.optimize(
+        T_room=20.35,
+        T_outdoor_series=[28.0] * 12,
+        heat_target_series=[18.0] * 12,
+        cool_target_series=[20.0] * 12,
+        dt_minutes=5,
+        initial_mode=MODE_COOLING,
+    )
+    # From idle this deviation would not justify a start (see above with the
+    # same magnitude); an already-running unit keeps working it off.
+    assert plan.actions[0] == "cooling"

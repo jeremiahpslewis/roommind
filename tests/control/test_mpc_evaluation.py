@@ -1162,7 +1162,7 @@ async def test_unknown_outdoor_temp_does_not_gate_cooling():
 
     The deviation is large so the verdict isolates the gate: with the cold
     fallback the model predicts a natural drift down, and at a small
-    deviation waiting for that drift is a legitimate plan.
+    deviation the mode-start penalty would legitimately wait it out.
     """
     ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=None)
     mode, pf = await ctrl.async_evaluate(current_temp=24.0, targets=TargetTemps(heat=None, cool=22.0))
