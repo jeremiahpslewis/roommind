@@ -1075,9 +1075,13 @@ async def test_unknown_outdoor_temp_does_not_gate_cooling():
     The MPC horizon falls back to DEFAULT_OUTDOOR_TEMP_FALLBACK (10 °C), which
     is below DEFAULT_OUTDOOR_COOLING_MIN (16 °C), so gating on it barred any
     room without an outdoor sensor from ever cooling.
+
+    The deviation is large so the verdict isolates the gate: with the cold
+    fallback the model predicts a natural drift down, and at a small
+    deviation the mode-start penalty would legitimately wait it out.
     """
     ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=None)
-    mode, pf = await ctrl.async_evaluate(current_temp=22.6, targets=TargetTemps(heat=None, cool=22.0))
+    mode, pf = await ctrl.async_evaluate(current_temp=24.0, targets=TargetTemps(heat=None, cool=22.0))
     assert mode == MODE_COOLING
     assert pf > 0.0
 
