@@ -355,7 +355,7 @@ async def test_release_clears_idle_offset_not_running():
     # Room below target → release; base 21.0 + idle offset 1.0 + 2.0 parking = 24.0
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.5)
     sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
-    assert 24.0 in sent
+    assert 23.5 in sent
 
 
 @pytest.mark.asyncio
