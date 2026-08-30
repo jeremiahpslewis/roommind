@@ -276,6 +276,17 @@ def _learned_setback_step(hass: HomeAssistant, attributes: Any) -> float:
     return 1.0 if hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT else 0.5
 
 
+# Cross-cycle holding-rung servo state: {entity_id: (level_c, last_change_ts)}.
+# Module-level because the controller object is rebuilt every cycle.
+_hold_rungs: dict[str, tuple[float, float]] = {}
+# One rung step at most per dwell, so equilibrium shifts stay slow.
+HOLD_RUNG_DWELL_S = 900.0
+# Room-vs-target band treated as "holding" (no rung adjustment inside it).
+HOLD_RUNG_BAND_C = 0.15
+# Past this far on the no-demand side the servo gives up and parks fully.
+HOLD_PARK_BAND_C = 0.5
+
+
 def clear_command_cache() -> None:
     """Clear the sent-command cache (for tests)."""
     _last_commands.clear()
@@ -286,6 +297,7 @@ def clear_command_cache() -> None:
     _active_targets.clear()
     _overshoot_sent.clear()
     _hold_modulated.clear()
+    _hold_rungs.clear()
 
 
 def _resolve_idle_setpoint(
@@ -2223,13 +2235,11 @@ class MPCController:
                         current_temp=current_temp,
                     )
                     continue
-                if self.has_external_sensor and current_temp is not None and power_fraction <= MIN_POWER_FRACTION:
-                    # Holding regime: parity in the device's frame — let the
-                    # unit's own modulation trickle at the quasi-equilibrium
+                holding = power_fraction <= MIN_POWER_FRACTION
+                if self.has_external_sensor and current_temp is not None and holding:
+                    # Holding regime: the rung servo owns the setpoint
                     # (see the cooling branch).
-                    ac_heat_target = self._to_device_frame(
-                        eid, effective_target, current_temp, release_bound=effective_target, intent="heat"
-                    )
+                    ac_heat_target = self._holding_rung(eid, effective_target, current_temp, "heat")
                 elif self.has_external_sensor and current_temp is not None:
                     # Anchor at the release position: when the room is already
                     # at or above the target, the zero-power setpoint is the
@@ -2272,7 +2282,7 @@ class MPCController:
                         "set_temperature",
                         {"entity_id": eid, "temperature": ha_t, "hvac_mode": ac_mode},
                         temp_intent="heat",
-                        deadband=self._proportional_deadband(eid, current_temp, effective_target),
+                        deadband=None if holding else self._proportional_deadband(eid, current_temp, effective_target),
                     )
                 else:
                     await self._call("set_hvac_mode", {"entity_id": eid, "hvac_mode": "off"})
@@ -2290,25 +2300,22 @@ class MPCController:
                         current_temp=current_temp,
                     )
                     continue
+                holding = power_fraction <= MIN_POWER_FRACTION
                 if self.has_external_sensor and current_temp is not None:
-                    learned = self.learned_cool_setpoint(eid, current_temp, power_fraction)
-                    if learned is not None:
+                    learned = None if holding else self.learned_cool_setpoint(eid, current_temp, power_fraction)
+                    if holding:
+                        # Holding regime: the rung servo owns the setpoint —
+                        # closed-loop on the room, one device-step per dwell —
+                        # because the equilibrium rung can sit above the
+                        # head's reading, where no open-loop inversion knows
+                        # the output until it has been tried.
+                        ac_cool_target = self._holding_rung(eid, effective_target, current_temp, "cool")
+                    elif learned is not None:
                         # Learned response: the gap is already sized from the
                         # device's measured behaviour, so the heuristic clamps
                         # (proportional map, error limit) do not apply. Only the
                         # device's own range still binds.
                         ac_cool_target = max(ac_cool_boost, learned)
-                    elif power_fraction <= MIN_POWER_FRACTION:
-                        # Holding regime: hand the unit the target in its own
-                        # sensor frame and let its internal modulation trickle
-                        # at the quasi-equilibrium. Forcing the one-step
-                        # excursion here overshoots the tiny holding load and
-                        # bounces the command ladder between park and demand,
-                        # skipping the parity rung where a modulating unit
-                        # balances the room on its own.
-                        ac_cool_target = self._to_device_frame(
-                            eid, effective_target, current_temp, release_bound=effective_target, intent="cool"
-                        )
                     else:
                         # Anchor at the release position: when the room is
                         # already at or below the target (cold evening,
@@ -2338,11 +2345,14 @@ class MPCController:
                 direct_t = self._direct_setpoint_ha(eid, direct_target)
                 ha_t = direct_t if direct_t is not None else celsius_to_ha_temp(self.hass, ac_cool_target)
                 await self._call("set_hvac_mode", {"entity_id": eid, "hvac_mode": "cool"})
+                # A holding rung or park is not a proportional setpoint: the servo steps
+                # once per dwell of its own, and holding back a release by the proportional
+                # dwell (#317) would keep the unit cooling at the last active setpoint.
                 await self._call(
                     "set_temperature",
                     {"entity_id": eid, "temperature": ha_t, "hvac_mode": "cool"},
                     temp_intent="cool",
-                    deadband=self._proportional_deadband(eid, current_temp, effective_target),
+                    deadband=None if holding else self._proportional_deadband(eid, current_temp, effective_target),
                 )
             for eid in thermostats:
                 if eid in _forced_off:
@@ -2832,6 +2842,58 @@ class MPCController:
             except (TypeError, ValueError):
                 pass
         return round(shifted, 1)
+
+    def _holding_rung(self, eid: str, effective_target: float, current_temp: float, intent: str) -> float:
+        """Closed-loop choice of the quasi-equilibrium hold rung for an AC.
+
+        In the holding regime the right setpoint is the one whose output
+        balances the room's small load — and on units that keep trickling at
+        or above their own reading, that rung can sit a step ABOVE the head,
+        where no open-loop curve can know the output until it has been
+        commanded at least once. So the rung is found by servo: hold a level,
+        watch the ROOM, and step one device-step per dwell in whichever
+        direction it drifted. Bounded by parity (full holding output) on the
+        demand side and the parked release on the gentle side; real deficits
+        are the excursion path's job, and a room well past target on the
+        no-demand side parks fully.
+        """
+        step = self._setpoint_step(eid) or 0.5
+        sign = 1.0 if intent == "cool" else -1.0
+        parity = effective_target + self.head_frame_shift(eid, current_temp)
+        release_shift = self.head_frame_shift(eid, current_temp, release_intent=intent)
+        if intent == "cool":
+            park = effective_target + max(0.0, release_shift) + DEFAULT_IDLE_SETBACK_OFFSET
+        else:
+            park = effective_target + min(0.0, release_shift) - DEFAULT_IDLE_SETBACK_OFFSET
+
+        now = time.time()
+        # error > 0 = the room needs more output; error < 0 = it got too much
+        error = (current_temp - effective_target) * sign
+        if error < -HOLD_PARK_BAND_C:
+            # Load has reversed: no equilibrium exists, park fully.
+            _hold_rungs[eid] = (park, now)
+            n = math.ceil(round(park / step, 6)) if intent == "cool" else math.floor(round(park / step, 6))
+            return round(n * step, 1)
+
+        stored = _hold_rungs.get(eid)
+        if stored is None:
+            # Start from the quiet end: one rung below the parked release.
+            # Under-delivering costs a slow drift the servo corrects; starting
+            # near parity in the running-offset frame can open with a blast.
+            level, ts = park - sign * step, now
+        else:
+            level, ts = stored
+        if now - ts >= HOLD_RUNG_DWELL_S:
+            if error > HOLD_RUNG_BAND_C:
+                level -= sign * step
+                ts = now
+            elif error < -HOLD_RUNG_BAND_C:
+                level += sign * step
+                ts = now
+        lo, hi = (parity, park) if intent == "cool" else (park, parity)
+        level = max(lo, min(hi, level))
+        _hold_rungs[eid] = (level, ts)
+        return round(math.floor(round(level / step, 6) + 0.5) * step, 1)
 
     def ac_setpoint_limit(
         self,
