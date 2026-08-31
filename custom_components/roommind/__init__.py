@@ -19,8 +19,8 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN, PLATFORMS, VERSION
 from .coordinator import RoomMindCoordinator
-from .store import RoomMindStore
 from .services.settings_service import async_register_settings_service
+from .store import RoomMindStore
 from .websocket_api import async_register_websocket_commands
 
 _LOGGER = logging.getLogger(__name__)
