@@ -430,6 +430,13 @@ class MPCOptimizer:
                 T_drift += beta * self.model.Q_occupancy * q_occupancy / alpha
             else:
                 T_drift += self.model.Q_occupancy * q_occupancy * dt_h
+        # Add the learned persistent disturbance (ventilation, internal gains)
+        bias = getattr(self.model, "bias", 0.0)
+        if bias:
+            if alpha > 0.01:
+                T_drift += beta * bias * self.model.C / alpha
+            else:
+                T_drift += bias * dt_h
 
         # Reference sub-target: close `approach_rate` of the remaining gap this block
         # instead of the whole gap (deadbeat). approach_rate=1.0 => T_ref == target =>
