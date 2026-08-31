@@ -1,0 +1,13 @@
+update_settings:
+  name: Update settings
+  description: >-
+    Merge keys into RoomMind's global settings. For settings without a UI
+    field yet (e.g. the whole-house ventilation supply-air sensor).
+  fields:
+    settings:
+      name: Settings
+      description: "Mapping of setting keys to values, e.g. {ventilation_supply_sensor: sensor.maico_temperatur_zuluft}"
+      required: true
+      example: '{"ventilation_supply_sensor": "sensor.maico_temperatur_zuluft"}'
+      selector:
+        object:
