@@ -241,6 +241,19 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         self.outdoor_temp_effective, self.outdoor_temp_source = self._resolve_outdoor_temp(settings)
         self._update_outdoor_unavailable_notification(settings)
 
+        # Whole-house ventilation supply-air temperature (optional). Stamped
+        # into the model manager so the EKF learns the vent coupling and every
+        # RCModel consumer predicts with it. None (sensor missing/unavailable)
+        # freezes the coupling instead of corrupting it.
+        vent_sensor_id = settings.get("ventilation_supply_sensor")
+        if vent_sensor_id:
+            raw_vent = read_sensor_value(self.hass, vent_sensor_id, "global", "ventilation supply temperature")
+            self._model_manager.set_vent_temp(
+                ha_temp_to_celsius(self.hass, raw_vent, entity_id=vent_sensor_id) if raw_vent is not None else None
+            )
+        else:
+            self._model_manager.set_vent_temp(None)
+
         # Load compressor groups from settings (every cycle, cheap)
         self._compressor_manager.load_groups(settings.get("compressor_groups", []))
 

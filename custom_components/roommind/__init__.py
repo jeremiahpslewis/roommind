@@ -20,6 +20,7 @@ from homeassistant.helpers.typing import ConfigType
 from .const import DOMAIN, PLATFORMS, VERSION
 from .coordinator import RoomMindCoordinator
 from .store import RoomMindStore
+from .services.settings_service import async_register_settings_service
 from .websocket_api import async_register_websocket_commands
 
 _LOGGER = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the RoomMind integration (YAML, runs once)."""
     hass.data.setdefault(DOMAIN, {})
     async_register_websocket_commands(hass)
+    async_register_settings_service(hass)
     return True
 
 

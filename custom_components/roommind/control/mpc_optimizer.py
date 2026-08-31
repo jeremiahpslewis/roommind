@@ -403,6 +403,14 @@ class MPCOptimizer:
 
         dt_h = dt_minutes / 60.0
         alpha = self.model.U
+        # Ventilation coupling: two conductances collapse to alpha_eff and a
+        # conductance-weighted reference temperature (see RCModel.predict).
+        vent_u = getattr(self.model, "U_vent", 0.0)
+        vent_t = getattr(self.model, "vent_temp", None)
+        T_ref = T_outdoor
+        if vent_u > 0 and vent_t is not None:
+            T_ref = (alpha * T_outdoor + vent_u * vent_t) / (alpha + vent_u)
+            alpha = alpha + vent_u
         if alpha < 0.01:
             beta = alpha * dt_h  # Euler approx for tiny alpha
         else:
@@ -412,7 +420,7 @@ class MPCOptimizer:
             return 0.0, MODE_IDLE
 
         # Drift temperature: where the room would go with no HVAC
-        T_drift = T_room + beta * (T_outdoor - T_room)
+        T_drift = T_room + beta * (T_ref - T_room)
         # Add predicted solar gain to drift
         if alpha > 0.01:
             T_drift += beta * self.model.Q_solar * q_solar / alpha
