@@ -58,6 +58,7 @@ class RCModel:
         Q_cool: float = DEFAULT_Q_COOL,
         Q_solar: float = DEFAULT_Q_SOLAR,
         Q_occupancy: float = DEFAULT_Q_OCCUPANCY,
+        bias: float = 0.0,
     ) -> None:
         self.C = C
         self.U = U
@@ -65,6 +66,10 @@ class RCModel:
         self.Q_cool = Q_cool
         self.Q_solar = Q_solar
         self.Q_occupancy = Q_occupancy
+        # Persistent unmodeled drift rate [degC/h]: ventilation, internal
+        # gains, neighbouring rooms. Estimated by the EKF disturbance state
+        # so it stops corrupting U and the Q parameters.
+        self.bias = bias
 
     def predict(
         self,
@@ -96,8 +101,9 @@ class RCModel:
         dt_hours = dt_minutes / 60.0
         # Residual heat: only contributes when HVAC is off (no double-counting)
         Q_residual = self.Q_heat * q_residual if Q_active == 0.0 and q_residual > 0 else 0.0
-        # Total thermal input including solar gain, occupancy heat, and residual heat
-        Q_total = Q_active + self.Q_solar * q_solar + self.Q_occupancy * q_occupancy + Q_residual
+        # Total thermal input including solar gain, occupancy heat, residual
+        # heat, and the learned persistent disturbance (bias, degC/h)
+        Q_total = Q_active + self.Q_solar * q_solar + self.Q_occupancy * q_occupancy + Q_residual + self.bias * self.C
         # Equilibrium temperature: T_out + Q/U
         T_eq = T_outdoor + Q_total / self.U
         # Decay constant  (U/C has unit 1/h)
@@ -181,6 +187,7 @@ class RCModel:
             "Q_cool": self.Q_cool,
             "Q_solar": self.Q_solar,
             "Q_occupancy": self.Q_occupancy,
+            "bias": self.bias,
         }
 
     @classmethod
@@ -193,6 +200,7 @@ class RCModel:
             Q_cool=max(0.0, data.get("Q_cool", cls.DEFAULT_Q_COOL)),
             Q_solar=max(0.0, data.get("Q_solar", cls.DEFAULT_Q_SOLAR)),
             Q_occupancy=max(0.0, data.get("Q_occupancy", cls.DEFAULT_Q_OCCUPANCY)),
+            bias=data.get("bias", 0.0),
         )
 
     def __repr__(self) -> str:
@@ -211,13 +219,20 @@ class RCModel:
 class ThermalEKF:
     """Extended Kalman Filter for 1R1C thermal model.
 
-    Augmented state vector x = [T, alpha, beta_h, beta_c, beta_s, beta_o] where:
+    Augmented state vector x = [T, alpha, beta_h, beta_c, beta_s, beta_o, d]:
       T       = room temperature [degC]  (directly measured)
       alpha   = U/C  heat loss rate [1/h]
       beta_h  = Q_heat/C  heating rate [degC/h]
       beta_c  = Q_cool/C  cooling rate [degC/h]
       beta_s  = Q_solar/C  solar gain rate [degC/h per kW/m²]
       beta_o  = Q_occupancy/C  occupancy heat gain rate [degC/h]
+      d       = persistent disturbance rate [degC/h] (offset-free estimation)
+
+    The disturbance state absorbs persistent unmodeled load — ventilation,
+    internal gains, heat exchange with neighbouring rooms — that would
+    otherwise be laundered into alpha and the betas, railing the time
+    constant against its bounds and inflating the HVAC strengths. It is
+    always observable and adapts faster than the physical parameters.
 
     The EKF uses the analytical 1R1C solution for the predict step and
     a standard Kalman measurement update.  Parameters are modeled as
@@ -244,7 +259,11 @@ class ThermalEKF:
     _ANOMALY_R_INFLATE: float = 100.0
 
     # Parameter bounds (C=1 normalization: alpha=U/C, beta=Q/C)
-    _ALPHA_MIN: float = 0.005  # time constant up to 200 h (very heavy building)
+    # A single room's envelope time constant is 5-40 h; even a very heavy
+    # building rarely exceeds 2 days. The old 200 h bound was a rail the
+    # filter drove alpha into while laundering unmodeled load (ventilation)
+    # into the parameters — now the disturbance state absorbs that instead.
+    _ALPHA_MIN: float = 0.02  # time constant up to 50 h
     _ALPHA_MAX: float = 2.0  # time constant down to 30 min — defensive for residential rooms
     _BETA_H_MIN: float = 0.1  # very weak heater relative to thermal mass
     _BETA_H_MAX: float = 200.0  # powerful heater in lightweight room
@@ -254,6 +273,7 @@ class ThermalEKF:
     _BETA_S_MAX: float = 50.0  # large south-facing sunroom
     _BETA_O_MIN: float = 0.0  # no occupancy gain
     _BETA_O_MAX: float = 20.0  # large occupancy gain (many people / small room)
+    _D_MAX: float = 3.0  # |disturbance| bound [degC/h] — beyond this something is broken
 
     # Default initial parameter values (C=1 normalization)
     _DEFAULT_ALPHA: float = 0.15  # ~7 h time constant (moderate residential room)
@@ -261,6 +281,7 @@ class ThermalEKF:
     _DEFAULT_BETA_C: float = 4.0  # moderate AC
     _DEFAULT_BETA_S: float = 0.5  # small initial solar gain; learns from data
     _DEFAULT_BETA_O: float = 0.3  # ~100W body heat, C=1 normalized
+    _DEFAULT_D: float = 0.0  # no disturbance until observed
 
     # Process noise (diagonal of Q_noise matrix)
     # Higher values keep the filter adaptive; lower values freeze parameters.
@@ -272,6 +293,7 @@ class ThermalEKF:
     _Q_BETA_C: float = 0.005  # HVAC power drift (5x previous)
     _Q_BETA_S: float = 0.002  # solar gain drift
     _Q_BETA_O: float = 0.002  # occupancy gain drift
+    _Q_D: float = 0.02  # disturbance walks on the hours scale (ventilation schedules)
 
     # Measurement noise
     _R: float = 0.04  # sensor noise variance (0.2 degC std)
@@ -283,6 +305,13 @@ class ThermalEKF:
     _P_INIT_BETA: float = 50.0  # σ≈7 around default 3.0
     _P_INIT_BETA_S: float = 25.0  # σ≈5 around default 0.5
     _P_INIT_BETA_O: float = 10.0  # moderate initial uncertainty for occupancy
+    _P_INIT_D: float = 1.0  # disturbance starts plausible-zero, sigma 1 degC/h
+
+    # Learning gates: physical parameters must not learn from confounded
+    # intervals. While |d| is large the innovation is dominated by unmodeled
+    # load, and the first interval after a mode change mixes two dynamics.
+    _D_GATE: float = 0.5  # degC/h of disturbance above which params slow down
+    _D_GATE_FACTOR: float = 0.2  # process-noise multiplier while gated
 
     # Window-open heat exchange multiplier
     _K_WINDOW_DEFAULT: float = 5.0  # initial: 5x faster than closed
@@ -293,7 +322,7 @@ class ThermalEKF:
     _K_WINDOW_MIN_DELTA_T: float = 0.1  # min |T_outdoor - T_room| for learning
 
     # Number of state dimensions
-    _N: int = 6
+    _N: int = 7
 
     def __init__(self, T_init: float = 20.0) -> None:
         self._x: list[float] = [
@@ -303,15 +332,18 @@ class ThermalEKF:
             self._DEFAULT_BETA_C,
             self._DEFAULT_BETA_S,
             self._DEFAULT_BETA_O,
+            self._DEFAULT_D,
         ]
-        self._P: list[list[float]] = [
-            [self._P_INIT_T, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, self._P_INIT_ALPHA, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, self._P_INIT_BETA, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, self._P_INIT_BETA, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, self._P_INIT_BETA_S, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 0.0, self._P_INIT_BETA_O],
+        diag = [
+            self._P_INIT_T,
+            self._P_INIT_ALPHA,
+            self._P_INIT_BETA,
+            self._P_INIT_BETA,
+            self._P_INIT_BETA_S,
+            self._P_INIT_BETA_O,
+            self._P_INIT_D,
         ]
+        self._P: list[list[float]] = [[diag[i] if i == j else 0.0 for j in range(self._N)] for i in range(self._N)]
         self._n_updates: int = 0
         self._n_heating: int = 0
         self._n_cooling: int = 0
@@ -603,6 +635,7 @@ class ThermalEKF:
             Q_cool=max(self._x[3], 0.0),
             Q_solar=max(self._x[4], 0.0),
             Q_occupancy=max(self._x[5], 0.0),
+            bias=max(-self._D_MAX, min(self._D_MAX, self._x[6])),
         )
 
     # -- EKF internals -------------------------------------------------------
@@ -649,16 +682,14 @@ class ThermalEKF:
         F[0][3] = dT_new/d_beta_c  (nonzero only during cooling)
         F[0][4] = dT_new/d_beta_s  (nonzero only when q_solar > 0)
         F[0][5] = dT_new/d_beta_o  (nonzero only when q_occupancy > 0)
-        F[1..5][1..5] = I           (parameters are random walk)
+        F[0][6] = dT_new/d_d       (always nonzero: disturbance is always on)
+        F[1..6][1..6] = I           (parameters are random walk)
         """
         N = self._N
         F: list[list[float]] = [[0.0] * N for _ in range(N)]
         # Identity for parameter rows
-        F[1][1] = 1.0
-        F[2][2] = 1.0
-        F[3][3] = 1.0
-        F[4][4] = 1.0
-        F[5][5] = 1.0
+        for i in range(1, N):
+            F[i][i] = 1.0
 
         if abs(alpha) < self._ALPHA_SMALL:
             # Linearized (Euler) Jacobian
@@ -674,6 +705,8 @@ class ThermalEKF:
             F[0][4] = q_solar * dt_h
             # Occupancy: dT_new/d_beta_o = q_occupancy * dt_h
             F[0][5] = q_occupancy * dt_h
+            # Disturbance: always observable
+            F[0][6] = dt_h
         else:
             decay = math.exp(-alpha * dt_h)
             one_minus_decay = 1.0 - decay
@@ -690,6 +723,8 @@ class ThermalEKF:
             F[0][4] = q_solar * (1.0 / alpha) * one_minus_decay
             # Occupancy: dT_new/d_beta_o = q_occupancy * (1/alpha) * (1 - exp(-alpha*dt))
             F[0][5] = q_occupancy * (1.0 / alpha) * one_minus_decay
+            # Disturbance: always observable
+            F[0][6] = (1.0 / alpha) * one_minus_decay
         return F
 
     def _predict_step(
@@ -704,16 +739,16 @@ class ThermalEKF:
         q_occupancy: float = 0.0,
     ) -> None:
         """EKF predict: propagate state and covariance forward."""
-        T, alpha, beta_h, beta_c, beta_s, beta_o = self._x
+        T, alpha, beta_h, beta_c, beta_s, beta_o, d = self._x
         u_hvac = self._mode_to_u(mode) * power_fraction
         # Residual heat: during idle, thermal mass continues releasing stored energy
         u_residual = beta_h * q_residual if mode == "idle" and q_residual > 0 else 0.0
-        # Occupancy heat: always additive (not mode-gated)
-        u = u_hvac + beta_s * q_solar + beta_o * q_occupancy + u_residual
+        # Occupancy heat: always additive (not mode-gated); disturbance too
+        u = u_hvac + beta_s * q_solar + beta_o * q_occupancy + u_residual + d
 
         # State prediction (analytical or linearized)
         T_new = self._state_transition(T, alpha, u, T_outdoor, dt_h)
-        self._x = [T_new, alpha, beta_h, beta_c, beta_s, beta_o]
+        self._x = [T_new, alpha, beta_h, beta_c, beta_s, beta_o, d]
 
         # Jacobian at current state
         F = self._compute_jacobian(
@@ -740,13 +775,25 @@ class ThermalEKF:
         # oscillation).
         alpha_ratio = max(alpha, self._ALPHA_MIN) / self._DEFAULT_ALPHA
         q_alpha = self._Q_ALPHA * min(1.0, alpha_ratio * alpha_ratio)
+        # Learning gates: the physical parameters must not learn from
+        # confounded intervals. The first interval after a mode change mixes
+        # two dynamics into one residual, and while the disturbance state is
+        # absorbing a large unmodeled load the innovation says more about
+        # the ventilation than about the building. The disturbance state
+        # itself keeps learning throughout — that is its job.
+        gate = 1.0
+        if self._last_mode is not None and mode != self._last_mode:
+            gate = 0.0
+        elif abs(d) > self._D_GATE:
+            gate = self._D_GATE_FACTOR
         Q = [
             self._Q_T,
-            q_alpha,
-            self._Q_BETA_H if (mode == "heating" or (mode == "idle" and q_residual > 0)) else 0.0,
-            self._Q_BETA_C if mode == "cooling" else 0.0,
-            self._Q_BETA_S if q_solar > 0 else 0.0,
-            self._Q_BETA_O if q_occupancy > 0 else 0.0,
+            q_alpha * gate,
+            (self._Q_BETA_H if (mode == "heating" or (mode == "idle" and q_residual > 0)) else 0.0) * gate,
+            (self._Q_BETA_C if mode == "cooling" else 0.0) * gate,
+            (self._Q_BETA_S if q_solar > 0 else 0.0) * gate,
+            (self._Q_BETA_O if q_occupancy > 0 else 0.0) * gate,
+            self._Q_D,
         ]
 
         # FP = F @ P
@@ -818,6 +865,7 @@ class ThermalEKF:
         self._x[3] = max(self._BETA_C_MIN, min(self._BETA_C_MAX, self._x[3]))
         self._x[4] = max(self._BETA_S_MIN, min(self._BETA_S_MAX, self._x[4]))
         self._x[5] = max(self._BETA_O_MIN, min(self._BETA_O_MAX, self._x[5]))
+        self._x[6] = max(-self._D_MAX, min(self._D_MAX, self._x[6]))
 
     def _enforce_psd(self) -> None:
         """Enforce symmetry and positive semi-definiteness of P."""
@@ -839,7 +887,7 @@ class ThermalEKF:
     def to_dict(self) -> dict:
         """Serialize EKF state for persistence."""
         return {
-            "ekf_version": 6,
+            "ekf_version": 7,
             "x": list(self._x),
             "P": [list(row) for row in self._P],
             "n_updates": self._n_updates,
@@ -867,6 +915,7 @@ class ThermalEKF:
             self._P_INIT_BETA,
             self._P_INIT_BETA_S,
             self._P_INIT_BETA_O,
+            self._P_INIT_D,
         ]
         for i in range(self._N):
             for j in range(self._N):
@@ -882,17 +931,23 @@ class ThermalEKF:
         """Restore EKF from persisted data."""
         ekf = cls()
 
-        if "x" in data:
-            if len(data["x"]) == 6:
-                ekf._x = list(data["x"])
-            elif len(data["x"]) == 5:
-                ekf._x = list(data["x"]) + [cls._DEFAULT_BETA_O]
-        if "P" in data:
-            if len(data["P"]) == 6:
-                ekf._P = [list(row) for row in data["P"]]
-            elif len(data["P"]) == 5:
-                ekf._P = [list(row) + [0.0] for row in data["P"]]
-                ekf._P.append([0.0] * 5 + [cls._P_INIT_BETA_O])
+        # Migrate older state vectors by appending the newer states with
+        # their defaults: index 5 = beta_o, index 6 = disturbance d.
+        state_defaults = {5: cls._DEFAULT_BETA_O, 6: cls._DEFAULT_D}
+        p_defaults = {5: cls._P_INIT_BETA_O, 6: cls._P_INIT_D}
+        if "x" in data and 5 <= len(data["x"]) <= cls._N:
+            x = list(data["x"])
+            while len(x) < cls._N:
+                x.append(state_defaults[len(x)])
+            ekf._x = x
+        if "P" in data and 5 <= len(data["P"]) <= cls._N:
+            P = [list(row) for row in data["P"]]
+            while len(P) < cls._N:
+                n = len(P)
+                for row in P:
+                    row.append(0.0)
+                P.append([0.0] * n + [p_defaults[n]])
+            ekf._P = P
 
         ekf._n_updates = data.get("n_updates", 0)
         ekf._n_heating = data.get("n_heating", 0)
@@ -920,6 +975,13 @@ class ThermalEKF:
         ekf_version = ekf_version_raw if isinstance(ekf_version_raw, int) else 0
         if ekf_version < 6 and len(ekf._x) >= 6 and len(ekf._P) >= 6 and ekf._x[1] >= cls._ALPHA_MAX * 0.99:
             cls._reset_rc_params_for_recovery(ekf, ekf_version)
+        # v<7 → v7: recovery for models railed against the old LOWER alpha
+        # bound (0.005 → 200 h time constant). Pre-disturbance-state filters
+        # laundered persistent unmodeled load (ventilation) into alpha and
+        # the betas; a model at that rail carries corrupted parameters that
+        # the new, tighter bound alone would not heal.
+        if ekf_version < 7 and ekf._x[1] <= 0.005 * 1.05:
+            cls._reset_rc_params_for_recovery(ekf, ekf_version)
         # Apply bounds in case stored data is out of range
         ekf._clamp_parameters()
         return ekf
@@ -938,6 +1000,7 @@ class ThermalEKF:
         ekf._x[3] = cls._DEFAULT_BETA_C
         ekf._x[4] = cls._DEFAULT_BETA_S
         ekf._x[5] = cls._DEFAULT_BETA_O
+        ekf._x[6] = cls._DEFAULT_D
         p_init_diag = (
             cls._P_INIT_T,
             cls._P_INIT_ALPHA,
@@ -945,6 +1008,7 @@ class ThermalEKF:
             cls._P_INIT_BETA,
             cls._P_INIT_BETA_S,
             cls._P_INIT_BETA_O,
+            cls._P_INIT_D,
         )
         for i in range(cls._N):
             for j in range(cls._N):
@@ -953,7 +1017,7 @@ class ThermalEKF:
             if i >= 1:
                 ekf._P[i][i] = p_init_diag[i]
         _LOGGER.warning(
-            "ThermalEKF: recovered from alpha pegged at upper bound "
+            "ThermalEKF: recovered from alpha pegged at a bound "
             "(legacy ekf_version=%d, alpha=%.3f → reset to defaults). "
             "Predictions will improve over the next few hours as the filter relearns.",
             ekf_version,
