@@ -382,7 +382,7 @@ def test_ekf_serialization_roundtrip():
     assert restored.confidence == pytest.approx(ekf.confidence, abs=0.01)
 
     # Verify serialization metadata
-    assert data["ekf_version"] == 8
+    assert data["ekf_version"] == 9
 
 
 def test_ekf_get_model_c1_normalization():
@@ -1634,7 +1634,7 @@ def test_ekf_from_dict_6d_roundtrip():
     ekf.update(T_measured=20.0, T_outdoor=5.0, mode="idle", dt_minutes=5.0, q_occupancy=1.0)
     ekf.update(T_measured=20.5, T_outdoor=5.0, mode="idle", dt_minutes=5.0, q_occupancy=1.0)
     data = ekf.to_dict()
-    assert data["ekf_version"] == 8
+    assert data["ekf_version"] == 9
     restored = ThermalEKF.from_dict(data)
     for i in range(6):
         assert restored._x[i] == pytest.approx(ekf._x[i], rel=1e-6)
@@ -1867,7 +1867,7 @@ def test_to_dict_writes_current_version():
     ekf = ThermalEKF()
     ekf.update(T_measured=20.0, T_outdoor=10.0, mode="idle", dt_minutes=5.0)
     data = ekf.to_dict()
-    assert data["ekf_version"] == 8
+    assert data["ekf_version"] == 9
 
 
 def test_from_dict_v4_at_bound_preserves_counters_and_modes():
@@ -2173,6 +2173,60 @@ def test_from_dict_migrates_v6_to_v7():
     assert ekf._P[7][7] == ThermalEKF._P_INIT_ALPHA_V
     assert ekf._x[1] == pytest.approx(0.12)  # learned params preserved
     assert ekf._n_updates == 500
+
+
+def test_from_dict_v9_resets_material_disturbance():
+    """A pre-v9 filter with a materially nonzero disturbance is reset on load.
+
+    Before the coordinator's head-gap training guard, rung-servo holds and
+    setback parks were labeled cooling at the commanded power fraction while
+    the AC delivered nothing — the phantom work was laundered into d (field
+    data: +1.13 degC/h).  That d poisons every forecast; drop it and relearn.
+    """
+    data = {
+        "ekf_version": 8,
+        "x": [21.0, 0.05, 2.5, 10.9, 0.4, 0.2, 1.13, 0.11],
+        "P": [[0.1 if i == j else 0.02 for j in range(8)] for i in range(8)],
+        "n_updates": 4907,
+        "initialized": True,
+    }
+    ekf = ThermalEKF.from_dict(data)
+    assert ekf._x[6] == 0.0
+    assert ekf._P[6][6] == ThermalEKF._P_INIT_D
+    # Cross-covariances with d are cleared so nothing drags it back at once.
+    assert all(ekf._P[6][j] == 0.0 for j in range(8) if j != 6)
+    assert all(ekf._P[j][6] == 0.0 for j in range(8) if j != 6)
+    # Everything else survives.
+    assert ekf._x[1] == pytest.approx(0.05)
+    assert ekf._x[3] == pytest.approx(10.9)
+    assert ekf._n_updates == 4907
+
+
+def test_from_dict_v9_keeps_small_disturbance():
+    """A disturbance below the gate is plausible real load — preserved."""
+    data = {
+        "ekf_version": 8,
+        "x": [21.0, 0.05, 2.5, 3.5, 0.4, 0.2, -0.3, 0.11],
+        "P": [[0.1 if i == j else 0.0 for j in range(8)] for i in range(8)],
+        "n_updates": 500,
+        "initialized": True,
+    }
+    ekf = ThermalEKF.from_dict(data)
+    assert ekf._x[6] == pytest.approx(-0.3)
+    assert ekf._P[6][6] == pytest.approx(0.1)
+
+
+def test_from_dict_v9_save_not_re_reset():
+    """A v9 save with a large learned d is trusted — no repeated resets."""
+    data = {
+        "ekf_version": 9,
+        "x": [21.0, 0.05, 2.5, 3.5, 0.4, 0.2, 1.5, 0.11],
+        "P": [[0.1 if i == j else 0.0 for j in range(8)] for i in range(8)],
+        "n_updates": 500,
+        "initialized": True,
+    }
+    ekf = ThermalEKF.from_dict(data)
+    assert ekf._x[6] == pytest.approx(1.5)
 
 
 def test_from_dict_recovers_alpha_railed_at_old_floor():

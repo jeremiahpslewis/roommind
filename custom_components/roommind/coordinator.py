@@ -1156,6 +1156,25 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 ekf_mode = MODE_IDLE
                 ekf_pf = 0.0
                 q_residual_training = 0.0
+            elif self._acs_head_satisfied(room, ekf_mode):
+                # Head-gap guard: an AC obeys its own head sensor, and a
+                # commanded setpoint at or past that reading means the unit's
+                # internal control loop sees no demand — regardless of what
+                # hvac_action claims (many AC integrations report "cooling"
+                # whenever the mode is cool, or expose no hvac_action at
+                # all).  A rung-servo hold or setback park can sit in this
+                # regime for hours; training it as cooling at the commanded
+                # power_fraction attributes phantom work to the compressor
+                # and launders the miss into the disturbance state and
+                # beta_c/beta_h.
+                _LOGGER.debug(
+                    "Room '%s': head-gap guard — commanded %s but AC setpoints are non-demanding, training as idle",
+                    area_id,
+                    ekf_mode,
+                )
+                ekf_mode = MODE_IDLE
+                ekf_pf = 0.0
+                q_residual_training = 0.0
 
         # Zero-power normalization: heat source orchestration may yield
         # mean(pf)=0 while the commanded mode is still heating/cooling.
@@ -1478,19 +1497,28 @@ class RoomMindCoordinator(DataUpdateCoordinator):
 
         now = time.monotonic()
         prev = self._gap_prev.get(area_id)
-        self._gap_prev[area_id] = (current_temp, now, mode)
         if prev is None:
+            self._gap_prev[area_id] = (current_temp, now, mode)
             return
         prev_temp, prev_ts, prev_mode = prev
         dt_minutes = (now - prev_ts) / 60.0
-        if not (MIN_OBSERVATION_DT <= dt_minutes <= MAX_OBSERVATION_DT):
-            return
-        # A mode change mid-interval mixes two dynamics into one residual.
-        # MODE_IDLE intervals are observed too: a parked or holding unit left
-        # in cool/heat can keep trickling at a NEGATIVE gap (setpoint past its
-        # own reading), and that trickle — the gentlest output the unit has —
-        # is exactly what the negative-gap end of the curve must learn.
+        # A mode change mid-interval mixes two dynamics into one residual —
+        # restart the baseline.  MODE_IDLE intervals are observed too: a
+        # parked or holding unit left in cool/heat can keep trickling at a
+        # NEGATIVE gap (setpoint past its own reading), and that trickle —
+        # the gentlest output the unit has — is exactly what the negative-gap
+        # end of the curve must learn.
         if prev_mode != mode or mode not in (MODE_HEATING, MODE_COOLING, MODE_IDLE):
+            self._gap_prev[area_id] = (current_temp, now, mode)
+            return
+        if dt_minutes < MIN_OBSERVATION_DT:
+            # The coordinator cycle (UPDATE_INTERVAL) is shorter than a
+            # useful observation window.  Keep the existing baseline and let
+            # the interval accumulate across cycles — advancing it here would
+            # reject every observation forever.
+            return
+        self._gap_prev[area_id] = (current_temp, now, mode)
+        if dt_minutes > MAX_OBSERVATION_DT:
             return
 
         model = self._model_manager.get_model(area_id)
@@ -1607,6 +1635,48 @@ class RoomMindCoordinator(DataUpdateCoordinator):
 
         pf = 1.0 if dominated in ("heating", "cooling") else 0.0
         return (dominated, pf)
+
+    def _acs_head_satisfied(self, room: dict, mode: str) -> bool:
+        """True when every active device is an AC whose own setpoint demands nothing.
+
+        An AC regulates against its internal head sensor.  When the commanded
+        setpoint sits at or past that reading (cooling: setpoint >= head,
+        heating: setpoint <= head) the unit's control loop is satisfied and
+        the compressor delivers at most a trickle — however long RoomMind's
+        commanded mode stays heating/cooling.  Rung-servo holds and setback
+        parks live in this regime for hours; see the head-gap guard in
+        _observe_and_train.
+
+        Conservative by construction: any non-AC active device, any AC with
+        unreadable head/setpoint, or any AC actually demanding makes this
+        False, leaving the commanded training label untouched.  Head and
+        setpoint are compared in the device's own frame, so no unit
+        conversion is needed for the sign of the gap.
+        """
+        if mode not in (MODE_HEATING, MODE_COOLING):
+            return False
+        ac_eids = set(get_ac_eids(room.get("devices", [])))
+        if not ac_eids:
+            return False
+        saw_active_ac = False
+        for eid in get_all_entity_ids(room.get("devices", [])):
+            state = self.hass.states.get(eid)
+            if state is None or state.state in ("unavailable", "unknown", "off"):
+                continue
+            if eid not in ac_eids:
+                return False
+            head = state.attributes.get("current_temperature")
+            setpoint = state.attributes.get("temperature")
+            try:
+                head_f = float(head)
+                setpoint_f = float(setpoint)
+            except (TypeError, ValueError):
+                return False
+            gap = head_f - setpoint_f if mode == MODE_COOLING else setpoint_f - head_f
+            if gap > 0:
+                return False
+            saw_active_ac = True
+        return saw_active_ac
 
     def _devices_lack_hvac_action(self, room: dict) -> bool:
         """Return True if at least one active device lacks hvac_action.

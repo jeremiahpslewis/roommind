@@ -473,3 +473,195 @@ class TestGhostHeatingGuard:
 
         # process should not be called at all when learning is disabled
         assert kwargs is None
+
+
+# ---------------------------------------------------------------------------
+# Head-gap guard behaviour (parked/holding ACs)
+# ---------------------------------------------------------------------------
+
+
+def _ac_room(**overrides) -> dict:
+    room = _room_for_guard()
+    room["climate_mode"] = "cool_only"
+    room["devices"] = [
+        {
+            "entity_id": "climate.living_room",
+            "type": "ac",
+            "role": "auto",
+            "heating_system_type": "",
+            "idle_action": "setback",
+            "idle_fan_mode": "low",
+            "setpoint_mode": "proportional",
+        }
+    ]
+    room["thermostats"] = []
+    room["acs"] = ["climate.living_room"]
+    room.update(overrides)
+    return room
+
+
+class TestHeadGapGuard:
+    """An AC whose commanded setpoint sits at/past its own head reading is
+    satisfied — no compressor demand — however the integration labels its
+    hvac_action.  Rung-servo holds and setback parks live there for hours;
+    training them as cooling at the commanded power fraction launders the
+    phantom work into the disturbance state and beta_c (field data: bias
+    +1.13 degC/h, beta_c 10.9 after a 7 h parked 'cooling' stretch)."""
+
+    @pytest.mark.asyncio
+    async def test_parked_ac_trains_idle_despite_cooling_action(self, hass, mock_config_entry):
+        """Setpoint above the head reading + hvac_action='cooling' (a lying
+        integration) → head-gap guard downgrades training to idle."""
+        states_get = make_mock_states_get(
+            temp="28.0",
+            humidity="55.0",
+            schedule_state="on",
+            outdoor_temp="30.0",
+            extra={
+                "climate.living_room": (
+                    "cool",
+                    {
+                        "hvac_action": "cooling",
+                        "current_temperature": 27.0,
+                        "temperature": 28.0,  # parked past the head reading
+                        "hvac_modes": ["off", "cool", "heat", "auto"],
+                    },
+                ),
+            },
+        )
+        kwargs = await _run_and_capture_train_kwargs(hass, mock_config_entry, states_get, room=_ac_room())
+
+        assert kwargs is not None
+        assert kwargs["ekf_mode"] == MODE_IDLE
+        assert kwargs["ekf_pf"] == 0.0
+        assert kwargs["q_residual"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_parked_ac_trains_idle_without_hvac_action(self, hass, mock_config_entry):
+        """No hvac_action at all (the field case) → the head gap is still
+        observable and the guard fires."""
+        states_get = make_mock_states_get(
+            temp="28.0",
+            humidity="55.0",
+            schedule_state="on",
+            outdoor_temp="30.0",
+            extra={
+                "climate.living_room": (
+                    "cool",
+                    {
+                        "current_temperature": 27.0,
+                        "temperature": 27.0,  # gap exactly 0: satisfied
+                        "hvac_modes": ["off", "cool", "heat", "auto"],
+                    },
+                ),
+            },
+        )
+        kwargs = await _run_and_capture_train_kwargs(hass, mock_config_entry, states_get, room=_ac_room())
+
+        assert kwargs is not None
+        assert kwargs["ekf_mode"] == MODE_IDLE
+        assert kwargs["ekf_pf"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_demanding_ac_keeps_cooling_label_without_hvac_action(self, hass, mock_config_entry):
+        """Setpoint below the head reading → real demand → label preserved."""
+        states_get = make_mock_states_get(
+            temp="28.0",
+            humidity="55.0",
+            schedule_state="on",
+            outdoor_temp="30.0",
+            extra={
+                "climate.living_room": (
+                    "cool",
+                    {
+                        "current_temperature": 28.0,
+                        "temperature": 24.0,  # 4 K of head gap: demanding
+                        "hvac_modes": ["off", "cool", "heat", "auto"],
+                    },
+                ),
+            },
+        )
+        kwargs = await _run_and_capture_train_kwargs(hass, mock_config_entry, states_get, room=_ac_room())
+
+        assert kwargs is not None
+        assert kwargs["ekf_mode"] == MODE_COOLING
+        assert kwargs["ekf_pf"] > 0.0
+
+    @pytest.mark.asyncio
+    async def test_mixed_trv_and_ac_room_is_left_alone(self, hass, mock_config_entry):
+        """A non-AC active device makes head-gap reasoning inapplicable —
+        the guard must stay conservative and keep the commanded label."""
+        room = _room_for_guard(
+            devices=[
+                {
+                    "entity_id": "climate.living_room",
+                    "type": "trv",
+                    "role": "auto",
+                    "heating_system_type": "radiator",
+                    "idle_action": "off",
+                    "idle_fan_mode": "low",
+                    "setpoint_mode": "direct",
+                },
+                {
+                    "entity_id": "climate.living_room_ac",
+                    "type": "ac",
+                    "role": "auto",
+                    "heating_system_type": "",
+                    "idle_action": "off",
+                    "idle_fan_mode": "low",
+                    "setpoint_mode": "proportional",
+                },
+            ]
+        )
+        room["thermostats"] = ["climate.living_room"]
+        room["acs"] = ["climate.living_room_ac"]
+        states_get = make_mock_states_get(
+            temp="19.5",
+            humidity="55.0",
+            schedule_state="on",
+            outdoor_temp="5.0",
+            extra={
+                "climate.living_room": (
+                    "heat",
+                    {"current_temperature": 19.5, "temperature": 21.0},
+                ),
+                "climate.living_room_ac": (
+                    "heat",
+                    {
+                        "current_temperature": 21.0,
+                        "temperature": 19.0,  # AC satisfied, but TRV is active
+                        "hvac_modes": ["off", "heat", "cool", "heat_cool"],
+                    },
+                ),
+            },
+        )
+        kwargs = await _run_and_capture_train_kwargs(hass, mock_config_entry, states_get, room=room)
+
+        assert kwargs is not None
+        assert kwargs["ekf_mode"] == MODE_HEATING
+
+    @pytest.mark.asyncio
+    async def test_heating_ac_parked_low_trains_idle(self, hass, mock_config_entry):
+        """Heating mirror: setpoint at/below the head reading → satisfied."""
+        room = _ac_room(climate_mode="heat_only")
+        states_get = make_mock_states_get(
+            temp="19.5",
+            humidity="55.0",
+            schedule_state="on",
+            outdoor_temp="5.0",
+            extra={
+                "climate.living_room": (
+                    "heat",
+                    {
+                        "current_temperature": 21.0,
+                        "temperature": 19.0,  # parked below the head reading
+                        "hvac_modes": ["off", "heat", "cool", "heat_cool"],
+                    },
+                ),
+            },
+        )
+        kwargs = await _run_and_capture_train_kwargs(hass, mock_config_entry, states_get, room=room)
+
+        assert kwargs is not None
+        assert kwargs["ekf_mode"] == MODE_IDLE
+        assert kwargs["ekf_pf"] == 0.0

@@ -958,7 +958,7 @@ class ThermalEKF:
     def to_dict(self) -> dict:
         """Serialize EKF state for persistence."""
         return {
-            "ekf_version": 8,
+            "ekf_version": 9,
             "x": list(self._x),
             "P": [list(row) for row in self._P],
             "n_updates": self._n_updates,
@@ -1054,6 +1054,27 @@ class ThermalEKF:
         # the new, tighter bound alone would not heal.
         if ekf_version < 7 and ekf._x[1] <= 0.005 * 1.05:
             cls._reset_rc_params_for_recovery(ekf, ekf_version)
+        # v<9 → v9: reset a materially nonzero disturbance state.  Before the
+        # coordinator's head-gap training guard, hours of rung-servo holds and
+        # setback parks were labeled cooling/heating at the commanded power
+        # fraction while the AC head saw no demand — the filter laundered the
+        # phantom active power into d (and inflated beta).  A d learned under
+        # that corrupted labeling poisons every forecast; drop it and let the
+        # now-correctly-labeled stream relearn any real disturbance.
+        if ekf_version < 9 and abs(ekf._x[6]) > cls._D_GATE:
+            legacy_d = ekf._x[6]
+            ekf._x[6] = cls._DEFAULT_D
+            for j in range(cls._N):
+                ekf._P[6][j] = 0.0
+                ekf._P[j][6] = 0.0
+            ekf._P[6][6] = cls._P_INIT_D
+            _LOGGER.warning(
+                "ThermalEKF: reset disturbance state learned under mislabeled "
+                "hold/park intervals (legacy ekf_version=%d, d=%+.2f degC/h → 0). "
+                "Forecasts will settle over the next few hours.",
+                ekf_version,
+                legacy_d,
+            )
         # Apply bounds in case stored data is out of range
         ekf._clamp_parameters()
         return ekf
