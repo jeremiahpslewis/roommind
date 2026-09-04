@@ -1022,3 +1022,90 @@ def test_continuing_the_running_mode_is_not_charged():
     # From idle this deviation would not justify a start (see above with the
     # same magnitude); an already-running unit keeps working it off.
     assert plan.actions[0] == "cooling"
+
+
+# ---------------------------------------------------------------------------
+# Regulated cooling: the COOLING hypothesis and rollout model a
+# setpoint-following AC that holds at its target rather than plunging past it.
+# Field data (bedroom, Sep 4): once the thermal model became honest, the
+# unregulated full-Q_cool hypothesis made "keep cooling" look like a 2.5 K
+# overshoot near target, so the plan duty-cycled cooling/idle every 15-25 min.
+# ---------------------------------------------------------------------------
+
+
+def _warm_drift_model() -> RCModel:
+    """Bedroom-like C=1 model: weak envelope, strong AC, real warm load."""
+    return RCModel(C=1.0, U=0.08, Q_heat=3.0, Q_cool=11.3, bias=1.0)
+
+
+def test_cooling_holds_against_persistent_warm_drift():
+    """At target with a genuine warm load, an active run holds — no idle flip.
+
+    Net drift is ~+0.6 degC/h (bias 1.0 minus envelope loss to a 17 degC
+    night). The regulated hypothesis knows a holding run costs nothing and
+    keeps the room pinned; flipping to idle would drift warm and later pay a
+    restart. Before the fix this plan alternated cooling/idle at the min-run
+    period.
+    """
+    opt = MPCOptimizer(_warm_drift_model(), can_heat=False, can_cool=True, min_run_blocks=3)
+    plan = opt.optimize(
+        T_room=21.6,
+        T_outdoor_series=[17.0] * 24,
+        heat_target_series=[5.0] * 24,
+        cool_target_series=[21.5] * 24,
+        dt_minutes=5,
+        initial_mode=MODE_COOLING,
+    )
+    # The decision horizon holds the run (the tail block may tie off at the
+    # shrinking end of the horizon — harmless, plans are rebuilt every cycle)
+    # and the plan never restarts cooling after a release: no duty-cycling.
+    assert all(a == "cooling" for a in plan.actions[:12]), plan.actions
+    if "idle" in plan.actions:
+        first_idle = plan.actions.index("idle")
+        assert all(a == "idle" for a in plan.actions[first_idle:]), plan.actions
+    # And the held trajectory stays pinned near target, not plunging.
+    assert all(20.9 <= t <= 21.7 for t in plan.temperatures), plan.temperatures
+
+
+def test_cooling_releases_to_idle_when_drift_reverses():
+    """With no warm load and a cold night, the run ends instead of trickling.
+
+    Regulated cooling at/below target delivers nothing, so it ties with idle
+    and idle wins — the unit turns off rather than blowing air all night —
+    and the plan never restarts cooling while the room keeps sinking.
+    """
+    model = RCModel(C=1.0, U=0.08, Q_heat=3.0, Q_cool=11.3, bias=0.0)
+    opt = MPCOptimizer(model, can_heat=False, can_cool=True, min_run_blocks=3)
+    plan = opt.optimize(
+        T_room=21.4,
+        T_outdoor_series=[10.0] * 24,
+        heat_target_series=[5.0] * 24,
+        cool_target_series=[21.5] * 24,
+        dt_minutes=5,
+        initial_mode=MODE_COOLING,
+    )
+    assert "idle" in plan.actions
+    first_idle = plan.actions.index("idle")
+    assert all(a == "idle" for a in plan.actions[first_idle:]), plan.actions
+
+
+def test_holding_cooling_block_predicts_no_overshoot():
+    """A zero-demand cooling block (pf=MIN hold) must not forecast cooling.
+
+    The servo parks the head at/below target; MIN*Q_cool of predicted
+    cooling was phantom overshoot that poisoned the whole plan tail.
+    """
+    opt = MPCOptimizer(_warm_drift_model(), can_heat=False, can_cool=True, min_run_blocks=3)
+    plan = opt.optimize(
+        T_room=21.4,  # below the cool target: pure hold
+        T_outdoor_series=[17.0] * 12,
+        heat_target_series=[5.0] * 12,
+        cool_target_series=[21.5] * 12,
+        dt_minutes=5,
+        initial_mode=MODE_COOLING,
+    )
+    # First block is a min-run continuation below target — a hold. The
+    # predicted temperature must follow passive drift (warming here), not
+    # fall as if the compressor were delivering MIN power.
+    assert plan.actions[0] == "cooling"
+    assert plan.temperatures[1] >= plan.temperatures[0]
