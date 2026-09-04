@@ -242,11 +242,17 @@ class MPCOptimizer:
                 else:
                     pf = MIN_POWER_FRACTION
 
-            # Apply action with proportional Q for accurate forward prediction
+            # Apply action with proportional Q for accurate forward prediction.
+            # A proportional AC never drives past its own setpoint: at/below
+            # the cool target the rung servo parks the head and delivered
+            # power is ~zero — the pf=MIN command only keeps the run alive.
+            # Predicting MIN*Q_cool here forecast phantom overshoot for every
+            # holding block, which made sustained cooling look like a comfort
+            # violation and forced the plan into idle/cool duty-cycling.
             if best_action == MODE_HEATING:
                 Q = pf * self.model.Q_heat
             elif best_action == MODE_COOLING:
-                Q = -(pf * self.model.Q_cool)
+                Q = 0.0 if current_temp <= cool_tgt else -(pf * self.model.Q_cool)
             else:
                 Q = 0.0
             next_temp = self.model.predict(
@@ -327,6 +333,17 @@ class MPCOptimizer:
             # Simulate HVAC for min_run_blocks (not just 1 block) to correctly
             # value sustained heating/cooling over the lookahead horizon.
             block_Q = Q if j < self.min_run_blocks else 0.0
+            # Regulated cooling: a setpoint-following AC holds at its target
+            # instead of overshooting past it, so the COOLING hypothesis must
+            # not charge itself for a full-power plunge it would never
+            # deliver. Without this the hypothesis predicted min_run blocks
+            # of unregulated Q_cool, made "keep cooling" look like a comfort
+            # violation near target, and duty-cycled against idle. Heating is
+            # left unregulated deliberately: UFH pre-heat charges thermal
+            # mass past the current target on purpose.
+            c_tgt = future_cool_targets[j] if j < len(future_cool_targets) else cool_target
+            if action == MODE_COOLING and block_Q != 0.0 and T <= c_tgt:
+                block_Q = 0.0
             # Residual for the idle / post-run blocks. For the HEATING
             # hypothesis on a gated slow system, synthesize the afterglow this
             # hypothetical run would generate; otherwise fall back to the
@@ -354,16 +371,16 @@ class MPCOptimizer:
             # from implausible model predictions
             T = max(self.temp_min, min(self.temp_max, T))
             h_tgt = future_heat_targets[j] if j < len(future_heat_targets) else heat_target
-            c_tgt = future_cool_targets[j] if j < len(future_cool_targets) else cool_target
             # Dead-band-aware comfort cost: zero inside the band
             if T < h_tgt:
                 total_cost += self.w_comfort * (T - h_tgt) ** 2
             elif T > c_tgt:
                 total_cost += self.w_comfort * (T - c_tgt) ** 2
             # else: inside dead band, no comfort cost
-            # Energy cost: proportional to HVAC power for min_run blocks
+            # Energy cost: proportional to the power actually simulated for
+            # the block — a regulated (held) cooling block consumes ~nothing.
             if j < self.min_run_blocks and action != MODE_IDLE:
-                total_cost += self.w_energy * abs(Q) / 1000.0
+                total_cost += self.w_energy * abs(block_Q) / 1000.0
 
         return total_cost
 
