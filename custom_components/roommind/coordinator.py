@@ -254,6 +254,18 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         else:
             self._model_manager.set_vent_temp(None)
 
+        # Ventilation supply volume flow (optional, m3/h). Scales the learned
+        # vent conductance to the live fan stage — a modulating system (night
+        # boost, day setback) otherwise forces its time-varying coupling into
+        # alpha and the disturbance state. None = constant-volume assumption.
+        vent_flow_sensor_id = settings.get("ventilation_flow_sensor")
+        if vent_flow_sensor_id:
+            self._model_manager.set_vent_flow(
+                read_sensor_value(self.hass, vent_flow_sensor_id, "global", "ventilation volume flow")
+            )
+        else:
+            self._model_manager.set_vent_flow(None)
+
         # Load compressor groups from settings (every cycle, cheap)
         self._compressor_manager.load_groups(settings.get("compressor_groups", []))
 
