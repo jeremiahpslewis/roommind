@@ -2413,3 +2413,87 @@ def test_manager_stamps_vent_temp_on_models():
     assert model.vent_temp == 17.5
     mgr.set_vent_temp(None)
     assert mgr.get_model("room_a").vent_temp is None
+
+
+# ---------------------------------------------------------------------------
+# Flow-scaled ventilation conductance: alpha_v is the conductance at the
+# reference flow; the live volume flow scales the effective coupling. A
+# modulating system (night boost, day setback) otherwise forces its
+# time-varying coupling into alpha and the disturbance state — the exact
+# regime change behind the field (alpha, d) ridge.
+# ---------------------------------------------------------------------------
+
+
+def test_vent_scale_scales_predicted_coupling():
+    """Twice the flow pulls the prediction twice as hard toward supply air."""
+
+    def predicted_T(scale: float) -> float:
+        ekf = ThermalEKF(T_init=22.0)
+        ekf._x[7] = 0.3
+        ekf._predict_step(T_outdoor=22.0, mode="idle", dt_h=0.5, T_vent=16.0, vent_scale=scale)
+        return ekf._x[0]
+
+    t1 = predicted_T(1.0)
+    t2 = predicted_T(2.0)
+    t0 = predicted_T(0.0)
+    assert t2 < t1 < 22.0  # stronger flow, stronger pull toward 16°C
+    assert t0 == pytest.approx(22.0, abs=1e-9)  # flow off: coupling inert
+
+
+def test_vent_scale_zero_freezes_alpha_v():
+    """With the fan off the coupling is unobservable — alpha_v must not move."""
+    ekf = ThermalEKF(T_init=22.0)
+    ekf._initialized = True
+    ekf._x[7] = 0.25
+    for _ in range(50):
+        ekf.update(T_measured=21.9, T_outdoor=15.0, mode="idle", dt_minutes=3.0, T_vent=16.0, vent_scale=0.0)
+    assert ekf._x[7] == pytest.approx(0.25, abs=1e-6)
+
+
+def test_vent_coupling_identified_under_modulating_flow():
+    """A day/night fan schedule is explained by the flow scale, not by d.
+
+    Truth: conductance proportional to flow — 200 m3/h at 'night', 60 by
+    'day' — with the supply air 6 K below the room and no envelope gradient.
+    A constant-conductance model would launder the difference into the
+    disturbance state; the flow-scaled model identifies the reference
+    conductance and keeps d small.
+    """
+    ekf = ThermalEKF(T_init=22.0)
+    ekf._initialized = True
+    alpha_v_ref_true = 0.15  # at the 100 m3/h reference
+    T_true = 22.0
+    for k in range(600):
+        flow = 200.0 if (k // 100) % 2 == 0 else 60.0  # alternate every 5 h
+        T_vent = T_true - 6.0
+        dT = alpha_v_ref_true * (flow / 100.0) * (T_vent - T_true) * (3.0 / 60.0)
+        T_true += dT
+        ekf.update(
+            T_measured=T_true,
+            T_outdoor=T_true,
+            mode="idle",
+            dt_minutes=3.0,
+            T_vent=T_vent,
+            vent_scale=flow / 100.0,
+        )
+    assert ekf._x[7] == pytest.approx(alpha_v_ref_true, abs=0.05)
+    assert abs(ekf._x[6]) < 0.3  # d did not eat the fan schedule
+
+
+def test_manager_scales_u_vent_by_flow():
+    mgr = RoomModelManager()
+    mgr.set_vent_temp(17.5)
+    est = mgr.get_estimator("room_a")
+    est._x[7] = 0.2
+    # No flow sensor → unscaled (constant-volume assumption)
+    mgr.set_vent_flow(None)
+    assert mgr.get_model("room_a").U_vent == pytest.approx(0.2)
+    # 200 m3/h at a 100 m3/h reference → double conductance
+    mgr.set_vent_flow(200.0)
+    assert mgr.get_model("room_a").U_vent == pytest.approx(0.4)
+    # Fan off → coupling off
+    mgr.set_vent_flow(0.0)
+    assert mgr.get_model("room_a").U_vent == pytest.approx(0.0)
+    # Absurd reading → clamped, not multiplied into nonsense
+    mgr.set_vent_flow(10000.0)
+    assert mgr.get_model("room_a").U_vent == pytest.approx(0.2 * RoomModelManager._VENT_SCALE_MAX)

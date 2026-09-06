@@ -22,6 +22,7 @@ SERVICE_UPDATE_SETTINGS = "update_settings"
 # could shadow structured settings the UI owns.
 _ALLOWED_KEYS = {
     "ventilation_supply_sensor",
+    "ventilation_flow_sensor",
 }
 
 _SCHEMA = vol.Schema(
