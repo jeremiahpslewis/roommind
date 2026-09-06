@@ -382,7 +382,7 @@ def test_ekf_serialization_roundtrip():
     assert restored.confidence == pytest.approx(ekf.confidence, abs=0.01)
 
     # Verify serialization metadata
-    assert data["ekf_version"] == 9
+    assert data["ekf_version"] == 10
 
 
 def test_ekf_get_model_c1_normalization():
@@ -1634,7 +1634,7 @@ def test_ekf_from_dict_6d_roundtrip():
     ekf.update(T_measured=20.0, T_outdoor=5.0, mode="idle", dt_minutes=5.0, q_occupancy=1.0)
     ekf.update(T_measured=20.5, T_outdoor=5.0, mode="idle", dt_minutes=5.0, q_occupancy=1.0)
     data = ekf.to_dict()
-    assert data["ekf_version"] == 9
+    assert data["ekf_version"] == 10
     restored = ThermalEKF.from_dict(data)
     for i in range(6):
         assert restored._x[i] == pytest.approx(ekf._x[i], rel=1e-6)
@@ -1867,7 +1867,7 @@ def test_to_dict_writes_current_version():
     ekf = ThermalEKF()
     ekf.update(T_measured=20.0, T_outdoor=10.0, mode="idle", dt_minutes=5.0)
     data = ekf.to_dict()
-    assert data["ekf_version"] == 9
+    assert data["ekf_version"] == 10
 
 
 def test_from_dict_v4_at_bound_preserves_counters_and_modes():
@@ -2217,7 +2217,7 @@ def test_from_dict_v9_keeps_small_disturbance():
 
 
 def test_from_dict_v9_save_not_re_reset():
-    """A v9 save with a large learned d is trusted — no repeated resets."""
+    """A v9 save with d at (not past) the v10 gate is trusted on load."""
     data = {
         "ekf_version": 9,
         "x": [21.0, 0.05, 2.5, 3.5, 0.4, 0.2, 1.5, 0.11],
@@ -2227,6 +2227,56 @@ def test_from_dict_v9_save_not_re_reset():
     }
     ekf = ThermalEKF.from_dict(data)
     assert ekf._x[6] == pytest.approx(1.5)
+
+
+def test_from_dict_v10_resets_ridge_ridden_params():
+    """A pre-v10 save with d past half its bound rode the (alpha, d) ridge.
+
+    Field data: bias ratcheted +0.5 → +1.1 → +2.1 degC/h over three days
+    while alpha tripled — both corrupted, so the whole RC set resets.
+    """
+    data = {
+        "ekf_version": 9,
+        "x": [21.0, 0.214, 3.0, 8.9, 0.5, 0.3, 2.13, 0.3],
+        "P": [[0.1 if i == j else 0.02 for j in range(8)] for i in range(8)],
+        "n_updates": 6064,
+        "initialized": True,
+    }
+    ekf = ThermalEKF.from_dict(data)
+    assert ekf._x[6] == 0.0
+    assert ekf._x[1] == ThermalEKF._DEFAULT_ALPHA
+    assert ekf._x[3] == ThermalEKF._DEFAULT_BETA_C
+    assert ekf._n_updates == 6064  # counters preserved: data gates stay open
+
+
+def test_from_dict_v10_save_with_large_d_trusted():
+    """A v10 save is post-mean-reversion: a large d there is evidence-backed."""
+    data = {
+        "ekf_version": 10,
+        "x": [21.0, 0.05, 2.5, 3.5, 0.4, 0.2, 2.5, 0.11],
+        "P": [[0.1 if i == j else 0.0 for j in range(8)] for i in range(8)],
+        "n_updates": 500,
+        "initialized": True,
+    }
+    ekf = ThermalEKF.from_dict(data)
+    assert ekf._x[6] == pytest.approx(2.5)
+
+
+def test_disturbance_state_mean_reverts():
+    """The disturbance decays toward zero through the predict step.
+
+    A pure random walk let d ratchet upward indefinitely; with mean
+    reversion a large d held without fresh evidence must shrink.
+    """
+    import math
+
+    ekf = ThermalEKF(T_init=21.0)
+    ekf._x[6] = 2.0
+    ekf._predict_step(T_outdoor=21.0, mode="idle", dt_h=1.0)
+    assert ekf._x[6] == pytest.approx(2.0 * math.exp(-1.0 / ThermalEKF._D_TAU_H))
+    # And the interval's temperature integral still used the pre-decay d:
+    # one hour at ~2 degC/h of disturbance with no other gradient.
+    assert ekf._x[0] > 22.5
 
 
 def test_from_dict_recovers_alpha_railed_at_old_floor():

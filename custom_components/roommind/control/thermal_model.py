@@ -315,6 +315,16 @@ class ThermalEKF:
     _Q_BETA_S: float = 0.002  # solar gain drift
     _Q_BETA_O: float = 0.002  # occupancy gain drift
     _Q_D: float = 0.02  # disturbance walks on the hours scale (ventilation schedules)
+    # Mean-reversion time constant for the disturbance state [hours]. A pure
+    # random walk lets (alpha, d) ride an identifiability ridge: an unmodeled
+    # regime change (a window-open night, coupling to the warm house interior
+    # instead of outdoors) pushes alpha up, the rebound pushes d up, and
+    # nothing ever pulls either back — field data showed d ratcheting
+    # +0.5 → +1.1 → +2.1 degC/h over three days with alpha tripling alongside.
+    # Decaying d toward zero anchors it: holding a large value now requires
+    # continuous fresh evidence, while hours-scale real loads (occupancy,
+    # cooking) are barely attenuated.
+    _D_TAU_H: float = 6.0
     _Q_ALPHA_V: float = 0.001  # ventilation coupling drift (fan-stage changes)
 
     # Measurement noise
@@ -809,9 +819,12 @@ class ThermalEKF:
         # Occupancy heat: always additive (not mode-gated); disturbance too
         u = u_hvac + beta_s * q_solar + beta_o * q_occupancy + u_residual + d
 
-        # State prediction (analytical or linearized)
+        # State prediction (analytical or linearized). The temperature
+        # integral uses the pre-decay disturbance (first-order exact for a
+        # slow decay); d itself mean-reverts toward zero — see _D_TAU_H.
         T_new = self._state_transition(T, alpha, u, T_outdoor, dt_h, alpha_v=alpha_v, T_vent=T_vent)
-        self._x = [T_new, alpha, beta_h, beta_c, beta_s, beta_o, d, alpha_v]
+        d_decay = math.exp(-dt_h / self._D_TAU_H)
+        self._x = [T_new, alpha, beta_h, beta_c, beta_s, beta_o, d * d_decay, alpha_v]
 
         # Jacobian at current state
         F = self._compute_jacobian(
@@ -828,6 +841,8 @@ class ThermalEKF:
             alpha_v=alpha_v,
             T_vent=T_vent,
         )
+        # The disturbance row is not a pure random walk — it mean-reverts.
+        F[6][6] = d_decay
 
         # Covariance prediction: P = F @ P @ F^T + Q_noise
         N = self._N
@@ -958,7 +973,7 @@ class ThermalEKF:
     def to_dict(self) -> dict:
         """Serialize EKF state for persistence."""
         return {
-            "ekf_version": 9,
+            "ekf_version": 10,
             "x": list(self._x),
             "P": [list(row) for row in self._P],
             "n_updates": self._n_updates,
@@ -1072,6 +1087,21 @@ class ThermalEKF:
                 "ThermalEKF: reset disturbance state learned under mislabeled "
                 "hold/park intervals (legacy ekf_version=%d, d=%+.2f degC/h → 0). "
                 "Forecasts will settle over the next few hours.",
+                ekf_version,
+                legacy_d,
+            )
+        # v<10 → v10: recovery from the (alpha, d) identifiability ridge.
+        # Before disturbance mean-reversion, unmodeled regime changes
+        # (window-open nights, interior-coupled rooms) ratcheted d and alpha
+        # up together — d past half its physical bound means the whole RC
+        # parameter set rode the ridge and cannot be trusted; reset it and
+        # let the now-anchored filter relearn.
+        if ekf_version < 10 and abs(ekf._x[6]) > cls._D_MAX / 2.0:
+            legacy_d = ekf._x[6]
+            cls._reset_rc_params_for_recovery(ekf, ekf_version)
+            _LOGGER.warning(
+                "ThermalEKF: disturbance state rode the identifiability ridge "
+                "(legacy ekf_version=%d, d=%+.2f degC/h) — RC parameters reset.",
                 ekf_version,
                 legacy_d,
             )
