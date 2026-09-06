@@ -391,6 +391,15 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
         outdoor["forecast_available"] = bool(forecast)
         outdoor["forecast_points"] = len(forecast) if forecast else 0
 
+    ventilation: dict[str, Any] = {}
+    if coordinator:
+        mm = coordinator._model_manager
+        ventilation = {
+            "supply_temp": mm._vent_temp,
+            "volume_flow": mm._vent_flow,
+            "flow_scale": round(mm._vent_scale(), 3),
+        }
+
     # Recent history (last 2 hours of detail data per room)
     recent_history: dict[str, list] = {}
     if coordinator and coordinator._history_store:
@@ -448,6 +457,7 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
         "settings": {"control_mode": DEFAULT_CONTROL_MODE, **settings},
         "rooms": rooms_diag,
         "outdoor": outdoor,
+        "ventilation": ventilation,
         "recent_history": recent_history,
         "history_48h": history_48h,
         "compressor_groups": compressor,

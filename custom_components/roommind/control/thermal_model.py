@@ -597,6 +597,7 @@ class ThermalEKF:
         q_occupancy: float = 0.0,
         q_rebound: float | None = None,
         T_vent: float | None = None,
+        vent_scale: float = 1.0,
     ) -> None:
         """Run one full EKF cycle: predict then update with measurement.
 
@@ -612,6 +613,11 @@ class ThermalEKF:
             q_rebound: mean AC rebound charge over the interval (0-1); None
                 leaves beta_f out (no charge tracked).
             T_vent: ventilation supply-air temperature [degC], None = no coupling.
+            vent_scale: live volume flow relative to the reference flow. The
+                state alpha_v is the conductance AT the reference flow; the
+                effective conductance this interval is alpha_v * vent_scale,
+                so a modulating ventilation system (night boost, day setback)
+                no longer forces its time-varying coupling into alpha.
         """
         if dt_minutes <= 0:
             return
@@ -642,6 +648,7 @@ class ThermalEKF:
             q_occupancy=q_occupancy,
             q_rebound=q_rebound,
             T_vent=T_vent,
+            vent_scale=vent_scale,
         )
 
         # --- Update step ---
@@ -828,9 +835,14 @@ class ThermalEKF:
         q_occupancy: float = 0.0,
         q_rebound: float | None = None,
         T_vent: float | None = None,
+        vent_scale: float = 1.0,
     ) -> None:
         """EKF predict: propagate state and covariance forward."""
         T, alpha, beta_h, beta_c, beta_s, beta_o, beta_f, alpha_v = self._x
+        # Effective ventilation conductance this interval: the state alpha_v
+        # is the conductance at the reference flow, scaled by the live volume
+        # flow (conductance is proportional to mass flow).
+        av_eff = alpha_v * vent_scale
         u_hvac = self._mode_to_u(mode) * power_fraction
         # Residual heat: during idle, thermal mass continues releasing stored energy
         u_residual = beta_h * q_residual if mode == "idle" and q_residual > 0 else 0.0
@@ -841,7 +853,7 @@ class ThermalEKF:
         u = u_hvac + beta_s * q_solar + beta_o * q_occupancy + u_residual + u_rebound
 
         # State prediction (analytical or linearized)
-        T_new = self._state_transition(T, alpha, u, T_outdoor, dt_h, alpha_v=alpha_v, T_vent=T_vent)
+        T_new = self._state_transition(T, alpha, u, T_outdoor, dt_h, alpha_v=av_eff, T_vent=T_vent)
         self._x = [T_new, alpha, beta_h, beta_c, beta_s, beta_o, beta_f, alpha_v]
 
         # Jacobian at current state
@@ -857,9 +869,12 @@ class ThermalEKF:
             q_residual=q_residual,
             q_occupancy=q_occupancy,
             q_rebound=q_rebound,
-            alpha_v=alpha_v,
+            alpha_v=av_eff,
             T_vent=T_vent,
         )
+        # The Jacobian above differentiates against the EFFECTIVE conductance;
+        # the state is the reference-flow value, so chain-rule the flow scale.
+        F[0][7] *= vent_scale
         self._excited = [True, True] + [F[0][i] != 0.0 for i in range(2, self._N)]
         # Solar gain is learned from sunny steps without heating only: while
         # heating, the innovation is dominated by how far the emitter's real
@@ -886,8 +901,10 @@ class ThermalEKF:
             self._Q_BETA_S if solar_learnable else 0.0,
             self._Q_BETA_O if q_occupancy > 0 else 0.0,
             self._Q_BETA_F if fast != 0.0 else 0.0,
-            # Ventilation coupling learns only with a live supply-air reading
-            self._Q_ALPHA_V if T_vent is not None else 0.0,
+            # Ventilation coupling learns only with a live supply-air reading.
+            # With the flow at zero the coupling is unobservable (F[0][7] = 0),
+            # so no drift then either.
+            self._Q_ALPHA_V if (T_vent is not None and vent_scale > 0.0) else 0.0,
         ]
 
         # FP = F @ P
@@ -1152,16 +1169,40 @@ class RoomModelManager:
     request predictions without worrying about per-room bookkeeping.
     """
 
+    # Reference volume flow [m3/h] the learned alpha_v/U_vent is expressed at.
+    # Conductance is proportional to mass flow, so the effective coupling each
+    # interval is alpha_v * (flow / VENT_FLOW_REF). The constant is arbitrary
+    # (the EKF learns alpha_v in whatever units this implies) — it only fixes
+    # the semantics of the stored value.
+    VENT_FLOW_REF: float = 100.0
+    # Sanity clamp on the flow scale — a misreporting sensor must not multiply
+    # the coupling into absurdity.
+    _VENT_SCALE_MAX: float = 5.0
+
     def __init__(self) -> None:
         self._estimators: dict[str, ThermalEKF] = {}
         # Whole-house ventilation supply-air temperature [degC], refreshed by
         # the coordinator each cycle; None when no sensor is wired or it is
         # unavailable (the vent coupling then freezes instead of corrupting).
         self._vent_temp: float | None = None
+        # Live supply volume flow [m3/h]; None when no flow sensor is wired or
+        # it is unavailable — the coupling then runs unscaled (constant-volume
+        # assumption), exactly the pre-flow-sensor behavior.
+        self._vent_flow: float | None = None
 
     def set_vent_temp(self, value: float | None) -> None:
         """Set the current ventilation supply-air temperature (global)."""
         self._vent_temp = value
+
+    def set_vent_flow(self, value: float | None) -> None:
+        """Set the current ventilation supply volume flow [m3/h] (global)."""
+        self._vent_flow = value
+
+    def _vent_scale(self) -> float:
+        """Live flow relative to the reference flow; 1.0 without a sensor."""
+        if self._vent_flow is None:
+            return 1.0
+        return max(0.0, min(self._VENT_SCALE_MAX, self._vent_flow / self.VENT_FLOW_REF))
 
     def get_room_ids(self) -> list[str]:
         """Return list of room IDs with learned models."""
@@ -1198,6 +1239,7 @@ class RoomModelManager:
             mode,
             dt_minutes,
             T_vent=self._vent_temp,
+            vent_scale=self._vent_scale(),
             power_fraction=power_fraction,
             q_solar=q_solar,
             q_residual=q_residual,
@@ -1219,11 +1261,13 @@ class RoomModelManager:
     def get_model(self, area_id: str) -> RCModel:
         """Return the learned RCModel for *area_id* (C=1 normalization).
 
-        Stamped with the current ventilation supply-air temperature, so every
-        consumer's predictions include the vent coupling automatically.
+        Stamped with the current ventilation supply-air temperature, and with
+        U_vent scaled to the live volume flow, so every consumer's predictions
+        include the vent coupling at its current strength automatically.
         """
         model = self.get_estimator(area_id).get_model()
         model.vent_temp = self._vent_temp
+        model.U_vent = model.U_vent * self._vent_scale()
         return model
 
     def get_confidence(self, area_id: str) -> float:
