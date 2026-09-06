@@ -6,7 +6,7 @@ update_settings:
   fields:
     settings:
       name: Settings
-      description: "Mapping of setting keys to values, e.g. {ventilation_supply_sensor: sensor.maico_temperatur_zuluft}"
+      description: "Mapping of setting keys to values, e.g. {ventilation_supply_sensor: sensor.maico_temperatur_zuluft, ventilation_flow_sensor: sensor.maico_aktueller_volumenstrom_zul}"
       required: true
       example: '{"ventilation_supply_sensor": "sensor.maico_temperatur_zuluft"}'
       selector:
