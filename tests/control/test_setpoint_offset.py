@@ -240,8 +240,8 @@ async def test_setback_keeps_offset_for_direct_device():
 
     await async_idle_device(hass, "climate.dev", devices, targets=TargetTemps(heat=None, cool=24.0))
 
-    # cool target 24 + offset 1 + setback 2 = 27
-    assert _sent(hass) == [27.0]
+    # cool target 24 + offset 1 + lean AC park 1 = 26
+    assert _sent(hass) == [26.0]
 
 
 @pytest.mark.asyncio
@@ -271,8 +271,8 @@ async def test_setback_ignores_offset_without_external_sensor():
 
     await ctrl.async_apply("idle", TargetTemps(heat=None, cool=24.0))
 
-    # cool target 24 + setback 2, no offset
-    assert _sent(hass) == [26.0]
+    # cool target 24 + lean AC park 1, no offset
+    assert _sent(hass) == [25.0]
 
 
 @pytest.mark.asyncio
@@ -285,4 +285,5 @@ async def test_setback_keeps_offset_with_external_sensor_via_controller():
 
     await ctrl.async_apply("idle", TargetTemps(heat=None, cool=24.0))
 
-    assert _sent(hass) == [27.0]
+    # cool target 24 + offset 1 + lean AC park 1
+    assert _sent(hass) == [26.0]
