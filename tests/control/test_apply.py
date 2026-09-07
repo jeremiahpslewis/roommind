@@ -4430,35 +4430,35 @@ async def test_setback_cooling_widens_for_warm_head_sensor():
     idle setpoint must clear the head reading so the unit actually stops.
     """
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=23.0, current_temp=19.0)
-    # 20.5 + 2.0 + (23.0 - 19.0) = 26.5
-    assert temp == 26.5
+    # 20.5 + AC_RELEASE_PARK_C (1.0) + (23.0 - 19.0) = 25.5
+    assert temp == 25.5
 
 
 @pytest.mark.asyncio
 async def test_setback_cooling_head_offset_capped():
     """A wildly-biased head sensor cannot push the setback past the cap."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=27.0, current_temp=19.0)
-    # offset 8.0 capped at AC_MAX_HEAD_GAP_C (6.0): 20.5 + 2.0 + 6.0 = 28.5
-    assert temp == 28.5
+    # offset 8.0 capped at AC_MAX_HEAD_GAP_C (6.0): 20.5 + 1.0 + 6.0 = 27.5
+    assert temp == 27.5
 
 
 @pytest.mark.asyncio
 async def test_setback_cooling_ignores_cool_reading_head():
     """A head reading cooler than the room must not lower the setback setpoint."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=18.0, current_temp=19.0)
-    assert temp == 22.5  # plain target + offset
+    assert temp == 21.5  # plain target + AC parking margin
 
 
 @pytest.mark.asyncio
 async def test_setback_without_room_temp_unchanged():
-    """No external reading available: legacy setback behavior."""
+    """No external reading available: plain AC parking margin."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=23.0, current_temp=None)
-    assert temp == 22.5
+    assert temp == 21.5
 
 
 @pytest.mark.asyncio
 async def test_setback_heating_widens_for_cold_head_sensor():
     """Heating mirror: a head reading colder than the room lowers the setback."""
     temp = await _setback_sent_temp("heat", TargetTemps(heat=21.0, cool=None), head_temp=18.0, current_temp=21.0)
-    # 21.0 - 2.0 - (21.0 - 18.0) = 16.0
-    assert temp == 16.0
+    # 21.0 - 1.0 - (21.0 - 18.0) = 17.0
+    assert temp == 17.0

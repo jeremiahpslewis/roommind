@@ -17,6 +17,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from .const import (
     AC_COOLING_BOOST_TARGET,
     AC_HEATING_BOOST_TARGET,
+    AC_RELEASE_PARK_C,
     CLIMATE_MODE_COOL_ONLY,
     CLIMATE_MODE_HEAT_ONLY,
     DEFAULT_COMFORT_COOL,
@@ -75,7 +76,6 @@ from .managers.valve_manager import ValveManager
 from .managers.weather_manager import WeatherManager
 from .managers.window_manager import WindowManager
 from .utils.device_utils import (
-    DEFAULT_IDLE_SETBACK_OFFSET,
     build_rooms_devices_map,
     get_ac_eids,
     get_all_entity_ids,
@@ -1452,7 +1452,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             if not has_thermostats and head_frame_shift is not None:
                 # Release (no deficit): adverse component + setback parking
                 if sp <= target_temp <= current_temp:
-                    shift = min(0.0, head_frame_shift) - DEFAULT_IDLE_SETBACK_OFFSET
+                    shift = min(0.0, head_frame_shift) - AC_RELEASE_PARK_C
                 else:
                     shift = head_frame_shift
                 sp = round(sp + shift, 1)
@@ -1473,7 +1473,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             if head_frame_shift is not None:
                 # Release (no deficit): adverse component + setback parking
                 if sp >= target_temp >= current_temp:
-                    shift = max(0.0, head_frame_shift) + DEFAULT_IDLE_SETBACK_OFFSET
+                    shift = max(0.0, head_frame_shift) + AC_RELEASE_PARK_C
                 else:
                     shift = head_frame_shift
                 sp = round(sp + shift, 1)

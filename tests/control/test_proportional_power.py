@@ -208,12 +208,12 @@ async def test_proportional_ac_heating_clamped_floor():
         has_external_sensor=True,
     )
     # Holding regime (pf <= MIN): rung servo starts at the quiet end,
-    # one step above the parked release (21.0 - 2.0 + 0.5, no head data).
+    # one step above the parked release (21.0 - 1.0 + 0.5, no head data).
     await ctrl.async_apply("heating", 21.0, power_fraction=0.01, current_temp=20.5)
 
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
-    assert any(c[0][2]["temperature"] == 19.5 for c in temp_calls)
+    assert any(c[0][2]["temperature"] == 20.5 for c in temp_calls)
 
 
 @pytest.mark.asyncio
@@ -235,12 +235,12 @@ async def test_proportional_ac_cooling_clamped_ceiling():
         has_external_sensor=True,
     )
     # Holding regime (pf <= MIN): the rung servo starts at the quiet end,
-    # one step below the parked release (23.0 + 2.0 - 0.5, no head data).
+    # one step below the parked release (23.0 + 1.0 - 0.5, no head data).
     await ctrl.async_apply("cooling", 23.0, power_fraction=0.01, current_temp=23.5)
 
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
-    assert any(c[0][2]["temperature"] == 24.5 for c in temp_calls)
+    assert any(c[0][2]["temperature"] == 23.5 for c in temp_calls)
 
 
 @pytest.mark.asyncio
@@ -765,7 +765,7 @@ async def test_ac_cooling_releases_when_room_below_target():
     kept the commanded setpoint at or below the falling room temperature, so
     the AC could never release and chased the room downward. Now: holding
     regime → parity value = target; room below target → release → setback
-    parking (21.0 + 2.0 with no head data).
+    parking (21.0 + 1.0 with no head data).
     """
     hass, ctrl = _make_cooling_ctrl()
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.1, current_temp=20.0)
@@ -774,7 +774,7 @@ async def test_ac_cooling_releases_when_room_below_target():
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
     assert temp_calls
     sp = temp_calls[0][0][2]["temperature"]
-    assert sp == 23.0
+    assert sp == 22.0
     # The commanded setpoint must sit well above the room temperature
     assert sp > 20.0
 
@@ -787,8 +787,8 @@ async def test_ac_cooling_zero_power_releases_at_target():
 
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
-    # Parked at the setback position: target + 2.0 (no head data)
-    assert any(c[0][2]["temperature"] == 23.0 for c in temp_calls)
+    # Parked at the setback position: target + 1.0 (no head data)
+    assert any(c[0][2]["temperature"] == 22.0 for c in temp_calls)
 
 
 @pytest.mark.asyncio
@@ -854,8 +854,8 @@ async def test_ac_heating_releases_when_room_above_target():
 
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
-    # Parked at the setback position: target - 2.0 (no head data)
-    assert any(c[0][2]["temperature"] == 19.0 for c in temp_calls)
+    # Parked at the setback position: target - 1.0 (no head data)
+    assert any(c[0][2]["temperature"] == 20.0 for c in temp_calls)
 
 
 @pytest.mark.asyncio
@@ -1080,7 +1080,7 @@ async def test_cooling_release_clears_warm_head():
     """
     hass, ctrl = _head_ctrl(head_temp=23.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 26.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0) + 2.0 setback parking
+    assert 25.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0) + 1.0 setback parking
 
 
 @pytest.mark.asyncio
@@ -1088,7 +1088,7 @@ async def test_cooling_release_ignores_favourable_head():
     """A head reading cooler than the room adds no shift — setback parking only."""
     hass, ctrl = _head_ctrl(head_temp=19.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 23.0 in _sent_temps(hass)
+    assert 22.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1103,21 +1103,22 @@ async def test_cooling_active_command_takes_full_shift():
 @pytest.mark.asyncio
 async def test_cooling_hold_at_target_starts_gentle():
     """Room just above target with no demand: servo starts at the quiet end,
-    one step below the parked release (24.0 from the +1.0 head bias and
+    one step below the parked release (23.0 from the +1.0 head bias and
     setback parking, minus the 0.5 default step)."""
     hass, ctrl = _head_ctrl(head_temp=22.2)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=21.2)
-    assert 23.5 in _sent_temps(hass)
+    assert 22.5 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
 async def test_cooling_release_near_target_winds_down_gradually():
     """Just below target the servo winds down one rung above parity instead
-    of slamming straight to the parked release: parity 21.8 (head bias
-    +0.8) + one 1.0 step → 22.8 → snapped to 23.0."""
+    of slamming straight to the parked release: park 22.8 (head bias +0.8,
+    1.0 parking) minus one 1.0 step → 21.8 → snapped to 22.0, short of the
+    park."""
     hass, ctrl = _head_ctrl(head_temp=21.4, step=1.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.6)
-    assert 23.0 in _sent_temps(hass)
+    assert 22.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1125,7 +1126,7 @@ async def test_heating_release_clears_cold_head():
     """Heating mirror: a head reading colder than the room lowers the release."""
     hass, ctrl = _head_ctrl(head_temp=20.0, state_mode="heat", modes=("heat", "off"))
     await ctrl.async_apply("heating", 21.0, power_fraction=0.0, current_temp=22.0)
-    assert 17.0 in _sent_temps(hass)  # 21.0 + (20.0 - 22.0) - 2.0 setback parking
+    assert 18.0 in _sent_temps(hass)  # 21.0 + (20.0 - 22.0) - 1.0 setback parking
 
 
 @pytest.mark.asyncio
@@ -1173,9 +1174,9 @@ async def test_holding_power_engages_the_rung_servo():
     closed-loop on the room, at most once per dwell.
     """
     hass, ctrl = _head_ctrl(head_temp=22.3, step=1.0)
-    # park = 21.0 + 1.0 head bias + 2.0 setback = 24.0; start one step below → 23.0
+    # park = 21.0 + 1.0 head bias + 1.0 setback = 23.0; start one step below → 22.0
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.15, current_temp=21.3)
-    assert 23.0 in _sent_temps(hass)
+    assert 22.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio

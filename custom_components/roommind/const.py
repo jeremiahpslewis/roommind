@@ -101,6 +101,16 @@ NO_COOL_TARGET = float("inf")  # never too warm -> cooling never demanded
 # unidentified or badly-fitted curve can never ask for an extreme setpoint.
 AC_MAX_HEAD_GAP_C = 6.0
 
+# Parking margin [K] past the head reading for a released or idled AC. The
+# release setpoint already carries the learned adverse head offset (the
+# reading the head settles to when the fan slows), so this only needs to
+# clear whole-degree quantization and the unit's stop hysteresis — a bigger
+# margin buys nothing but a bigger jump on every release and re-engage, the
+# 3 K setpoint swings users see on the head. Distinct from the generic
+# DEFAULT_IDLE_SETBACK_OFFSET, which sizes TRV/thermostat setbacks that have
+# no learned offset to lean on.
+AC_RELEASE_PARK_C = 1.0
+
 PROPORTIONAL_DEADBAND_C = 0.5  # Minimum proportional setpoint change (°C) to resend, in the gentle regime
 PROPORTIONAL_DEADBAND_NEAR_TARGET_C = 0.2  # Finer proportional deadband (°C) within 1°C of target
 

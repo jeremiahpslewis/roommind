@@ -16,6 +16,7 @@ from ..const import (
     AC_COOLING_BOOST_TARGET,
     AC_HEATING_BOOST_TARGET,
     AC_MAX_HEAD_GAP_C,
+    AC_RELEASE_PARK_C,
     AC_SETPOINT_ERROR_FLOOR_MAX_C,
     AC_SETPOINT_ERROR_FLOOR_MIN_C,
     AC_SETPOINT_ERROR_GAIN_MAX,
@@ -463,11 +464,15 @@ async def async_idle_device(
             await async_turn_off_climate(hass, entity_id, area_id=area_id, fallback_setpoint=fallback_temp)
             return
 
-        # Compute setback temperature
+        # Compute setback temperature. An AC gets the lean parking margin:
+        # its head bias is measured and added below, so the fixed part only
+        # has to clear quantization and stop hysteresis — every extra degree
+        # here is an extra degree of setpoint swing on each release/re-engage.
+        offset = AC_RELEASE_PARK_C if entity_id in get_ac_eids(devices) else DEFAULT_IDLE_SETBACK_OFFSET
         if current_hvac == "heat" and targets.heat is not None:
-            setback_temp = targets.heat - DEFAULT_IDLE_SETBACK_OFFSET
+            setback_temp = targets.heat - offset
         elif current_hvac == "cool" and targets.cool is not None:
-            setback_temp = targets.cool + DEFAULT_IDLE_SETBACK_OFFSET
+            setback_temp = targets.cool + offset
         else:
             await async_turn_off_climate(hass, entity_id, area_id=area_id, fallback_setpoint=fallback_temp)
             return
@@ -1933,7 +1938,7 @@ class MPCController:
             # the unit's stop threshold. Compressor-group holds opt out
             # (park_on_release=False): a forced-on head must stay gently
             # engaged at the head-frame target, not be parked off.
-            park = DEFAULT_IDLE_SETBACK_OFFSET if park_on_release else 0.0
+            park = AC_RELEASE_PARK_C if park_on_release else 0.0
             if intent == "cool":
                 shift = max(0.0, shift) + park
             else:
@@ -1985,9 +1990,9 @@ class MPCController:
         parity = effective_target + self.head_frame_shift(eid, current_temp)
         release_shift = self.head_frame_shift(eid, current_temp, release_intent=intent)
         if intent == "cool":
-            park = effective_target + max(0.0, release_shift) + DEFAULT_IDLE_SETBACK_OFFSET
+            park = effective_target + max(0.0, release_shift) + AC_RELEASE_PARK_C
         else:
-            park = effective_target + min(0.0, release_shift) - DEFAULT_IDLE_SETBACK_OFFSET
+            park = effective_target + min(0.0, release_shift) - AC_RELEASE_PARK_C
 
         now = time.time()
         # error > 0 = the room needs more output; error < 0 = it got too much
