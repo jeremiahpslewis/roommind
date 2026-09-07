@@ -330,11 +330,14 @@ def test_release_offset_prefers_most_adverse_reading():
 
 @pytest.mark.asyncio
 async def test_release_clears_idle_offset_not_running():
-    """A cooling release must use the idle offset, not the running one.
+    """A holding command near the release must not lean on the running offset.
 
     Running (return-air) offset is -2 K while idle (stratified) is +1 K: the
     old commanding_offset preference under-shot the release by 3 K and the
-    unit re-armed as soon as its fan slowed.
+    unit re-armed as soon as its fan slowed. The park is now taken from the
+    head's OWN reading (20.9 → first level past it, 21.0), so neither
+    learned offset can pull it below the head; the servo starts one step
+    under that park.
     """
     gap_mgr = GapResponseManager()
     ho = gap_mgr.offset("climate.ac")
@@ -352,10 +355,10 @@ async def test_release_clears_idle_offset_not_running():
         has_external_sensor=True,
         gap_manager=gap_mgr,
     )
-    # Room below target → release; base 21.0 + idle offset 1.0 + 1.0 parking = 23.0
+    # Room 0.5 below target: holding regime, one step under the observed park
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.5)
     sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
-    assert 22.5 in sent
+    assert 20.5 in sent
 
 
 @pytest.mark.asyncio
@@ -449,4 +452,6 @@ async def test_learned_holding_command_sits_above_the_head():
     await ctrl.async_apply("cooling", 20.0, power_fraction=0.15, current_temp=20.3)
     sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
     assert sent
-    assert sent[-1] > 20.3, f"expected a setpoint above the head reading, got {sent[-1]}"
+    # The two adjacent levels around the head reading (20.0 / 20.5) are the
+    # dither pair; a holding command must be one of them, never deeper.
+    assert 20.0 <= sent[-1] <= 20.5, f"expected a level adjacent to the head reading, got {sent[-1]}"
