@@ -774,7 +774,7 @@ async def test_mpc_apply_heat_source_inactive_trv_low():
 
 @pytest.mark.asyncio
 async def test_async_idle_device_setback_heating():
-    """Device with idle_action='setback' in heat mode shifts target down by 2."""
+    """AC with idle_action='setback' in heat mode shifts target down by the AC parking margin."""
     clear_command_cache()
     hass = build_hass()
     state = MagicMock()
@@ -791,14 +791,14 @@ async def test_async_idle_device_setback_heating():
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
     assert len(temp_calls) == 1
-    assert temp_calls[0][0][2]["temperature"] == 19.0
+    assert temp_calls[0][0][2]["temperature"] == 20.0
     hvac_calls = [c for c in calls if c[0][1] == "set_hvac_mode"]
     assert len(hvac_calls) == 0
 
 
 @pytest.mark.asyncio
 async def test_async_idle_device_setback_cooling():
-    """Device with idle_action='setback' in cool mode shifts target up by 2."""
+    """AC with idle_action='setback' in cool mode shifts target up by the AC parking margin."""
     clear_command_cache()
     hass = build_hass()
     state = MagicMock()
@@ -815,7 +815,7 @@ async def test_async_idle_device_setback_cooling():
     calls = hass.services.async_call.call_args_list
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
     assert len(temp_calls) == 1
-    assert temp_calls[0][0][2]["temperature"] == 26.0
+    assert temp_calls[0][0][2]["temperature"] == 25.0
     hvac_calls = [c for c in calls if c[0][1] == "set_hvac_mode"]
     assert len(hvac_calls) == 0
 
@@ -982,13 +982,13 @@ async def test_async_idle_device_setback_redundancy():
     hass = build_hass()
     state = MagicMock()
     state.state = "heat"
-    state.attributes = {"hvac_modes": ["heat", "off"], "min_temp": 5.0, "max_temp": 35.0, "temperature": 19.0}
+    state.attributes = {"hvac_modes": ["heat", "off"], "min_temp": 5.0, "max_temp": 35.0, "temperature": 20.0}
     hass.states.get = MagicMock(return_value=state)
 
     devices = [
         {"entity_id": "climate.ac1", "type": "ac", "role": "auto", "idle_action": "setback", "idle_fan_mode": ""}
     ]
-    # heat=21.0, setback=19.0, device already at 19.0
+    # heat=21.0, AC setback=20.0, device already at 20.0
     targets = TargetTemps(heat=21.0, cool=None)
     await async_idle_device(hass, "climate.ac1", devices, area_id="living_room", targets=targets)
 
@@ -1039,10 +1039,10 @@ async def test_mpc_apply_idle_respects_setback():
     await ctrl.async_apply(MODE_IDLE, targets)
 
     calls = hass.services.async_call.call_args_list
-    # Should set temperature to 26.0 (cool setback: 24 + 2)
+    # Should set temperature to 25.0 (AC cool setback: 24 + 1)
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
     assert len(temp_calls) >= 1
-    assert temp_calls[0][0][2]["temperature"] == 26.0
+    assert temp_calls[0][0][2]["temperature"] == 25.0
     # No off calls
     off_calls = [c for c in calls if c[0][1] == "set_hvac_mode" and c[0][2].get("hvac_mode") == "off"]
     assert len(off_calls) == 0
