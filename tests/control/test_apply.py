@@ -4423,15 +4423,15 @@ async def _setback_sent_temp(hvac_mode, targets, head_temp, current_temp):
 
 @pytest.mark.asyncio
 async def test_setback_cooling_widens_for_warm_head_sensor():
-    """A head sensor reading warmer than the room widens the cool setback.
+    """The AC setback parks one step past the head's OWN reading.
 
     The device regulates on its own sensor: with room 19.0 but head 23.0, a
     setpoint of target+2 (22.5) keeps the compressor running all night. The
-    idle setpoint must clear the head reading so the unit actually stops.
+    idle setpoint sits at the first level past the reading (23.0 → 23.5),
+    independent of the room-frame target.
     """
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=23.0, current_temp=19.0)
-    # 20.5 + AC_RELEASE_PARK_C (1.0) + (23.0 - 19.0) = 25.5
-    assert temp == 25.5
+    assert temp == 23.5
 
 
 @pytest.mark.asyncio
@@ -4444,21 +4444,23 @@ async def test_setback_cooling_head_offset_capped():
 
 @pytest.mark.asyncio
 async def test_setback_cooling_ignores_cool_reading_head():
-    """A head reading cooler than the room must not lower the setback setpoint."""
+    """A head reading cooler than the room parks just past THAT reading.
+
+    The head is satisfied at 18.5 whatever the room sensor says — parking
+    higher only widens the swing on the next re-engage."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=18.0, current_temp=19.0)
-    assert temp == 21.5  # plain target + AC parking margin
+    assert temp == 18.5
 
 
 @pytest.mark.asyncio
 async def test_setback_without_room_temp_unchanged():
-    """No external reading available: plain AC parking margin."""
+    """No external room reading: the head reading alone still fixes the park."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=23.0, current_temp=None)
-    assert temp == 21.5
+    assert temp == 23.5
 
 
 @pytest.mark.asyncio
 async def test_setback_heating_widens_for_cold_head_sensor():
-    """Heating mirror: a head reading colder than the room lowers the setback."""
+    """Heating mirror: park one step below the head's own reading (18.0 → 17.5)."""
     temp = await _setback_sent_temp("heat", TargetTemps(heat=21.0, cool=None), head_temp=18.0, current_temp=21.0)
-    # 21.0 - 1.0 - (21.0 - 18.0) = 17.0
-    assert temp == 17.0
+    assert temp == 17.5

@@ -1072,23 +1072,25 @@ def _sent_temps(hass):
 
 @pytest.mark.asyncio
 async def test_cooling_release_clears_warm_head():
-    """Release below target must land above the head's own reading.
+    """Release below target parks one step past the head's own reading.
 
     Room 20.0 (below the 21.0 target) with the head reading 23.0: the old
     release at 21.0 kept the compressor running until the head — and so the
-    room — fell a degree past target (the 1 K sawtooth).
+    room — fell a degree past target (the 1 K sawtooth). The park is the
+    first level past the reading, 23.5 — no wider, so the re-engage that
+    follows stays within the adjacent-levels dither.
     """
     hass, ctrl = _head_ctrl(head_temp=23.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 25.0 in _sent_temps(hass)  # 21.0 + (23.0 - 20.0) + 1.0 setback parking
+    assert 23.5 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
 async def test_cooling_release_ignores_favourable_head():
-    """A head reading cooler than the room adds no shift — setback parking only."""
+    """A head reading cooler than the room parks just past THAT reading (19.5)."""
     hass, ctrl = _head_ctrl(head_temp=19.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 22.0 in _sent_temps(hass)
+    assert 19.5 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1103,11 +1105,11 @@ async def test_cooling_active_command_takes_full_shift():
 @pytest.mark.asyncio
 async def test_cooling_hold_at_target_starts_gentle():
     """Room just above target with no demand: servo starts at the quiet end,
-    one step below the parked release (23.0 from the +1.0 head bias and
-    setback parking, minus the 0.5 default step)."""
+    one step below the observed park (head 22.2 → park 22.5 → start 22.0):
+    the lower of the two levels adjacent to the reading."""
     hass, ctrl = _head_ctrl(head_temp=22.2)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=21.2)
-    assert 22.5 in _sent_temps(hass)
+    assert 22.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1123,10 +1125,10 @@ async def test_cooling_release_near_target_winds_down_gradually():
 
 @pytest.mark.asyncio
 async def test_heating_release_clears_cold_head():
-    """Heating mirror: a head reading colder than the room lowers the release."""
+    """Heating mirror: park one step below the head's own reading (20.0 → 19.5)."""
     hass, ctrl = _head_ctrl(head_temp=20.0, state_mode="heat", modes=("heat", "off"))
     await ctrl.async_apply("heating", 21.0, power_fraction=0.0, current_temp=22.0)
-    assert 18.0 in _sent_temps(hass)  # 21.0 + (20.0 - 22.0) - 1.0 setback parking
+    assert 19.5 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1203,3 +1205,89 @@ async def test_rung_servo_respects_the_dwell():
     _hold_rungs["climate.ac"] = (23.0, _time.time() - 10.0)  # just adjusted
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.15, current_temp=21.3)
     assert 23.0 in _sent_temps(hass)
+
+
+# ---------------------------------------------------------------------------
+# Observed-reading park: with a whole-degree actuator the only optimal steady
+# states are a fixed level or a dither between two ADJACENT levels. The head
+# reports the reading it regulates against, so the level it is satisfied at
+# is directly observable — one device step past that reading — and needs no
+# estimate, learned offset or safety margin, each of which only widened the
+# release/re-engage swing (the 3 K jumps users saw on the head unit).
+# ---------------------------------------------------------------------------
+
+
+def test_observed_park_is_one_step_past_the_reading():
+    from custom_components.roommind.control.mpc_controller import observed_park_level
+
+    hass, _ = _head_ctrl(head_temp=22.0, step=1.0)
+    assert observed_park_level(hass, "climate.ac", "cool") == 23.0
+    hass, _ = _head_ctrl(head_temp=22.0, step=1.0, state_mode="heat", modes=("heat", "off"))
+    assert observed_park_level(hass, "climate.ac", "heat") == 21.0
+    # Fine-resolution reading, half-degree steps: the first level strictly past it
+    hass, _ = _head_ctrl(head_temp=22.2, step=0.5)
+    assert observed_park_level(hass, "climate.ac", "cool") == 22.5
+    # No reading → no observed park (callers fall back to the estimate)
+    hass, _ = _head_ctrl(head_temp=None, step=1.0)
+    assert observed_park_level(hass, "climate.ac", "cool") is None
+
+
+def test_observed_park_tracks_the_reading():
+    """The park follows the head as the room drifts: always reading + 1 step."""
+    from custom_components.roommind.control.mpc_controller import observed_park_level
+
+    hass, _ = _head_ctrl(head_temp=22.0, step=1.0)
+    assert observed_park_level(hass, "climate.ac", "cool") == 23.0
+    hass.states.get.return_value.attributes["current_temperature"] = 23.0
+    assert observed_park_level(hass, "climate.ac", "cool") == 24.0
+
+
+def test_observed_park_escalates_when_room_keeps_sinking():
+    """A head that trickles at reading+1 shows as a parked room still sinking.
+
+    One extra step per dwell, capped; reset as soon as the room is back at
+    target. Escalation only arms from a parked call site (room error given).
+    """
+    from unittest.mock import patch
+
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, _ = _head_ctrl(head_temp=22.0, step=1.0)
+    with patch.object(mc.time, "time", return_value=1000.0):
+        # Room 1 K below target while parked: arms, no step yet
+        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=20.0, target=21.0) == 23.0
+    with patch.object(mc.time, "time", return_value=1000.0 + mc.HOLD_RUNG_DWELL_S):
+        # Still sinking after a dwell: one step further
+        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=19.9, target=21.0) == 24.0
+    with patch.object(mc.time, "time", return_value=1000.0 + 2 * mc.HOLD_RUNG_DWELL_S):
+        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=19.8, target=21.0) == 25.0
+    with patch.object(mc.time, "time", return_value=1000.0 + 3 * mc.HOLD_RUNG_DWELL_S):
+        # Capped at PARK_ESCALATION_MAX_STEPS
+        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=19.7, target=21.0) == 25.0
+        # Room back at target: escalation clears, park returns to reading + 1
+        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=21.0, target=21.0) == 23.0
+    mc.clear_command_cache()
+
+
+@pytest.mark.asyncio
+async def test_release_and_reengage_stay_within_adjacent_levels():
+    """End to end on a whole-degree head: the park and the holding re-engage
+    are two adjacent levels around the reading — the optimal dither."""
+    from unittest.mock import patch
+
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, ctrl = _head_ctrl(head_temp=22.0, step=1.0)
+    with patch.object(mc.time, "time", return_value=1000.0):
+        # Room well below target: full park at reading + 1
+        await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.2)
+    assert _sent_temps(hass)[-1] == 23.0
+    hass.services.async_call.reset_mock()
+    with patch.object(mc.time, "time", return_value=1000.0 + mc.HOLD_RUNG_DWELL_S):
+        # Room back just above target with holding-level demand, a dwell
+        # later: the servo steps one level down — not a jump to demand.
+        await ctrl.async_apply("cooling", 21.0, power_fraction=0.15, current_temp=21.3)
+    assert _sent_temps(hass)[-1] == 22.0
+    mc.clear_command_cache()

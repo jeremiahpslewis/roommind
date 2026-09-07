@@ -115,6 +115,11 @@ HOLD_RUNG_DWELL_S = 900.0
 HOLD_RUNG_BAND_C = 0.15
 # Past this far on the no-demand side the servo gives up and parks fully.
 HOLD_PARK_BAND_C = 0.5
+# Cross-cycle park escalation: {entity_id: (extra_steps, since_ts)}. A head
+# that keeps trickling at the first level past its own reading is parked one
+# step further after a dwell of the room still sinking.
+_park_escalation: dict[str, tuple[int, float]] = {}
+PARK_ESCALATION_MAX_STEPS = 2
 
 
 def clear_command_cache() -> None:
@@ -122,6 +127,75 @@ def clear_command_cache() -> None:
     _last_commands.clear()
     _setpoint_override_warned.clear()
     _hold_rungs.clear()
+    _park_escalation.clear()
+
+
+def _device_step_c(hass: HomeAssistant, eid: str | None) -> float | None:
+    """Device target_temp_step in °C, or None when it is unknown/fine."""
+    if not eid:
+        return None
+    state = hass.states.get(eid)
+    if state is None:
+        return None
+    raw = state.attributes.get("target_temp_step")
+    try:
+        step = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if step <= 0:
+        return None
+    return ha_delta_to_celsius(hass, step)
+
+
+def observed_park_level(
+    hass: HomeAssistant,
+    eid: str,
+    intent: str,
+    *,
+    current_temp: float | None = None,
+    target: float | None = None,
+) -> float | None:
+    """Setpoint (°C) that parks an AC head: the first level past its own reading.
+
+    With a whole-degree actuator the only optimal steady states are a fixed
+    level or a dither between two ADJACENT levels. The head reports the
+    reading it regulates against, so the level at which it is satisfied is
+    directly observable — one device step past that reading — and needs no
+    room-frame estimate, learned offset or safety margin, each of which only
+    widened the release/re-engage swing. Tracks the reading as it moves.
+
+    Closed-loop safety net: a unit that keeps trickling at that first level
+    shows up as the ROOM still sinking while parked. Pass ``current_temp``
+    and ``target`` from a parked call site to arm the escalation — one more
+    step per dwell, capped — and it resets once the room is back at target.
+    Returns None when the head reading is unavailable.
+    """
+    state = hass.states.get(eid)
+    raw = state.attributes.get("current_temperature") if state else None
+    try:
+        head_c = ha_temp_to_celsius(hass, float(raw)) if raw is not None else None
+    except (TypeError, ValueError):
+        head_c = None
+    if head_c is None:
+        return None
+    step = _device_step_c(hass, eid) or 0.5
+    sign = 1.0 if intent == "cool" else -1.0
+    n = round(head_c / step, 6)
+    base = (math.floor(n) + 1) * step if intent == "cool" else (math.ceil(n) - 1) * step
+
+    steps, since = _park_escalation.get(eid, (0, 0.0))
+    now = time.time()
+    if current_temp is not None and target is not None:
+        error = (current_temp - target) * sign  # < 0 = the room got too much output
+        if error >= 0:
+            steps, since = 0, now
+        elif error < -HOLD_PARK_BAND_C:
+            if since == 0.0:
+                since = now
+            elif now - since >= HOLD_RUNG_DWELL_S and steps < PARK_ESCALATION_MAX_STEPS:
+                steps, since = steps + 1, now
+        _park_escalation[eid] = (steps, since)
+    return round(base + sign * steps * step, 1)
 
 
 def _resolve_idle_setpoint(
@@ -464,18 +538,26 @@ async def async_idle_device(
             await async_turn_off_climate(hass, entity_id, area_id=area_id, fallback_setpoint=fallback_temp)
             return
 
-        # Compute setback temperature. An AC gets the lean parking margin:
-        # its head bias is measured and added below, so the fixed part only
-        # has to clear quantization and stop hysteresis — every extra degree
-        # here is an extra degree of setpoint swing on each release/re-engage.
-        offset = AC_RELEASE_PARK_C if entity_id in get_ac_eids(devices) else DEFAULT_IDLE_SETBACK_OFFSET
-        if current_hvac == "heat" and targets.heat is not None:
-            setback_temp = targets.heat - offset
-        elif current_hvac == "cool" and targets.cool is not None:
-            setback_temp = targets.cool + offset
-        else:
+        is_ac = entity_id in get_ac_eids(devices)
+        intent = "cool" if current_hvac == "cool" else "heat"
+        target = targets.cool if current_hvac == "cool" else targets.heat
+        if target is None:
             await async_turn_off_climate(hass, entity_id, area_id=area_id, fallback_setpoint=fallback_temp)
             return
+
+        # An AC parks one device step past its OWN reading — the level it is
+        # observably satisfied at — so idling and the re-engage that follows
+        # stay within the two-adjacent-levels dither a whole-degree actuator
+        # can do optimally. A parked room still sinking arms the trickle
+        # escalation. Estimate-based fallback when the reading is unavailable.
+        observed = (
+            observed_park_level(hass, entity_id, intent, current_temp=current_temp, target=target) if is_ac else None
+        )
+        if observed is not None:
+            setback_temp = observed
+        else:
+            offset = AC_RELEASE_PARK_C if is_ac else DEFAULT_IDLE_SETBACK_OFFSET
+            setback_temp = target - offset if current_hvac == "heat" else target + offset
 
         # The device regulates against its OWN sensor, not the room sensor the
         # setback offset was computed from.  A head that reads warmer than the
@@ -485,8 +567,9 @@ async def async_idle_device(
         # Widen the setback by the measured head-vs-room bias — only in the
         # adverse direction, capped so a broken head sensor cannot command an
         # absurd setpoint.  The idle setpoint must be far enough past the
-        # device's own reading that it genuinely switches off.
-        if current_temp is not None:
+        # device's own reading that it genuinely switches off. (Not needed on
+        # the observed-reading path, which already sits past the reading.)
+        if current_temp is not None and observed is None:
             head_raw = state.attributes.get("current_temperature")
             try:
                 head_c = ha_temp_to_celsius(hass, float(head_raw)) if head_raw is not None else None
@@ -1928,16 +2011,20 @@ class MPCController:
             is_release = value >= release_bound and (current_temp is None or current_temp <= release_bound)
         else:
             is_release = value <= release_bound and (current_temp is None or current_temp >= release_bound)
+        if is_release and park_on_release:
+            # Park one device step past the head's OWN reading — the level at
+            # which it is observably satisfied — so a release and the
+            # re-engage that follows stay within the two-adjacent-levels
+            # dither a whole-degree actuator can do optimally. Falls back to
+            # the estimate (adverse learned offset + fixed margin) only when
+            # the head reading is unavailable. Compressor-group holds opt
+            # out (park_on_release=False): a forced-on head must stay gently
+            # engaged at the head-frame target, not be parked off.
+            observed = observed_park_level(self.hass, eid, intent)
+            if observed is not None:
+                return self._clamp_to_device_range(eid, observed)
         shift = self.head_frame_shift(eid, current_temp, release_intent=intent if is_release else None)
         if is_release:
-            # Park at the full setback position, not at head parity. Many
-            # units keep the compressor trickling until the setpoint clears
-            # their reading by a real margin, and in Full Control the release
-            # level is not a thermostat anyway — RoomMind decides when the
-            # next run starts — so there is no cost to parking well clear of
-            # the unit's stop threshold. Compressor-group holds opt out
-            # (park_on_release=False): a forced-on head must stay gently
-            # engaged at the head-frame target, not be parked off.
             park = AC_RELEASE_PARK_C if park_on_release else 0.0
             if intent == "cool":
                 shift = max(0.0, shift) + park
@@ -1958,18 +2045,22 @@ class MPCController:
                 # degrees apart — the command ladder must be deterministic
                 # so levels shift one step at a time.
                 shifted = (math.ceil(n - 0.5) if intent == "cool" else math.floor(n + 0.5)) * step
+        return self._clamp_to_device_range(eid, shifted)
+
+    def _clamp_to_device_range(self, eid: str, value: float) -> float:
+        """Clamp a °C setpoint to the device's own min/max, rounded to 0.1."""
         state = self.hass.states.get(eid)
         if state:
             try:
                 min_t = state.attributes.get("min_temp")
                 max_t = state.attributes.get("max_temp")
                 if min_t is not None:
-                    shifted = max(shifted, ha_temp_to_celsius(self.hass, float(min_t)))
+                    value = max(value, ha_temp_to_celsius(self.hass, float(min_t)))
                 if max_t is not None:
-                    shifted = min(shifted, ha_temp_to_celsius(self.hass, float(max_t)))
+                    value = min(value, ha_temp_to_celsius(self.hass, float(max_t)))
             except (TypeError, ValueError):
                 pass
-        return round(shifted, 1)
+        return round(value, 1)
 
     def _holding_rung(self, eid: str, effective_target: float, current_temp: float, intent: str) -> float:
         """Closed-loop choice of the quasi-equilibrium hold rung for an AC.
@@ -1988,16 +2079,23 @@ class MPCController:
         step = self._setpoint_step(eid) or 0.5
         sign = 1.0 if intent == "cool" else -1.0
         parity = effective_target + self.head_frame_shift(eid, current_temp)
-        release_shift = self.head_frame_shift(eid, current_temp, release_intent=intent)
-        if intent == "cool":
-            park = effective_target + max(0.0, release_shift) + AC_RELEASE_PARK_C
-        else:
-            park = effective_target + min(0.0, release_shift) - AC_RELEASE_PARK_C
-
-        now = time.time()
         # error > 0 = the room needs more output; error < 0 = it got too much
         error = (current_temp - effective_target) * sign
-        if error < -HOLD_PARK_BAND_C:
+        parked = error < -HOLD_PARK_BAND_C
+        # The gentle bound is the level the head is observably satisfied at
+        # (one step past its own reading); the estimate is the fallback when
+        # the reading is unavailable. The room error arms the trickle
+        # escalation while parked and resets it once the room is back.
+        park = observed_park_level(self.hass, eid, intent, current_temp=current_temp, target=effective_target)
+        if park is None:
+            release_shift = self.head_frame_shift(eid, current_temp, release_intent=intent)
+            if intent == "cool":
+                park = effective_target + max(0.0, release_shift) + AC_RELEASE_PARK_C
+            else:
+                park = effective_target + min(0.0, release_shift) - AC_RELEASE_PARK_C
+
+        now = time.time()
+        if parked:
             # Load has reversed: no equilibrium exists, park fully.
             _hold_rungs[eid] = (park, now)
             n = math.ceil(round(park / step, 6)) if intent == "cool" else math.floor(round(park / step, 6))
@@ -2080,19 +2178,7 @@ class MPCController:
 
     def _setpoint_step(self, eid: str | None) -> float | None:
         """Device target_temp_step in °C, or None when it is unknown/fine."""
-        if not eid:
-            return None
-        state = self.hass.states.get(eid)
-        if state is None:
-            return None
-        raw = state.attributes.get("target_temp_step")
-        try:
-            step = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if step <= 0:
-            return None
-        return ha_delta_to_celsius(self.hass, step)
+        return _device_step_c(self.hass, eid)
 
     def _proportional_deadband(self, eid: str, current_temp: float | None, effective_target: float) -> float | None:
         """Deadband threshold for a proportional setpoint send, or None to disable.
