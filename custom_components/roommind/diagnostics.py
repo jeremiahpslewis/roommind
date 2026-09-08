@@ -8,7 +8,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN, VERSION
+from .const import BUILD_ID, DOMAIN, VERSION
 from .control.mpc_controller import _last_commands
 from .utils.device_utils import get_ac_eids
 
@@ -345,6 +345,7 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
     return {
         "integration": {
             "version": VERSION,
+            "build": BUILD_ID,
             "domain": DOMAIN,
             "ha_temp_unit": hass.config.units.temperature_unit,
         },

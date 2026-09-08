@@ -8,6 +8,10 @@ from homeassistant.core import Context
 
 DOMAIN = "roommind"
 VERSION = "1.7.6"
+# Fork build stamp, bumped on every ship. Surfaced in diagnostics and the
+# startup log so the code actually running is never in doubt (a stale tarball
+# or an un-reloaded module looks identical to the new one otherwise).
+BUILD_ID = "2026-09-08.1-observed-park"
 
 # Platforms
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BINARY_SENSOR, Platform.CLIMATE]
