@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import HomeAssistant
 
-from .const import DEFAULT_CONTROL_MODE, DOMAIN, VERSION
+from .const import BUILD_ID, DEFAULT_CONTROL_MODE, DOMAIN, VERSION
 from .control.mpc_controller import _active_targets, _last_commands, _now, _sent_at
 from .utils.device_utils import get_ac_eids
 from .utils.history_store import DETAIL_FIELDS
@@ -445,6 +445,7 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
         "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "integration": {
             "version": VERSION,
+            "build": BUILD_ID,
             "domain": DOMAIN,
             "ha_version": HA_VERSION,
             "ha_temp_unit": hass.config.units.temperature_unit,
