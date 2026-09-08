@@ -17,7 +17,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN, PLATFORMS, VERSION
+from .const import BUILD_ID, DOMAIN, PLATFORMS, VERSION
 from .coordinator import RoomMindCoordinator
 from .services.settings_service import async_register_settings_service
 from .store import RoomMindStore
@@ -38,6 +38,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up RoomMind from a config entry."""
+    _LOGGER.info("RoomMind %s (build %s)", VERSION, BUILD_ID)
     # Ensure the store is created and loaded (once across all entries)
     store = hass.data[DOMAIN].get("store")
     if not store:
