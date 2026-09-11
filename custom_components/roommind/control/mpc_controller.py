@@ -115,9 +115,6 @@ HOLD_RUNG_DWELL_S = 900.0
 HOLD_RUNG_BAND_C = 0.15
 # Past this far on the no-demand side the servo gives up and parks fully.
 HOLD_PARK_BAND_C = 0.5
-# Cross-cycle park escalation: {entity_id: (extra_steps, since_ts)}. A head
-# that keeps trickling at the first level past its own reading is parked one
-# step further after a dwell of the room still sinking.
 # Latched park level per entity: {entity_id: setpoint_c}. Held for as long as
 # the device stays parked, and dropped the moment an active command is sent.
 _park_latch: dict[str, float] = {}
@@ -153,12 +150,36 @@ def _device_step_c(hass: HomeAssistant, eid: str | None) -> float | None:
     return ha_delta_to_celsius(hass, step)
 
 
+def no_demand_level(
+    target: float,
+    intent: str,
+    *,
+    head_shift: float = 0.0,
+    step: float | None = None,
+) -> float:
+    """First device level (°C, head frame) that cannot drive the room past ``target``.
+
+    A parked unit still regulates against its own reading, so the park level
+    IS a thermostat setting the MPC has handed over — and one set past the
+    room's own bound makes the device the binding controller at a temperature
+    RoomMind never chose. Carries the room-frame bound into the head frame
+    (adverse component only: a favourably biased head must not drag the bound
+    toward demand) and snaps it to the device ladder away from demand.
+    """
+    bound = target + (max(0.0, head_shift) if intent == "cool" else min(0.0, head_shift))
+    if not step or step <= 0:
+        return round(bound, 1)
+    n = round(bound / step, 6)
+    return round((math.ceil(n) if intent == "cool" else math.floor(n)) * step, 1)
+
+
 def observed_park_level(
     hass: HomeAssistant,
     eid: str,
     intent: str,
     *,
     latch: bool = True,
+    park_floor: float | None = None,
 ) -> float | None:
     """Setpoint (°C) that parks an AC head: the first level past its own reading.
 
@@ -178,6 +199,17 @@ def observed_park_level(
     the fixed-setting optimum, with the MPC commanding a real run when the
     error justifies it. Pass ``latch=False`` for a pure read (e.g. as the
     servo's gentle bound). Returns None when the head reading is unavailable.
+
+    ``park_floor`` (from :func:`no_demand_level`) bounds the result on the
+    gentle side and OUTRANKS the latch. One step past the reading is what
+    satisfies the unit; it is not automatically a level that leaves the room
+    alone. A head reading below the room — return air, stratification, or just
+    the whole-degree quantization of what it reports — puts that level under
+    the room's target, and the parked unit then regulates the
+    room below a target the MPC sees no deficit against: it stays idle, the
+    latch never drops, and the room is pinned under target indefinitely.
+    Raising the latch to the floor is not the ratchet (the floor moves with
+    the target, never with the head).
     """
     state = hass.states.get(eid)
     raw = state.attributes.get("current_temperature") if state else None
@@ -191,13 +223,15 @@ def observed_park_level(
     sign = 1.0 if intent == "cool" else -1.0
     n = round(head_c / step, 6)
     base = round((math.floor(n) + 1) * step if intent == "cool" else (math.ceil(n) - 1) * step, 1)
+    if park_floor is not None:
+        base = max(base, park_floor) if intent == "cool" else min(base, park_floor)
     if not latch:
         return base
     held = _park_latch.get(eid)
     # Keep the latched level whenever it still clears the head reading (the
-    # unit is satisfied there). Never raise it: a park that follows the head
-    # upward is the ratchet this latch exists to prevent.
-    if held is not None and (held - head_c) * sign >= 0:
+    # unit is satisfied there) AND still leaves the room alone. Never raise it
+    # to follow the head: that is the ratchet this latch exists to prevent.
+    if held is not None and (held - head_c) * sign >= 0 and (park_floor is None or (held - park_floor) * sign >= 0):
         return held
     _park_latch[eid] = base
     return base
@@ -550,40 +584,56 @@ async def async_idle_device(
             await async_turn_off_climate(hass, entity_id, area_id=area_id, fallback_setpoint=fallback_temp)
             return
 
+        # The device regulates against its OWN sensor, not the room sensor the
+        # targets are expressed in, so both the park and the estimate need the
+        # measured head-vs-room bias.
+        head_raw = state.attributes.get("current_temperature")
+        try:
+            head_c = ha_temp_to_celsius(hass, float(head_raw)) if head_raw is not None else None
+        except (TypeError, ValueError):
+            head_c = None
+        head_offset = head_c - current_temp if (head_c is not None and current_temp is not None) else None
+
         # An AC parks one device step past its OWN reading — the level it is
         # observably satisfied at — so idling and the re-engage that follows
         # stay within the two-adjacent-levels dither a whole-degree actuator
-        # can do optimally. A parked room still sinking arms the trickle
-        # escalation. Estimate-based fallback when the reading is unavailable.
-        observed = observed_park_level(hass, entity_id, intent) if is_ac else None
+        # can do optimally. Floored at the level that leaves the room alone:
+        # a head reading below the room puts "one step past the reading" under
+        # the room's own target, and the idle setpoint then becomes a colder
+        # thermostat than the one the user set. Estimate-based fallback when
+        # the reading is unavailable.
+        observed = (
+            observed_park_level(
+                hass,
+                entity_id,
+                intent,
+                park_floor=no_demand_level(
+                    target,
+                    intent,
+                    step=_device_step_c(hass, entity_id),
+                ),
+            )
+            if is_ac
+            else None
+        )
         if observed is not None:
             setback_temp = observed
         else:
             offset = AC_RELEASE_PARK_C if is_ac else DEFAULT_IDLE_SETBACK_OFFSET
             setback_temp = target - offset if current_hvac == "heat" else target + offset
 
-        # The device regulates against its OWN sensor, not the room sensor the
-        # setback offset was computed from.  A head that reads warmer than the
-        # room keeps the compressor running below the room target even with the
-        # +offset setpoint (an AC head near the ceiling easily reads several
-        # degrees high), so the idle setpoint never actually idles the unit.
-        # Widen the setback by the measured head-vs-room bias — only in the
-        # adverse direction, capped so a broken head sensor cannot command an
-        # absurd setpoint.  The idle setpoint must be far enough past the
-        # device's own reading that it genuinely switches off. (Not needed on
-        # the observed-reading path, which already sits past the reading.)
-        if current_temp is not None and observed is None:
-            head_raw = state.attributes.get("current_temperature")
-            try:
-                head_c = ha_temp_to_celsius(hass, float(head_raw)) if head_raw is not None else None
-            except (TypeError, ValueError):
-                head_c = None
-            if head_c is not None:
-                head_offset = head_c - current_temp
-                if current_hvac == "cool" and head_offset > 0:
-                    setback_temp += min(head_offset, AC_MAX_HEAD_GAP_C)
-                elif current_hvac == "heat" and head_offset < 0:
-                    setback_temp -= min(-head_offset, AC_MAX_HEAD_GAP_C)
+        # A head that reads warmer than the room keeps the compressor running
+        # below the room target even with the +offset setpoint (an AC head near
+        # the ceiling easily reads several degrees high), so the idle setpoint
+        # never actually idles the unit.  Widen the setback by the measured
+        # bias — only in the adverse direction, capped so a broken head sensor
+        # cannot command an absurd setpoint. (Not needed on the
+        # observed-reading path, which already sits past the reading.)
+        if head_offset is not None and observed is None:
+            if current_hvac == "cool" and head_offset > 0:
+                setback_temp += min(head_offset, AC_MAX_HEAD_GAP_C)
+            elif current_hvac == "heat" and head_offset < 0:
+                setback_temp -= min(-head_offset, AC_MAX_HEAD_GAP_C)
 
         # Convert to HA units FIRST, then clamp to device min/max
         # (device attributes min_temp/max_temp are in HA units, not Celsius)
@@ -1952,7 +2002,14 @@ class MPCController:
         )
         return setpoint
 
-    def head_frame_shift(self, eid: str, current_temp: float | None, *, release_intent: str | None = None) -> float:
+    def head_frame_shift(
+        self,
+        eid: str,
+        current_temp: float | None,
+        *,
+        release_intent: str | None = None,
+        learned_only: bool = False,
+    ) -> float:
         """Head-sensor bias (°C) between the device's own reading and the room.
 
         Prefers the gap-response learned offsets when identified — the running
@@ -1962,6 +2019,13 @@ class MPCController:
         Falls back to the instantaneous head-vs-room delta from the device's
         ``current_temperature`` attribute. Clamped to ±AC_MAX_HEAD_GAP_C so a
         broken head sensor cannot command an absurd setpoint. 0.0 without data.
+
+        ``learned_only`` drops that instantaneous fallback. The delta between a
+        head that is holding still and a room that is drifting is not a sensor
+        bias — it is the room error wearing one — so anything that must not
+        move with the room error (the park floor) has to refuse it. Reading it
+        there turned ventilation cooling a parked room into a climbing
+        setpoint, which is the escalation removed in the previous fix.
         """
         if current_temp is None:
             return 0.0
@@ -1969,7 +2033,7 @@ class MPCController:
         if self._gap_manager is not None:
             tracker = self._gap_manager.offset(eid)
             offset = tracker.release_offset(release_intent) if release_intent else tracker.commanding_offset()
-        if not offset:
+        if not offset and not learned_only:
             state = self.hass.states.get(eid)
             raw = state.attributes.get("current_temperature") if state else None
             try:
@@ -2023,7 +2087,17 @@ class MPCController:
             # the head reading is unavailable. Compressor-group holds opt
             # out (park_on_release=False): a forced-on head must stay gently
             # engaged at the head-frame target, not be parked off.
-            observed = observed_park_level(self.hass, eid, intent)
+            observed = observed_park_level(
+                self.hass,
+                eid,
+                intent,
+                park_floor=no_demand_level(
+                    release_bound,
+                    intent,
+                    head_shift=self.head_frame_shift(eid, current_temp, release_intent=intent, learned_only=True),
+                    step=self._setpoint_step(eid),
+                ),
+            )
             if observed is not None:
                 return self._clamp_to_device_range(eid, observed)
         else:
@@ -2090,12 +2164,23 @@ class MPCController:
         error = (current_temp - effective_target) * sign
         parked = error < -HOLD_PARK_BAND_C
         # The gentle bound is the level the head is observably satisfied at
-        # (one step past its own reading); the estimate is the fallback when
-        # the reading is unavailable. The room error arms the trickle
-        # escalation while parked and resets it once the room is back.
+        # (one step past its own reading), never gentler than the level that
+        # leaves the room alone; the estimate is the fallback when the reading
+        # is unavailable.
         if not parked:
             reset_park_latch(eid)
-        park = observed_park_level(self.hass, eid, intent, latch=parked)
+        park = observed_park_level(
+            self.hass,
+            eid,
+            intent,
+            latch=parked,
+            park_floor=no_demand_level(
+                effective_target,
+                intent,
+                head_shift=self.head_frame_shift(eid, current_temp, release_intent=intent, learned_only=True),
+                step=step,
+            ),
+        )
         if park is None:
             release_shift = self.head_frame_shift(eid, current_temp, release_intent=intent)
             if intent == "cool":

@@ -4443,13 +4443,18 @@ async def test_setback_cooling_head_offset_capped():
 
 
 @pytest.mark.asyncio
-async def test_setback_cooling_ignores_cool_reading_head():
-    """A head reading cooler than the room parks just past THAT reading.
+async def test_setback_cooling_with_a_cool_head_clears_the_room_target():
+    """A head reading cooler than the room still parks at or past the target.
 
-    The head is satisfied at 18.5 whatever the room sensor says — parking
-    higher only widens the swing on the next re-engage."""
+    Head 18, room 19, cool target 20.5. The head is satisfied at 18.5 — but a
+    unit idled there re-arms the moment its reading reaches 18.5, the room at
+    19.5, a full degree under the target the idle was supposed to respect. It
+    then holds the room there, and since the room never shows a deficit the
+    MPC never takes the device back. The idle setpoint is floored at the
+    target's own level, 20.5, where the head is equally satisfied today and
+    the unit cannot undercut the target tomorrow."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=18.0, current_temp=19.0)
-    assert temp == 18.5
+    assert temp == 20.5
 
 
 @pytest.mark.asyncio
