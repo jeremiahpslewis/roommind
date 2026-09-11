@@ -21,6 +21,15 @@ def _build_model_info(estimator: Any) -> dict[str, Any]:
         "alpha": round(estimator._x[1], 6),
         "beta_h": round(estimator._x[2], 4),
         "beta_c": round(estimator._x[3], 4),
+        # Which class the live beta_h/beta_c above belong to, and what the
+        # other classes hold — a room that looks weak is often just banked
+        # against the fan it was last running.
+        "airflow": estimator.airflow,
+        "beta_by_airflow": {
+            cls: [round(g[0], 4), round(g[1], 4)]
+            for cls in (AIRFLOW_NORMAL, AIRFLOW_QUIET)
+            if (g := estimator.gains_for(cls)) is not None
+        },
         "n_updates": estimator._n_updates,
         "n_idle": estimator._n_idle,
         "n_heating": estimator._n_heating,

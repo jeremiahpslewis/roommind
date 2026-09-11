@@ -2497,3 +2497,103 @@ def test_manager_scales_u_vent_by_flow():
     # Absurd reading → clamped, not multiplied into nonsense
     mgr.set_vent_flow(10000.0)
     assert mgr.get_model("room_a").U_vent == pytest.approx(0.2 * RoomModelManager._VENT_SCALE_MAX)
+
+
+# ---------------------------------------------------------------------------
+# Airflow-banked actuator gains. beta_h and beta_c are what the DEVICE
+# delivers and scale with the air carrying it; alpha, the solar and occupancy
+# gains, the disturbance and the vent coupling are properties of the ROOM and
+# cannot depend on the fan. So the gains are banked per airflow class over one
+# shared room filter, rather than a whole filter per class.
+# ---------------------------------------------------------------------------
+
+
+def _cool_room(ekf, beta_c_truth, airflow, rounds=400):
+    """Drive a room whose AC delivers beta_c_truth degC/h at full power."""
+    T, T_out = 24.0, 24.0
+    ekf.set_airflow(airflow)
+    for _ in range(rounds):
+        T = T - beta_c_truth * (5.0 / 60.0)
+        if T < 15.0:
+            T = 24.0
+        ekf.update(T, T_out, "cooling", 5.0, power_fraction=1.0)
+    return T
+
+
+def test_gains_are_banked_per_airflow_and_room_physics_is_not():
+    from custom_components.roommind.control.gap_response import AIRFLOW_NORMAL, AIRFLOW_QUIET
+    from custom_components.roommind.control.thermal_model import ThermalEKF
+
+    ekf = ThermalEKF(T_init=24.0)
+    _cool_room(ekf, 4.0, AIRFLOW_NORMAL)
+    normal_gain = ekf.get_model().Q_cool
+    alpha_after_normal = ekf.get_model().U
+
+    _cool_room(ekf, 1.0, AIRFLOW_QUIET)
+    quiet_gain = ekf.get_model().Q_cool
+
+    assert quiet_gain < normal_gain / 2, (quiet_gain, normal_gain)
+    # Switching back restores the other class's gain rather than the blend.
+    ekf.set_airflow(AIRFLOW_NORMAL)
+    assert ekf.get_model().Q_cool > quiet_gain * 2
+    # The room's own parameter kept learning across both regimes.
+    assert ekf.get_model().U != alpha_after_normal
+
+
+def test_a_new_airflow_class_starts_from_the_known_gain_not_from_nothing():
+    """A quiet head is a weaker head, not an unknown one."""
+    from custom_components.roommind.control.gap_response import AIRFLOW_NORMAL, AIRFLOW_QUIET
+    from custom_components.roommind.control.thermal_model import ThermalEKF
+
+    ekf = ThermalEKF(T_init=24.0)
+    _cool_room(ekf, 4.0, AIRFLOW_NORMAL)
+    trained = ekf.get_model().Q_cool
+
+    ekf.set_airflow(AIRFLOW_QUIET)
+    assert ekf.get_model().Q_cool == pytest.approx(trained, abs=1e-6)
+    # ...but carrying full uncertainty, so its own data can move it.
+    assert ekf._P[3][3] >= ThermalEKF._P_INIT_BETA
+
+
+def test_switching_airflow_leaves_the_covariance_usable():
+    """Cross-covariances belong to the other class's history and are dropped."""
+    from custom_components.roommind.control.gap_response import AIRFLOW_NORMAL, AIRFLOW_QUIET
+    from custom_components.roommind.control.thermal_model import ThermalEKF
+
+    ekf = ThermalEKF(T_init=24.0)
+    _cool_room(ekf, 4.0, AIRFLOW_NORMAL)
+    ekf.set_airflow(AIRFLOW_QUIET)
+    for i in ThermalEKF._ACTUATOR_IDX:
+        assert all(ekf._P[i][j] == 0.0 for j in range(ThermalEKF._N) if j != i)
+        assert ekf._P[i][i] > 0.0
+    # Still symmetric and positive on the diagonal after the swap.
+    for i in range(ThermalEKF._N):
+        assert ekf._P[i][i] > 0.0
+        for j in range(ThermalEKF._N):
+            assert ekf._P[i][j] == pytest.approx(ekf._P[j][i], abs=1e-9)
+    # And it keeps filtering sanely afterwards.
+    ekf.update(23.0, 24.0, "cooling", 5.0, power_fraction=1.0)
+    assert 0.0 < ekf.get_model().Q_cool < ThermalEKF._BETA_C_MAX
+
+
+def test_bank_survives_persistence_and_pre_airflow_state_loads():
+    from custom_components.roommind.control.gap_response import AIRFLOW_NORMAL, AIRFLOW_QUIET
+    from custom_components.roommind.control.thermal_model import ThermalEKF
+
+    ekf = ThermalEKF(T_init=24.0)
+    _cool_room(ekf, 4.0, AIRFLOW_NORMAL)
+    _cool_room(ekf, 1.0, AIRFLOW_QUIET)
+    quiet, normal = ekf.gains_for(AIRFLOW_QUIET), ekf.gains_for(AIRFLOW_NORMAL)
+
+    restored = ThermalEKF.from_dict(ekf.to_dict())
+    assert restored.gains_for(AIRFLOW_QUIET) == pytest.approx(quiet)
+    assert restored.gains_for(AIRFLOW_NORMAL) == pytest.approx(normal)
+
+    # Pre-airflow state has no bank: the loaded gains become the normal class.
+    legacy = ekf.to_dict()
+    legacy.pop("beta_bank")
+    legacy.pop("airflow")
+    old = ThermalEKF.from_dict(legacy)
+    assert old.airflow == AIRFLOW_NORMAL
+    assert old.gains_for(AIRFLOW_QUIET) is None
+    assert old.gains_for(AIRFLOW_NORMAL) is not None

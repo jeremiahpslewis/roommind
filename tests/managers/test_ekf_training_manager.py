@@ -49,6 +49,7 @@ class TestFlush:
             q_solar=0.0,
             q_residual=0.0,
             q_occupancy=0.0,
+            airflow="normal",
         )
         assert "room1" not in mgr._accumulated_dt
         assert "room1" not in mgr._accumulated_mode
