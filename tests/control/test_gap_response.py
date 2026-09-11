@@ -334,10 +334,13 @@ async def test_release_clears_idle_offset_not_running():
 
     Running (return-air) offset is -2 K while idle (stratified) is +1 K: the
     old commanding_offset preference under-shot the release by 3 K and the
-    unit re-armed as soon as its fan slowed. The park is now taken from the
+    unit re-armed as soon as its fan slowed. The park is taken from the
     head's OWN reading (20.9 → first level past it, 21.0), so neither
-    learned offset can pull it below the head; the servo starts one step
-    under that park.
+    learned offset can pull it below the head — and floored at the level
+    that leaves the room alone, which the adverse (idle, +1 K) offset puts
+    at 22.0: a park at 21.0 re-arms when the head reads 21.0, i.e. the room
+    at 20.0, a degree under the 21.0 target. The servo starts one step under
+    the floored park.
     """
     gap_mgr = GapResponseManager()
     ho = gap_mgr.offset("climate.ac")
@@ -358,7 +361,7 @@ async def test_release_clears_idle_offset_not_running():
     # Room 0.5 below target: holding regime, one step under the observed park
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.5)
     sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
-    assert 20.5 in sent
+    assert 21.5 in sent
 
 
 @pytest.mark.asyncio

@@ -1086,11 +1086,19 @@ async def test_cooling_release_clears_warm_head():
 
 
 @pytest.mark.asyncio
-async def test_cooling_release_ignores_favourable_head():
-    """A head reading cooler than the room parks just past THAT reading (19.5)."""
+async def test_cooling_release_with_a_cool_head_still_clears_the_target():
+    """A head reading cooler than the room cannot park below the room's target.
+
+    Head 19, room 20, target 21. One step past the reading is 19.5 — and a
+    unit left at 19.5 re-arms as soon as its reading hits 19.5, i.e. the room
+    at 20.5, half a degree UNDER the target it was parked to respect. The
+    parked unit becomes the binding thermostat at a temperature nobody chose,
+    and the MPC, seeing no deficit, never intervenes to correct it. The park
+    is floored at the target's own level, 21.0.
+    """
     hass, ctrl = _head_ctrl(head_temp=19.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 19.5 in _sent_temps(hass)
+    assert 21.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1255,6 +1263,112 @@ def test_observed_park_latches_against_the_ratchet():
     mc.reset_park_latch("climate.ac")
     assert mc.observed_park_level(hass, "climate.ac", "cool") == 21.0
     mc.clear_command_cache()
+
+
+@pytest.mark.asyncio
+async def test_kitchen_park_does_not_undercut_the_cool_target():
+    """Regression, kitchen 11 Sep: parked at 23 under a 23.5 target all day.
+
+    Whole-degree head reading 22 against a room of 22.5 — a reported value
+    that quantization alone can place a step off the room it shares — cool
+    target 23.5, nothing running. The park was 22 + 1 = 23 — under the target
+    — so the unit held the kitchen at ~23 and the MPC saw no deficit to act
+    on. It also latched there: with the room below target no active command
+    is ever sent, and only an active command drops the latch. The park is now
+    24, the first level the unit cannot cool the room past.
+    """
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, ctrl = _head_ctrl(head_temp=22.0, step=1.0)
+    await ctrl.async_apply("cooling", 23.5, power_fraction=0.0, current_temp=22.5)
+    sent = _sent_temps(hass)
+    assert sent, "expected a parked command"
+    assert max(sent) >= 24.0, f"park still undercuts the 23.5 target: {sent}"
+    mc.clear_command_cache()
+
+
+def test_park_is_floored_at_the_level_that_leaves_the_room_alone():
+    """A park may never be a colder thermostat than the room's own target.
+
+    Field case (kitchen, 11 Sep): head reading 22 on a whole-degree unit, room
+    22.5, cool target 23.5. "One step past the reading" is 23 — half a degree
+    UNDER the target — so the parked unit regulates the room to ~23 and the
+    MPC, seeing no deficit, never intervenes. The floor lifts it to the first
+    level at or past the target, 24.
+    """
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, _ = _head_ctrl(head_temp=22.0, step=1.0)
+    floor = mc.no_demand_level(23.5, "cool", head_shift=-0.5, step=1.0)
+    assert floor == 24.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 24.0
+    mc.clear_command_cache()
+
+    # Heating mirrors it: the park may not sit above the heat target.
+    hass, _ = _head_ctrl(head_temp=22.0, step=1.0, state_mode="heat", modes=("heat", "off"))
+    floor = mc.no_demand_level(20.5, "heat", head_shift=0.5, step=1.0)
+    assert floor == 20.0
+    assert mc.observed_park_level(hass, "climate.ac", "heat", park_floor=floor) == 20.0
+    mc.clear_command_cache()
+
+
+def test_park_floor_leaves_a_warm_reading_head_alone():
+    """The floor only bites on the gentle side — it never pulls a park down.
+
+    A head reading above the room is the case the observed park was built for;
+    one step past 26 stays 27 even though the target's level is far below.
+    """
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, _ = _head_ctrl(head_temp=26.0, step=1.0)
+    floor = mc.no_demand_level(23.5, "cool", head_shift=3.5, step=1.0)
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 27.0
+    mc.clear_command_cache()
+
+
+def test_park_floor_outranks_the_latch():
+    """A latched level below the floor is raised; the head may still not raise it.
+
+    The latch exists to stop the park ratcheting after the head reading, and
+    that still holds. But a latch under the room's target pins the room there
+    forever — the MPC sees no deficit, so no active command ever drops the
+    latch. The floor moves with the target, not with the head, so lifting to
+    it cannot ratchet.
+    """
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, _ = _head_ctrl(head_temp=21.0, step=1.0)
+    floor = mc.no_demand_level(21.5, "cool", head_shift=0.0, step=1.0)
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 22.0
+    # Room warms while parked and the head follows: the latch still holds.
+    hass.states.get.return_value.attributes["current_temperature"] = 22.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 22.0
+    # The target moves up; the latched 22 would now cool the room below it.
+    floor = mc.no_demand_level(23.5, "cool", head_shift=0.0, step=1.0)
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 24.0
+    mc.clear_command_cache()
+
+
+def test_no_demand_level_carries_only_the_adverse_bias():
+    """A favourably biased head must not drag the bound toward demand."""
+    from custom_components.roommind.control.mpc_controller import no_demand_level
+
+    # Cooling: a head reading 1.5 K below the room is favourable — ignored.
+    assert no_demand_level(23.5, "cool", head_shift=-1.5, step=1.0) == 24.0
+    # A head reading high is adverse and must be carried in full.
+    assert no_demand_level(23.5, "cool", head_shift=1.5, step=1.0) == 25.0
+    # Heating: a head reading high is the favourable direction — ignored.
+    assert no_demand_level(20.5, "heat", head_shift=1.5, step=1.0) == 20.0
+    assert no_demand_level(20.5, "heat", head_shift=-1.5, step=1.0) == 19.0
+    # Snapped away from demand, never onto the demand side of the bound.
+    assert no_demand_level(23.0, "cool", step=1.0) == 23.0
+    assert no_demand_level(23.1, "cool", step=1.0) == 24.0
+    # Unknown step: the bound itself.
+    assert no_demand_level(23.5, "cool") == 23.5
 
 
 def test_observed_park_unlatched_read_is_pure():
