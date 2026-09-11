@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1232,41 +1232,72 @@ def test_observed_park_is_one_step_past_the_reading():
     assert observed_park_level(hass, "climate.ac", "cool") is None
 
 
-def test_observed_park_tracks_the_reading():
-    """The park follows the head as the room drifts: always reading + 1 step."""
-    from custom_components.roommind.control.mpc_controller import observed_park_level
+def test_observed_park_latches_against_the_ratchet():
+    """The park does NOT follow the head upward once parked.
 
-    hass, _ = _head_ctrl(head_temp=22.0, step=1.0)
-    assert observed_park_level(hass, "climate.ac", "cool") == 23.0
-    hass.states.get.return_value.attributes["current_temperature"] = 23.0
-    assert observed_park_level(hass, "climate.ac", "cool") == 24.0
-
-
-def test_observed_park_escalates_when_room_keeps_sinking():
-    """A head that trickles at reading+1 shows as a parked room still sinking.
-
-    One extra step per dwell, capped; reset as soon as the room is back at
-    target. Escalation only arms from a parked call site (room error given).
+    Field data (bedroom, 9-11 Sep): a single 5 h idle stretch saw the head
+    reading cross 19 -> 20 -> 21 as the room warmed, and an unlatched park
+    walked 20 -> 21 -> 22 with it. Together with the active ladder that put
+    three levels between the extremes — the 2 K swings the user reported.
     """
-    from unittest.mock import patch
-
     from custom_components.roommind.control import mpc_controller as mc
 
     mc.clear_command_cache()
-    hass, _ = _head_ctrl(head_temp=22.0, step=1.0)
-    with patch.object(mc.time, "time", return_value=1000.0):
-        # Room 1 K below target while parked: arms, no step yet
-        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=20.0, target=21.0) == 23.0
-    with patch.object(mc.time, "time", return_value=1000.0 + mc.HOLD_RUNG_DWELL_S):
-        # Still sinking after a dwell: one step further
-        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=19.9, target=21.0) == 24.0
-    with patch.object(mc.time, "time", return_value=1000.0 + 2 * mc.HOLD_RUNG_DWELL_S):
-        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=19.8, target=21.0) == 25.0
-    with patch.object(mc.time, "time", return_value=1000.0 + 3 * mc.HOLD_RUNG_DWELL_S):
-        # Capped at PARK_ESCALATION_MAX_STEPS
-        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=19.7, target=21.0) == 25.0
-        # Room back at target: escalation clears, park returns to reading + 1
-        assert mc.observed_park_level(hass, "climate.ac", "cool", current_temp=21.0, target=21.0) == 23.0
+    hass, _ = _head_ctrl(head_temp=21.0, step=1.0)
+    assert mc.observed_park_level(hass, "climate.ac", "cool") == 22.0
+    # Room warms while parked; the head crosses a whole degree.
+    hass.states.get.return_value.attributes["current_temperature"] = 22.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool") == 22.0, "park must not ratchet"
+    # It also must not sink when the head falls again — one level, held.
+    hass.states.get.return_value.attributes["current_temperature"] = 20.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool") == 22.0
+    # An active command supersedes the latch; the next park re-reads the head.
+    mc.reset_park_latch("climate.ac")
+    assert mc.observed_park_level(hass, "climate.ac", "cool") == 21.0
+    mc.clear_command_cache()
+
+
+def test_observed_park_unlatched_read_is_pure():
+    """latch=False reads the head without setting or consuming the latch."""
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, _ = _head_ctrl(head_temp=21.0, step=1.0)
+    assert mc.observed_park_level(hass, "climate.ac", "cool", latch=False) == 22.0
+    hass.states.get.return_value.attributes["current_temperature"] = 22.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", latch=False) == 23.0
+    assert "climate.ac" not in mc._park_latch
+    mc.clear_command_cache()
+
+
+@pytest.mark.asyncio
+async def test_park_does_not_escalate_when_ventilation_cools_the_room():
+    """A parked room sinking below target must NOT push the setpoint up.
+
+    The room falling while the setpoint already clears the head reading means
+    something OTHER than the compressor is cooling it — on this house, the
+    ventilation, which is the disturbance this whole control problem started
+    with. Raising the park cannot slow ventilation; it only widens the swing
+    (field data: parks at 24 and 25 on nights the room drifted 0.7 K low).
+    """
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, ctrl = _head_ctrl(head_temp=21.0, step=1.0)
+    sent = []
+    for room in (20.9, 20.6, 20.3, 20.0, 19.8):
+        hass.services.async_call.reset_mock()
+        with patch.object(mc.time, "time", return_value=1000.0 + 3600 * len(sent)):
+            await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=room)
+        temps = _sent_temps(hass)
+        if temps:
+            sent.append(temps[-1])
+    assert sent, "expected at least one parked command"
+    # Everything stays inside the adjacent pair around the head reading (21):
+    # the servo holds at 21, the park sits at 22. Nothing climbs to 23+, which
+    # is where the old room-error escalation took it (field data: 24 and 25).
+    assert set(sent) <= {21.0, 22.0}, f"park drifted while ventilation cooled the room: {sent}"
+    assert max(sent) - min(sent) <= 1.0, f"swing wider than one step: {sent}"
     mc.clear_command_cache()
 
 
