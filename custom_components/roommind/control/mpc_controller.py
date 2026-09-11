@@ -183,6 +183,9 @@ def observed_park_level(
 ) -> float | None:
     """Setpoint (°C) that parks an AC head: the first level past its own reading.
 
+    Past the reading's whole quantization interval, where the head reports on
+    the device step grid — see the ``levels`` computation below.
+
     With a whole-degree actuator the only optimal steady states are a fixed
     level or a dither between two ADJACENT levels. The head reports the
     reading it regulates against, so the level at which it is satisfied is
@@ -222,7 +225,16 @@ def observed_park_level(
     step = _device_step_c(hass, eid) or 0.5
     sign = 1.0 if intent == "cool" else -1.0
     n = round(head_c / step, 6)
-    base = round((math.floor(n) + 1) * step if intent == "cool" else (math.ceil(n) - 1) * step, 1)
+    # One level past the REPORTED reading is not one level of margin. A head
+    # that reports on the step grid is quantized: every reading it has ever
+    # published is a whole degree, so the value it actually regulates against
+    # sits somewhere in [report, report + step) and the first level past the
+    # report can be sitting on it. Field case: living room reporting 22 and
+    # parked at 23, which is a park only if the true reading is near 22.0.
+    # Take the reading as its whole interval and park past the far end. A head
+    # with real resolution lands off the grid and keeps the lean one-step park.
+    levels = 2 if abs(n - round(n)) < 1e-6 else 1
+    base = round((math.floor(n) + levels) * step if intent == "cool" else (math.ceil(n) - levels) * step, 1)
     if park_floor is not None:
         base = max(base, park_floor) if intent == "cool" else min(base, park_floor)
     if not latch:

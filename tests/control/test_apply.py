@@ -4423,23 +4423,26 @@ async def _setback_sent_temp(hvac_mode, targets, head_temp, current_temp):
 
 @pytest.mark.asyncio
 async def test_setback_cooling_widens_for_warm_head_sensor():
-    """The AC setback parks one step past the head's OWN reading.
+    """The AC setback parks past the head's OWN reading.
 
     The device regulates on its own sensor: with room 19.0 but head 23.0, a
     setpoint of target+2 (22.5) keeps the compressor running all night. The
-    idle setpoint sits at the first level past the reading (23.0 → 23.5),
-    independent of the room-frame target.
+    idle setpoint is fixed by the reading, not the room-frame target. The
+    reading lands on the step grid, so it is a quantized report of something
+    in [23.0, 23.5) and the park clears the whole interval: 24.0.
     """
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=23.0, current_temp=19.0)
-    assert temp == 23.5
+    assert temp == 24.0
 
 
 @pytest.mark.asyncio
 async def test_setback_cooling_head_offset_capped():
     """A wildly-biased head sensor cannot push the setback past the cap."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=27.0, current_temp=19.0)
-    # offset 8.0 capped at AC_MAX_HEAD_GAP_C (6.0): 20.5 + 1.0 + 6.0 = 27.5
-    assert temp == 27.5
+    # The observed park fixes this, not the capped estimate: an on-grid 27.0
+    # reading is cleared past its whole quantization interval, 28.0. (The
+    # estimate path's cap would have given 20.5 + 1.0 + 6.0 = 27.5.)
+    assert temp == 28.0
 
 
 @pytest.mark.asyncio
@@ -4461,11 +4464,11 @@ async def test_setback_cooling_with_a_cool_head_clears_the_room_target():
 async def test_setback_without_room_temp_unchanged():
     """No external room reading: the head reading alone still fixes the park."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=23.0, current_temp=None)
-    assert temp == 23.5
+    assert temp == 24.0
 
 
 @pytest.mark.asyncio
 async def test_setback_heating_widens_for_cold_head_sensor():
-    """Heating mirror: park one step below the head's own reading (18.0 → 17.5)."""
+    """Heating mirror: park below the head's reading and its interval (18.0 → 17.0)."""
     temp = await _setback_sent_temp("heat", TargetTemps(heat=21.0, cool=None), head_temp=18.0, current_temp=21.0)
-    assert temp == 17.5
+    assert temp == 17.0
