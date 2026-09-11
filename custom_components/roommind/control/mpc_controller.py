@@ -118,8 +118,9 @@ HOLD_PARK_BAND_C = 0.5
 # Cross-cycle park escalation: {entity_id: (extra_steps, since_ts)}. A head
 # that keeps trickling at the first level past its own reading is parked one
 # step further after a dwell of the room still sinking.
-_park_escalation: dict[str, tuple[int, float]] = {}
-PARK_ESCALATION_MAX_STEPS = 2
+# Latched park level per entity: {entity_id: setpoint_c}. Held for as long as
+# the device stays parked, and dropped the moment an active command is sent.
+_park_latch: dict[str, float] = {}
 
 
 def clear_command_cache() -> None:
@@ -127,7 +128,12 @@ def clear_command_cache() -> None:
     _last_commands.clear()
     _setpoint_override_warned.clear()
     _hold_rungs.clear()
-    _park_escalation.clear()
+    _park_latch.clear()
+
+
+def reset_park_latch(eid: str) -> None:
+    """Forget the latched park level (an active command supersedes it)."""
+    _park_latch.pop(eid, None)
 
 
 def _device_step_c(hass: HomeAssistant, eid: str | None) -> float | None:
@@ -152,8 +158,7 @@ def observed_park_level(
     eid: str,
     intent: str,
     *,
-    current_temp: float | None = None,
-    target: float | None = None,
+    latch: bool = True,
 ) -> float | None:
     """Setpoint (°C) that parks an AC head: the first level past its own reading.
 
@@ -162,13 +167,17 @@ def observed_park_level(
     reading it regulates against, so the level at which it is satisfied is
     directly observable — one device step past that reading — and needs no
     room-frame estimate, learned offset or safety margin, each of which only
-    widened the release/re-engage swing. Tracks the reading as it moves.
+    widened the release/re-engage swing.
 
-    Closed-loop safety net: a unit that keeps trickling at that first level
-    shows up as the ROOM still sinking while parked. Pass ``current_temp``
-    and ``target`` from a parked call site to arm the escalation — one more
-    step per dwell, capped — and it resets once the room is back at target.
-    Returns None when the head reading is unavailable.
+    The level is LATCHED once parked. Recomputing it every cycle chases the
+    head reading: the room warms while parked, the head crosses a whole
+    degree, the park follows it up, and a single idle stretch walks the
+    setpoint across two or three levels (field data: head 19 -> 21 in one
+    night, park 20 -> 22). A latched park cannot ratchet — and if the room
+    does warm past it, the unit self-regulating at that one level is exactly
+    the fixed-setting optimum, with the MPC commanding a real run when the
+    error justifies it. Pass ``latch=False`` for a pure read (e.g. as the
+    servo's gentle bound). Returns None when the head reading is unavailable.
     """
     state = hass.states.get(eid)
     raw = state.attributes.get("current_temperature") if state else None
@@ -181,21 +190,17 @@ def observed_park_level(
     step = _device_step_c(hass, eid) or 0.5
     sign = 1.0 if intent == "cool" else -1.0
     n = round(head_c / step, 6)
-    base = (math.floor(n) + 1) * step if intent == "cool" else (math.ceil(n) - 1) * step
-
-    steps, since = _park_escalation.get(eid, (0, 0.0))
-    now = time.time()
-    if current_temp is not None and target is not None:
-        error = (current_temp - target) * sign  # < 0 = the room got too much output
-        if error >= 0:
-            steps, since = 0, now
-        elif error < -HOLD_PARK_BAND_C:
-            if since == 0.0:
-                since = now
-            elif now - since >= HOLD_RUNG_DWELL_S and steps < PARK_ESCALATION_MAX_STEPS:
-                steps, since = steps + 1, now
-        _park_escalation[eid] = (steps, since)
-    return round(base + sign * steps * step, 1)
+    base = round((math.floor(n) + 1) * step if intent == "cool" else (math.ceil(n) - 1) * step, 1)
+    if not latch:
+        return base
+    held = _park_latch.get(eid)
+    # Keep the latched level whenever it still clears the head reading (the
+    # unit is satisfied there). Never raise it: a park that follows the head
+    # upward is the ratchet this latch exists to prevent.
+    if held is not None and (held - head_c) * sign >= 0:
+        return held
+    _park_latch[eid] = base
+    return base
 
 
 def _resolve_idle_setpoint(
@@ -550,9 +555,7 @@ async def async_idle_device(
         # stay within the two-adjacent-levels dither a whole-degree actuator
         # can do optimally. A parked room still sinking arms the trickle
         # escalation. Estimate-based fallback when the reading is unavailable.
-        observed = (
-            observed_park_level(hass, entity_id, intent, current_temp=current_temp, target=target) if is_ac else None
-        )
+        observed = observed_park_level(hass, entity_id, intent) if is_ac else None
         if observed is not None:
             setback_temp = observed
         else:
@@ -2023,6 +2026,10 @@ class MPCController:
             observed = observed_park_level(self.hass, eid, intent)
             if observed is not None:
                 return self._clamp_to_device_range(eid, observed)
+        else:
+            # An active command supersedes any parked level: the next release
+            # latches afresh from the head reading it actually ends at.
+            reset_park_latch(eid)
         shift = self.head_frame_shift(eid, current_temp, release_intent=intent if is_release else None)
         if is_release:
             park = AC_RELEASE_PARK_C if park_on_release else 0.0
@@ -2086,7 +2093,9 @@ class MPCController:
         # (one step past its own reading); the estimate is the fallback when
         # the reading is unavailable. The room error arms the trickle
         # escalation while parked and resets it once the room is back.
-        park = observed_park_level(self.hass, eid, intent, current_temp=current_temp, target=effective_target)
+        if not parked:
+            reset_park_latch(eid)
+        park = observed_park_level(self.hass, eid, intent, latch=parked)
         if park is None:
             release_shift = self.head_frame_shift(eid, current_temp, release_intent=intent)
             if intent == "cool":

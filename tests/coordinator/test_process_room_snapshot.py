@@ -336,3 +336,26 @@ class TestProcessRoomSnapshot:
         assert result["target_temp"] is not None
         # Managed mode should still return all normal keys
         assert set(result.keys()) == NORMAL_ROOM_KEYS
+
+
+def test_read_device_setpoint_reports_the_held_level(hass, mock_config_entry):
+    """An idle device still holds a setpoint — report it instead of None.
+
+    While parked, that level IS the control action, and reporting None hid a
+    park that walked two levels across one night from the history CSV.
+    """
+    from unittest.mock import MagicMock
+
+    from .conftest import _create_coordinator, _make_store_mock
+
+    hass.data = {"roommind": {"store": _make_store_mock({})}}
+    state = MagicMock()
+    state.attributes = {"temperature": 22.0}
+    hass.states.get = MagicMock(return_value=state)
+    coordinator = _create_coordinator(hass, mock_config_entry)
+    devices = [{"entity_id": "climate.ac", "type": "ac"}]
+    assert coordinator._read_device_setpoint(devices) == 22.0
+
+    # Unreadable setpoint degrades to None rather than raising.
+    state.attributes = {"temperature": None}
+    assert coordinator._read_device_setpoint(devices) is None
