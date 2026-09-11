@@ -458,3 +458,132 @@ async def test_learned_holding_command_sits_above_the_head():
     # The two adjacent levels around the head reading (20.0 / 20.5) are the
     # dither pair; a holding command must be one of them, never deeper.
     assert 20.0 <= sent[-1] <= 20.5, f"expected a level adjacent to the head reading, got {sent[-1]}"
+
+
+# ---------------------------------------------------------------------------
+# Airflow-aware learning. Fan speed changes both learned quantities: the head's
+# offset from the room (less air past the return grille means it reads its own
+# stratified corner) and the rate a gap buys (quiet costs a head much of its
+# capacity). Pooling them fits a curve right for no speed at all — which began
+# to matter the moment RoomMind started setting the fan itself instead of
+# leaving every head on Auto.
+# ---------------------------------------------------------------------------
+
+
+def test_airflow_class_reads_the_devices_own_naming():
+    from custom_components.roommind.control.gap_response import (
+        AIRFLOW_NORMAL,
+        AIRFLOW_QUIET,
+        airflow_class,
+    )
+
+    for name in ("Quiet", "quiet", "Silent", "Low", "low", "Night", "ECO", "min"):
+        assert airflow_class(name) == AIRFLOW_QUIET, name
+    for name in ("Auto", "auto", "Medium", "Medium Low", "Medium High", "High", "", None):
+        assert airflow_class(name) == AIRFLOW_NORMAL, name
+
+
+def test_offsets_and_curves_are_separated_by_airflow():
+    """The same head, two fan speeds, two estimates — not one blended one."""
+    from custom_components.roommind.control.gap_response import (
+        AIRFLOW_NORMAL,
+        AIRFLOW_QUIET,
+        GapResponseManager,
+    )
+
+    mgr = GapResponseManager()
+    for _ in range(50):
+        # Running quiet: the head reads far below the room (stratified) and a
+        # 2 K gap buys little. Running with air: closer, and much more cooling.
+        mgr.observe_offset("climate.ac", 20.0, 22.0, is_running=True, airflow=AIRFLOW_QUIET)
+        mgr.observe_offset("climate.ac", 21.5, 22.0, is_running=True, airflow=AIRFLOW_NORMAL)
+        mgr.observe_response(
+            "climate.ac",
+            "cooling",
+            gap=2.0,
+            observed_temp_change=-0.05,
+            predicted_passive_change=0.0,
+            dt_minutes=5.0,
+            airflow=AIRFLOW_QUIET,
+        )
+        mgr.observe_response(
+            "climate.ac",
+            "cooling",
+            gap=2.0,
+            observed_temp_change=-0.20,
+            predicted_passive_change=0.0,
+            dt_minutes=5.0,
+            airflow=AIRFLOW_NORMAL,
+        )
+
+    quiet_off = mgr.offset("climate.ac", AIRFLOW_QUIET).commanding_offset()
+    normal_off = mgr.offset("climate.ac", AIRFLOW_NORMAL).commanding_offset()
+    assert quiet_off < normal_off - 1.0, (quiet_off, normal_off)
+
+    quiet_rate = mgr.curve("climate.ac", "cooling", AIRFLOW_QUIET).rate_for_gap(2.0)
+    normal_rate = mgr.curve("climate.ac", "cooling", AIRFLOW_NORMAL).rate_for_gap(2.0)
+    assert normal_rate > quiet_rate * 2, (quiet_rate, normal_rate)
+
+
+def test_pre_airflow_state_seeds_both_classes_instead_of_starting_cold():
+    """Adding the dimension must not cost the controller its learned path.
+
+    A device with months of pooled history would otherwise wake up with two
+    empty buckets, fail is_confident(), and fall back to the heuristic for as
+    long as it took to retrain.
+    """
+    from custom_components.roommind.control.gap_response import (
+        AIRFLOW_NORMAL,
+        AIRFLOW_QUIET,
+        GapResponseManager,
+    )
+
+    trained = GapResponseManager()
+    for i in range(200):
+        gap = 0.5 + (i % 7) * 0.5
+        trained.observe_offset("climate.ac", 23.0, 22.0, is_running=True)
+        trained.observe_response(
+            "climate.ac",
+            "cooling",
+            gap=gap,
+            observed_temp_change=-0.02 * gap,
+            predicted_passive_change=0.0,
+            dt_minutes=5.0,
+        )
+    # Persist under the pre-airflow key shape, as a real install would have.
+    legacy = trained.to_dict()
+    legacy["curves"] = {"climate.ac|cooling": next(iter(trained.to_dict()["curves"].values()))}
+    legacy["offsets"] = {"climate.ac": next(iter(trained.to_dict()["offsets"].values()))}
+
+    loaded = GapResponseManager.from_dict(legacy)
+    for airflow in (AIRFLOW_NORMAL, AIRFLOW_QUIET):
+        curve = loaded.curve("climate.ac", "cooling", airflow)
+        assert curve.is_confident(), f"{airflow} lost the learned path"
+        assert curve.rate_for_gap(2.0) > 0
+        assert loaded.offset("climate.ac", airflow).commanding_offset() == 1.0
+
+
+def test_a_seeded_bucket_can_still_be_moved_by_its_own_data():
+    """Seeding must carry the shape, not the authority.
+
+    Knot values are recursive means whose step is ~1/n, so inheriting a
+    thousand-sample history would freeze the new bucket at the old shape and
+    the split would learn nothing.
+    """
+    from custom_components.roommind.control.gap_response import MIN_TOTAL_SAMPLES, GapResponse
+
+    trained = GapResponse()
+    for _ in range(2000):
+        trained.observe(2.0, 3.0)
+    assert max(trained.counts) > 1000  # the knots near gap 2.0
+
+    seeded = trained.seeded_copy()
+    assert seeded.rate_for_gap(2.0) == pytest.approx(trained.rate_for_gap(2.0), abs=0.01)
+    assert seeded.n_observations <= MIN_TOTAL_SAMPLES
+    before = seeded.rate_for_gap(2.0)
+    for _ in range(40):
+        seeded.observe(2.0, 0.5)  # the quiet fan's much lower rate
+    moved = before - seeded.rate_for_gap(2.0)
+    frozen = before - GapResponse.from_dict(trained.to_dict()).rate_for_gap(2.0)
+    assert moved > 1.0, f"seeded bucket barely moved: {moved}"
+    assert moved > frozen * 5

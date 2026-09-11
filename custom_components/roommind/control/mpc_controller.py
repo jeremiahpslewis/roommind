@@ -62,7 +62,7 @@ from ..utils.device_utils import (
     has_reliable_hvac_modes,
 )
 from ..utils.temp_utils import celsius_delta_to_ha, celsius_to_ha_temp, ha_delta_to_celsius, ha_temp_to_celsius
-from .gap_response import GapResponseManager
+from .gap_response import GapResponseManager, airflow_class
 from .mpc_optimizer import MPCOptimizer, MPCPlan
 from .residual_heat import get_min_run_blocks
 from .thermal_model import RoomModelManager
@@ -1038,6 +1038,9 @@ class MPCController:
         self.has_external_sensor = has_external_sensor
         self._model_manager = model_manager
         self._gap_manager = gap_manager
+        # Airflow class each AC will be commanded to this cycle, filled in by
+        # async_apply once the mode is resolved.
+        self._intended_airflow: dict[str, str] = {}
         self._area_id = room_config.get("area_id", "unknown")
         self._target_resolver = target_resolver
         self.last_plan: MPCPlan | None = None
@@ -1595,6 +1598,18 @@ class MPCController:
         ac_heat_boost = ac_heating_boost_target if ac_heating_boost_target is not None else AC_HEATING_BOOST_TARGET
         ac_cool_boost = cooling_boost_target if cooling_boost_target is not None else AC_COOLING_BOOST_TARGET
 
+        # Decide the fan BEFORE any setpoint is computed. Every learned
+        # estimate below is read for the airflow class the head is about to be
+        # commanded to, because that is the capacity the setpoint will be
+        # delivered under — sizing a gap from the other class's curve is how a
+        # quiet head ends up commanded as though it still had full airflow.
+        self._intended_airflow = {}
+        _fan_mode = MODE_IDLE if force_off else mode
+        for _eid in self.acs:
+            _desired = self._desired_fan_mode(_eid, _fan_mode, current_temp, effective_target)
+            if _desired is not None:
+                self._intended_airflow[_eid] = airflow_class(_desired)
+
         can_heat, can_cool = self._get_can_heat_cool()
 
         _exclude = exclude_eids or set()
@@ -2086,7 +2101,7 @@ class MPCController:
         """
         if self._gap_manager is None:
             return None
-        curve = self._gap_manager.curve(eid, MODE_COOLING)
+        curve = self._gap_manager.curve(eid, MODE_COOLING, self._airflow_for(eid))
         if not curve.is_confident():
             return None
         model = self._model_manager.get_model(self._area_id)
@@ -2094,7 +2109,7 @@ class MPCController:
         if required_rate <= 0:
             return None
         gap = curve.gap_for_rate(required_rate, AC_MAX_HEAD_GAP_C)
-        offset = self._gap_manager.offset(eid).commanding_offset()
+        offset = self._gap_manager.offset(eid, self._airflow_for(eid)).commanding_offset()
         setpoint = round(current_temp + offset - gap, 1)
         _LOGGER.debug(
             "gap-response: %s commanding room=%.2f offset=%+.2f required=%.2f°C/h "
@@ -2139,7 +2154,7 @@ class MPCController:
             return 0.0
         offset = 0.0
         if self._gap_manager is not None:
-            tracker = self._gap_manager.offset(eid)
+            tracker = self._gap_manager.offset(eid, self._airflow_for(eid))
             offset = tracker.release_offset(release_intent) if release_intent else tracker.commanding_offset()
         if not offset and not learned_only:
             state = self.hass.states.get(eid)
@@ -2251,20 +2266,39 @@ class MPCController:
         NIGHT_QUIET_TOLERANCE_C the wrong side of target at night is not being
         served by a quiet fan and is given the air instead.
         """
-        parked = mode == MODE_IDLE
         for eid in self.acs:
-            idle_action, idle_fan = get_idle_action(self._devices, eid)
-            if parked:
-                # A head that is being switched off has no fan to quieten, and
-                # a fan command can wake a unit that was just told to stop.
-                if idle_action == IDLE_ACTION_OFF or (self._force_off and idle_action != IDLE_ACTION_LOW):
-                    continue
-                desired: str | None = idle_fan
-            elif in_night_quiet_window() and self._night_quiet_is_coping(mode, current_temp, effective_target):
-                desired = idle_fan
-            else:
-                desired = AC_ACTIVE_FAN_MODE
+            desired = self._desired_fan_mode(eid, mode, current_temp, effective_target)
+            if desired is None:
+                continue
             await _send_fan_mode(self.hass, eid, desired, area_id=self._area_id)
+
+    def _desired_fan_mode(self, eid: str, mode: str, current_temp: float | None, effective_target: float) -> str | None:
+        """Fan mode this head should be on, or None to leave it alone."""
+        idle_action, idle_fan = get_idle_action(self._devices, eid)
+        if mode == MODE_IDLE:
+            # A head that is being switched off has no fan to quieten, and a
+            # fan command can wake a unit that was just told to stop.
+            if idle_action == IDLE_ACTION_OFF or (self._force_off and idle_action != IDLE_ACTION_LOW):
+                return None
+            return idle_fan
+        if in_night_quiet_window() and self._night_quiet_is_coping(mode, current_temp, effective_target):
+            return idle_fan
+        return AC_ACTIVE_FAN_MODE
+
+    def _airflow_for(self, eid: str) -> str:
+        """Airflow class the learned estimates for this head should come from.
+
+        The class RoomMind is about to command, not the one the head is on:
+        the setpoint being computed will be delivered under the new fan, and
+        reading the old class's curve on every changeover would size the gap
+        from the wrong capacity. Falls back to the head's current fan when the
+        cycle has not decided yet (a read outside async_apply).
+        """
+        intended = self._intended_airflow.get(eid)
+        if intended is not None:
+            return intended
+        state = self.hass.states.get(eid)
+        return airflow_class(state.attributes.get("fan_mode") if state else None)
 
     @staticmethod
     def _night_quiet_is_coping(mode: str, current_temp: float | None, effective_target: float) -> bool:

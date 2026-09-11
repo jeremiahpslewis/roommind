@@ -9,6 +9,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import BUILD_ID, DOMAIN, VERSION
+from .control.gap_response import AIRFLOW_NORMAL, AIRFLOW_QUIET, airflow_class
 from .control.mpc_controller import _last_commands
 from .utils.device_utils import get_ac_eids
 
@@ -242,26 +243,42 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
         if coordinator:
             gap_diag: dict[str, Any] = {}
             for eid in get_ac_eids(config.get("devices", [])):
-                offset = coordinator._gap_manager.offset(eid)
-                per_mode: dict[str, Any] = {}
-                for gap_mode in ("cooling", "heating"):
-                    curve = coordinator._gap_manager.curve(eid, gap_mode)
-                    if curve.n_observations == 0:
+                # Both airflow classes, because "the offset" is now two numbers
+                # and a head that looks untrained in one may be well trained in
+                # the other — which is exactly the question when a park or a
+                # commanded gap looks wrong.
+                per_airflow: dict[str, Any] = {}
+                seen = False
+                for airflow in (AIRFLOW_NORMAL, AIRFLOW_QUIET):
+                    offset = coordinator._gap_manager.offset(eid, airflow)
+                    per_mode: dict[str, Any] = {}
+                    for gap_mode in ("cooling", "heating"):
+                        curve = coordinator._gap_manager.curve(eid, gap_mode, airflow)
+                        if curve.n_observations == 0:
+                            continue
+                        per_mode[gap_mode] = {
+                            "knots_K": curve.knots,
+                            "rate_degC_per_h": [round(v, 3) for v in curve.values],
+                            "samples_per_knot": curve.counts,
+                            "n_observations": curve.n_observations,
+                            "gap_spread_K": round(curve.gap_spread, 2),
+                            "identified_knots": curve.identified_knots,
+                            "driving_setpoints": curve.is_confident(),
+                        }
+                    if not (per_mode or offset.n_running or offset.n_idle):
                         continue
-                    per_mode[gap_mode] = {
-                        "knots_K": curve.knots,
-                        "rate_degC_per_h": [round(v, 3) for v in curve.values],
-                        "samples_per_knot": curve.counts,
-                        "n_observations": curve.n_observations,
-                        "gap_spread_K": round(curve.gap_spread, 2),
-                        "identified_knots": curve.identified_knots,
-                        "driving_setpoints": curve.is_confident(),
-                    }
-                if per_mode or offset.n_running or offset.n_idle:
-                    gap_diag[eid] = {
+                    seen = True
+                    per_airflow[airflow] = {
                         "head_offset": offset.to_dict(),
                         "commanding_offset_C": offset.commanding_offset(),
                         "response": per_mode,
+                    }
+                if seen:
+                    state = coordinator.hass.states.get(eid)
+                    gap_diag[eid] = {
+                        "fan_mode": state.attributes.get("fan_mode") if state else None,
+                        "airflow_class": airflow_class(state.attributes.get("fan_mode") if state else None),
+                        "by_airflow": per_airflow,
                     }
             if gap_diag:
                 room_diag["gap_response"] = gap_diag

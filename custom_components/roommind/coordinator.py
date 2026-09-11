@@ -51,6 +51,7 @@ from .control.gap_response import (
     MIN_OBSERVATION_DT,
     RUNNING_STATES,
     GapResponseManager,
+    airflow_class,
 )
 from .control.mpc_controller import (
     DEFAULT_OUTDOOR_TEMP_FALLBACK,
@@ -1583,9 +1584,13 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 setpoint_c = ha_temp_to_celsius(self.hass, float(setpoint), entity_id=eid)
             except (TypeError, ValueError):
                 continue
-            # Parked intervals feed the idle offset bucket — the reading the
-            # head settles to when the fan slows, which sizes releases.
-            self._gap_manager.observe_offset(eid, head_c, current_temp, is_running=mode != MODE_IDLE)
+            # Airflow is part of the physics being learned, so it is part of
+            # the bucket: the same head at the same gap reads a different
+            # offset and delivers a different rate depending on how hard its
+            # blower is turning. Parked intervals feed the idle offset bucket —
+            # the reading the head settles to when the fan slows.
+            airflow = airflow_class(state.attributes.get("fan_mode"))
+            self._gap_manager.observe_offset(eid, head_c, current_temp, is_running=mode != MODE_IDLE, airflow=airflow)
             gap = head_c - setpoint_c if obs_mode == MODE_COOLING else setpoint_c - head_c
             self._gap_manager.observe_response(
                 eid,
@@ -1594,6 +1599,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 observed_temp_change=current_temp - prev_temp,
                 predicted_passive_change=passive - prev_temp,
                 dt_minutes=dt_minutes,
+                airflow=airflow,
             )
 
     def _read_device_temp(self, room: dict) -> float | None:
