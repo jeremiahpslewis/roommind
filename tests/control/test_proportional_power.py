@@ -1082,7 +1082,7 @@ async def test_cooling_release_clears_warm_head():
     """
     hass, ctrl = _head_ctrl(head_temp=23.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 24.0 in _sent_temps(hass)
+    assert 26.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1098,7 +1098,7 @@ async def test_cooling_release_with_a_cool_head_still_clears_the_target():
     """
     hass, ctrl = _head_ctrl(head_temp=19.0)
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.0)
-    assert 21.0 in _sent_temps(hass)
+    assert 22.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1136,7 +1136,7 @@ async def test_heating_release_clears_cold_head():
     """Heating mirror: park below the reading and its interval (20.0 → 19.0)."""
     hass, ctrl = _head_ctrl(head_temp=20.0, state_mode="heat", modes=("heat", "off"))
     await ctrl.async_apply("heating", 21.0, power_fraction=0.0, current_temp=22.0)
-    assert 19.0 in _sent_temps(hass)
+    assert 17.0 in _sent_temps(hass)
 
 
 @pytest.mark.asyncio
@@ -1243,11 +1243,18 @@ def test_observed_park_clears_the_readings_quantization_interval():
     # an entity id, so a latch carried between them would mask it.
     park = lambda h, intent="cool": observed_park_level(h, "climate.ac", intent, latch=False)  # noqa: E731
 
-    assert park(_head_ctrl(head_temp=22.0, step=1.0)[0]) == 24.0
-    assert park(_head_ctrl(head_temp=22.0, step=1.0, state_mode="heat", modes=("heat", "off"))[0], "heat") == 20.0
-    # Off-grid reading: a value, not an interval — one step still clears it.
-    assert park(_head_ctrl(head_temp=22.2, step=0.5)[0]) == 22.5
-    assert park(_head_ctrl(head_temp=22.2, step=1.0)[0]) == 23.0
+    assert park(_head_ctrl(head_temp=22.0, step=1.0)[0]) == 25.0
+    assert park(_head_ctrl(head_temp=22.0, step=1.0, state_mode="heat", modes=("heat", "off"))[0], "heat") == 19.0
+    # The margin is a temperature, not a count of steps: snapped up to the
+    # ladder, 22.2 + 3.0 lands on 25.5 at half-degree steps and 26.0 at whole.
+    assert park(_head_ctrl(head_temp=22.2, step=0.5)[0]) == 25.5
+    assert park(_head_ctrl(head_temp=22.2, step=1.0)[0]) == 26.0
+    # margin_c=0.0 gives back the lean bound the holding servo runs against,
+    # still strictly past the reading even when the reading sits on a level.
+    lean = lambda h: observed_park_level(h, "climate.ac", "cool", latch=False, margin_c=0.0)  # noqa: E731
+
+    assert lean(_head_ctrl(head_temp=22.2, step=0.5)[0]) == 22.5
+    assert lean(_head_ctrl(head_temp=22.0, step=1.0)[0]) == 23.0
     # No reading → no observed park (callers fall back to the estimate)
     assert park(_head_ctrl(head_temp=None, step=1.0)[0]) is None
 
@@ -1264,16 +1271,16 @@ def test_observed_park_latches_against_the_ratchet():
 
     mc.clear_command_cache()
     hass, _ = _head_ctrl(head_temp=21.0, step=1.0)
-    assert mc.observed_park_level(hass, "climate.ac", "cool") == 23.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool") == 24.0
     # Room warms while parked; the head crosses a whole degree.
     hass.states.get.return_value.attributes["current_temperature"] = 22.0
-    assert mc.observed_park_level(hass, "climate.ac", "cool") == 23.0, "park must not ratchet"
+    assert mc.observed_park_level(hass, "climate.ac", "cool") == 24.0, "park must not ratchet"
     # It also must not sink when the head falls again — one level, held.
     hass.states.get.return_value.attributes["current_temperature"] = 20.0
-    assert mc.observed_park_level(hass, "climate.ac", "cool") == 23.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool") == 24.0
     # An active command supersedes the latch; the next park re-reads the head.
     mc.reset_park_latch("climate.ac")
-    assert mc.observed_park_level(hass, "climate.ac", "cool") == 22.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool") == 23.0
     mc.clear_command_cache()
 
 
@@ -1315,14 +1322,14 @@ def test_park_is_floored_at_the_level_that_leaves_the_room_alone():
     hass, _ = _head_ctrl(head_temp=22.0, step=1.0)
     floor = mc.no_demand_level(23.5, "cool", head_shift=-0.5, step=1.0)
     assert floor == 24.0
-    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 24.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 25.0
     mc.clear_command_cache()
 
     # Heating mirrors it: the park may not sit above the heat target.
     hass, _ = _head_ctrl(head_temp=22.0, step=1.0, state_mode="heat", modes=("heat", "off"))
     floor = mc.no_demand_level(20.5, "heat", head_shift=0.5, step=1.0)
     assert floor == 20.0
-    assert mc.observed_park_level(hass, "climate.ac", "heat", park_floor=floor) == 20.0
+    assert mc.observed_park_level(hass, "climate.ac", "heat", park_floor=floor) == 19.0
     mc.clear_command_cache()
 
 
@@ -1338,7 +1345,7 @@ def test_park_floor_leaves_a_warm_reading_head_alone():
     mc.clear_command_cache()
     hass, _ = _head_ctrl(head_temp=26.0, step=1.0)
     floor = mc.no_demand_level(23.5, "cool", head_shift=3.5, step=1.0)
-    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 28.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 29.0
     mc.clear_command_cache()
 
 
@@ -1356,10 +1363,10 @@ def test_park_floor_outranks_the_latch():
     mc.clear_command_cache()
     hass, _ = _head_ctrl(head_temp=21.0, step=1.0)
     floor = mc.no_demand_level(21.5, "cool", head_shift=0.0, step=1.0)
-    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 23.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 24.0
     # Room warms while parked and the head follows: the latch still holds.
     hass.states.get.return_value.attributes["current_temperature"] = 22.0
-    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 23.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 24.0
     # The target moves up past the latched level: the floor lifts it.
     floor = mc.no_demand_level(25.5, "cool", head_shift=0.0, step=1.0)
     assert mc.observed_park_level(hass, "climate.ac", "cool", park_floor=floor) == 26.0
@@ -1390,9 +1397,9 @@ def test_observed_park_unlatched_read_is_pure():
 
     mc.clear_command_cache()
     hass, _ = _head_ctrl(head_temp=21.0, step=1.0)
-    assert mc.observed_park_level(hass, "climate.ac", "cool", latch=False) == 23.0
-    hass.states.get.return_value.attributes["current_temperature"] = 22.0
     assert mc.observed_park_level(hass, "climate.ac", "cool", latch=False) == 24.0
+    hass.states.get.return_value.attributes["current_temperature"] = 22.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", latch=False) == 25.0
     assert "climate.ac" not in mc._park_latch
     mc.clear_command_cache()
 
@@ -1420,13 +1427,14 @@ async def test_park_does_not_escalate_when_ventilation_cools_the_room():
         if temps:
             sent.append(temps[-1])
     assert sent, "expected at least one parked command"
-    # Everything stays inside one adjacent pair (22/23 — the head reports 21,
-    # so its interval ends at 22 and the park clears that). What matters is
-    # that the level does not CLIMB cycle after cycle, which is where the old
-    # room-error escalation took it (field data: 24 and 25).
-    assert set(sent) <= {22.0, 23.0}, f"park drifted while ventilation cooled the room: {sent}"
-    assert sent[1:] == sent[1:][:1] * len(sent[1:]), f"park still moving once parked: {sent}"
-    assert max(sent) - min(sent) <= 1.0, f"swing wider than one step: {sent}"
+    # Two regimes, not a drift: the servo works near the lean bound (21/22)
+    # while the room is still close to target, then the full park (24) once it
+    # is past the band. What matters is that neither level CLIMBS cycle after
+    # cycle, which is where the old room-error escalation took it (field data:
+    # parks at 24 and 25 on nights the room drifted 0.7 K low).
+    assert set(sent) <= {21.0, 22.0, 24.0}, f"unexpected level while parked: {sent}"
+    parked = sent[2:]
+    assert parked == [parked[0]] * len(parked), f"park still moving once parked: {sent}"
     mc.clear_command_cache()
 
 
@@ -1443,7 +1451,7 @@ async def test_release_and_reengage_stay_within_adjacent_levels():
     with patch.object(mc.time, "time", return_value=1000.0):
         # Room well below target: full park past the reading's interval
         await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.2)
-    assert _sent_temps(hass)[-1] == 24.0
+    assert _sent_temps(hass)[-1] == 25.0
     hass.services.async_call.reset_mock()
     with patch.object(mc.time, "time", return_value=1000.0 + mc.HOLD_RUNG_DWELL_S):
         # Room back just above target with holding-level demand, a dwell
