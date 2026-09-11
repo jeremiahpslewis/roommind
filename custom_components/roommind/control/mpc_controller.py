@@ -6,16 +6,20 @@ import logging
 import math
 import time
 from collections.abc import Callable
+from datetime import time as dt_time
 from typing import TYPE_CHECKING, Any, cast
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from ..const import (
+    AC_ACTIVE_FAN_MODE,
     AC_BOOST_DELTA_MAX,
     AC_BOOST_DELTA_MIN,
     AC_COOLING_BOOST_TARGET,
     AC_HEATING_BOOST_TARGET,
     AC_MAX_HEAD_GAP_C,
+    AC_PARK_MARGIN_C,
     AC_RELEASE_PARK_C,
     AC_SETPOINT_ERROR_FLOOR_MAX_C,
     AC_SETPOINT_ERROR_FLOOR_MIN_C,
@@ -34,6 +38,9 @@ from ..const import (
     MODE_COOLING,
     MODE_HEATING,
     MODE_IDLE,
+    NIGHT_QUIET_END_H,
+    NIGHT_QUIET_START_H,
+    NIGHT_QUIET_TOLERANCE_C,
     NO_COOL_TARGET,
     NO_HEAT_TARGET,
     PROPORTIONAL_DEADBAND_C,
@@ -180,11 +187,20 @@ def observed_park_level(
     *,
     latch: bool = True,
     park_floor: float | None = None,
+    margin_c: float = AC_PARK_MARGIN_C,
 ) -> float | None:
-    """Setpoint (°C) that parks an AC head: the first level past its own reading.
+    """Setpoint (°C) that parks an AC head: ``margin_c`` past its own reading.
 
-    Past the reading's whole quantization interval, where the head reports on
-    the device step grid — see the ``levels`` computation below.
+    The head reports the reading it regulates against, so the margin by which
+    the unit is satisfied is directly observable. That report is quantized
+    (these heads publish whole degrees), so a lean one-step park is only a
+    park when the truth sits at the bottom of its interval — the living room
+    commanded 23 against a reported 22 was not meaningfully backed off. The
+    margin is therefore explicit: AC_PARK_MARGIN_C past the reading, snapped
+    to the device ladder away from demand. Pass ``margin_c=0.0`` for the lean
+    first-level-past-the-reading bound, which is what the holding servo wants
+    — starting it three rungs into do-nothing territory costs a dwell per rung
+    before it finds a level that holds.
 
     With a whole-degree actuator the only optimal steady states are a fixed
     level or a dither between two ADJACENT levels. The head reports the
@@ -224,17 +240,14 @@ def observed_park_level(
         return None
     step = _device_step_c(hass, eid) or 0.5
     sign = 1.0 if intent == "cool" else -1.0
-    n = round(head_c / step, 6)
-    # One level past the REPORTED reading is not one level of margin. A head
-    # that reports on the step grid is quantized: every reading it has ever
-    # published is a whole degree, so the value it actually regulates against
-    # sits somewhere in [report, report + step) and the first level past the
-    # report can be sitting on it. Field case: living room reporting 22 and
-    # parked at 23, which is a park only if the true reading is near 22.0.
-    # Take the reading as its whole interval and park past the far end. A head
-    # with real resolution lands off the grid and keeps the lean one-step park.
-    levels = 2 if abs(n - round(n)) < 1e-6 else 1
-    base = round((math.floor(n) + levels) * step if intent == "cool" else (math.ceil(n) - levels) * step, 1)
+    bound = head_c + margin_c if intent == "cool" else head_c - margin_c
+    n = round(bound / step, 6)
+    # Away from demand, and strictly past the reading even at margin_c=0 —
+    # a setpoint level ON the reading is the demand threshold, not a park.
+    if intent == "cool":
+        base = round(max(math.ceil(n), math.floor(round(head_c / step, 6)) + 1) * step, 1)
+    else:
+        base = round(min(math.floor(n), math.ceil(round(head_c / step, 6)) - 1) * step, 1)
     if park_floor is not None:
         base = max(base, park_floor) if intent == "cool" else min(base, park_floor)
     if not latch:
@@ -247,6 +260,79 @@ def observed_park_level(
         return held
     _park_latch[eid] = base
     return base
+
+
+def _resolve_fan_mode(state: Any, desired: str | None) -> str | None:
+    """Match ``desired`` against the device's advertised fan modes, loosely.
+
+    Devices name the same speed differently in case and spacing ("Quiet" vs
+    "quiet", "Medium Low" vs "medium_low"), and the configured value is free
+    text. An exact-string match silently does nothing on a mismatch, which is
+    indistinguishable from the fan never being commanded at all.
+    """
+    if not desired:
+        return None
+    modes: list[str] = (state.attributes.get("fan_modes") or []) if state else []
+
+    def norm(v: str) -> str:
+        return "".join(ch for ch in str(v).lower() if ch.isalnum())
+
+    want = norm(desired)
+    for mode in modes:
+        if norm(mode) == want:
+            return mode
+    return None
+
+
+async def _send_fan_mode(hass: HomeAssistant, entity_id: str, desired: str | None, *, area_id: str = "unknown") -> None:
+    """Set a climate device's fan mode, only when it is not already there.
+
+    Every cycle passes through here, so the no-op guard is what keeps this
+    from becoming a service call every few minutes against a cloud-backed
+    head. A device that does not advertise the mode keeps the fan it has.
+    """
+    state = hass.states.get(entity_id)
+    resolved = _resolve_fan_mode(state, desired)
+    if resolved is None:
+        if desired:
+            _LOGGER.debug(
+                "Area '%s': device '%s' has no fan mode matching '%s' (available: %s)",
+                area_id,
+                entity_id,
+                desired,
+                (state.attributes.get("fan_modes") if state else None),
+            )
+        return
+    if state is not None and state.attributes.get("fan_mode") == resolved:
+        return
+    cached = _last_commands.get(entity_id)
+    if cached and cached.get("service") == "set_fan_mode" and cached.get("fan_mode") == resolved:
+        if state is None or state.attributes.get("fan_mode") is None:
+            return
+    try:
+        await hass.services.async_call(
+            "climate",
+            "set_fan_mode",
+            {"entity_id": entity_id, "fan_mode": resolved},
+            blocking=True,
+            context=make_roommind_context(),
+        )
+        _last_commands[entity_id] = _cache_entry("set_fan_mode", {"fan_mode": resolved})
+    except Exception:  # noqa: BLE001
+        _LOGGER.warning(
+            "Area '%s': climate.set_fan_mode('%s') failed on '%s'",
+            area_id,
+            resolved,
+            entity_id,
+            exc_info=True,
+        )
+
+
+def in_night_quiet_window(now: dt_time | None = None) -> bool:
+    """True inside the local-time window where a working AC stays quiet."""
+    t = now if now is not None else dt_util.now().time()
+    start, end = dt_time(NIGHT_QUIET_START_H), dt_time(NIGHT_QUIET_END_H)
+    return t >= start or t < end if start > end else start <= t < end
 
 
 def _resolve_idle_setpoint(
@@ -1971,6 +2057,16 @@ class MPCController:
                     current_temp=current_temp,
                 )
 
+        # After the mode dispatch, so it reflects what was actually commanded
+        # and runs on every path (including idle, where nothing above touches
+        # the fan at all). A room shut down on purpose is parked like any
+        # other: force_off means less output, never more air.
+        await self._apply_ac_fan_modes(
+            MODE_IDLE if force_off else mode,
+            current_temp,
+            effective_target,
+        )
+
     def learned_cool_setpoint(self, eid: str, current_temp: float, power_fraction: float) -> float | None:
         """AC cooling setpoint from the learned head-gap response, or None.
 
@@ -2140,6 +2236,44 @@ class MPCController:
                 shifted = (math.ceil(n - 0.5) if intent == "cool" else math.floor(n + 0.5)) * step
         return self._clamp_to_device_range(eid, shifted)
 
+    async def _apply_ac_fan_modes(self, mode: str, current_temp: float | None, effective_target: float) -> None:
+        """Quiet the fan on parked heads; give a working one its air back.
+
+        A raised setpoint stops the compressor, not the blower. On a shared
+        outdoor unit the parked heads keep pushing air over coils the running
+        compressor keeps cold, which is what a room feels as the AC never
+        backing off — so a parked head gets its configured idle_fan_mode.
+
+        A head that is actually working gets AC_ACTIVE_FAN_MODE back, except
+        inside the night window, where the quiet fan is kept for as long as it
+        is coping. Quiet costs a head a large part of its capacity, so "coping"
+        has to be checked rather than assumed: a room more than
+        NIGHT_QUIET_TOLERANCE_C the wrong side of target at night is not being
+        served by a quiet fan and is given the air instead.
+        """
+        parked = mode == MODE_IDLE
+        for eid in self.acs:
+            idle_action, idle_fan = get_idle_action(self._devices, eid)
+            if parked:
+                # A head that is being switched off has no fan to quieten, and
+                # a fan command can wake a unit that was just told to stop.
+                if idle_action == IDLE_ACTION_OFF or (self._force_off and idle_action != IDLE_ACTION_LOW):
+                    continue
+                desired: str | None = idle_fan
+            elif in_night_quiet_window() and self._night_quiet_is_coping(mode, current_temp, effective_target):
+                desired = idle_fan
+            else:
+                desired = AC_ACTIVE_FAN_MODE
+            await _send_fan_mode(self.hass, eid, desired, area_id=self._area_id)
+
+    @staticmethod
+    def _night_quiet_is_coping(mode: str, current_temp: float | None, effective_target: float) -> bool:
+        """Is the room close enough to target for a quiet fan to be enough?"""
+        if current_temp is None:
+            return True  # no evidence it is failing; keep the night quiet
+        error = current_temp - effective_target if mode == MODE_COOLING else effective_target - current_temp
+        return error <= NIGHT_QUIET_TOLERANCE_C
+
     def _clamp_to_device_range(self, eid: str, value: float) -> float:
         """Clamp a °C setpoint to the device's own min/max, rounded to 0.1."""
         state = self.hass.states.get(eid)
@@ -2175,23 +2309,29 @@ class MPCController:
         # error > 0 = the room needs more output; error < 0 = it got too much
         error = (current_temp - effective_target) * sign
         parked = error < -HOLD_PARK_BAND_C
-        # The gentle bound is the level the head is observably satisfied at
-        # (one step past its own reading), never gentler than the level that
-        # leaves the room alone; the estimate is the fallback when the reading
-        # is unavailable.
+        # Two different levels, and conflating them starves the servo. A full
+        # park is AC_PARK_MARGIN_C past the reading — wide, because the unit
+        # must not regulate the room between cycles. The servo's GENTLE BOUND
+        # is the lean first level past the reading: the servo walks down one
+        # rung per dwell from there, so a bound three rungs into do-nothing
+        # territory costs three dwells of under-delivery before it reaches a
+        # level that holds. Both are floored at the level that leaves the room
+        # alone; the estimate is the fallback when the reading is unavailable.
         if not parked:
             reset_park_latch(eid)
+        floor = no_demand_level(
+            effective_target,
+            intent,
+            head_shift=self.head_frame_shift(eid, current_temp, release_intent=intent, learned_only=True),
+            step=step,
+        )
         park = observed_park_level(
             self.hass,
             eid,
             intent,
             latch=parked,
-            park_floor=no_demand_level(
-                effective_target,
-                intent,
-                head_shift=self.head_frame_shift(eid, current_temp, release_intent=intent, learned_only=True),
-                step=step,
-            ),
+            park_floor=floor,
+            margin_c=AC_PARK_MARGIN_C if parked else 0.0,
         )
         if park is None:
             release_shift = self.head_frame_shift(eid, current_temp, release_intent=intent)

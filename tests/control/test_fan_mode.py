@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -1362,3 +1362,135 @@ async def test_mpc_apply_idle_force_off_keeps_low_exempt():
     temp_calls = [c for c in calls if c[0][1] == "set_temperature"]
     assert len(temp_calls) == 1
     assert temp_calls[0][0][2]["temperature"] == 5.0
+
+
+# ---------------------------------------------------------------------------
+# Parked-head fan control. A raised setpoint stops the compressor, not the
+# blower — on a shared outdoor unit the parked heads keep pushing air over
+# coils the running compressor keeps cold, which is what a room feels as the
+# AC never backing off.
+# ---------------------------------------------------------------------------
+
+
+def _fan_ctrl(*, fan_mode="Auto", idle_fan_mode="quiet", idle_action="setback"):
+    hass = build_hass()
+    state = MagicMock()
+    state.state = "cool"
+    state.attributes = {
+        "hvac_modes": ["off", "auto", "cool", "heat", "dry", "fan_only"],
+        # Real Carrier casing: the configured value never matches exactly.
+        "fan_modes": ["Auto", "Quiet", "Low", "Medium Low", "Medium", "Medium High", "High"],
+        "fan_mode": fan_mode,
+        "temperature": 23.0,
+        "current_temperature": 22.0,
+        "min_temp": 17.0,
+        "max_temp": 30.0,
+        "target_temp_step": 1.0,
+    }
+    hass.states.get = MagicMock(return_value=state)
+    room = make_room(thermostats=[], acs=["climate.ac1"])
+    room["devices"] = [
+        {
+            "entity_id": "climate.ac1",
+            "type": "ac",
+            "role": "auto",
+            "heating_system_type": "",
+            "idle_action": idle_action,
+            "idle_fan_mode": idle_fan_mode,
+        }
+    ]
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=30.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    return hass, ctrl, state
+
+
+def _fan_sent(hass):
+    return [c[0][2]["fan_mode"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_fan_mode"]
+
+
+@pytest.mark.asyncio
+async def test_parked_head_is_quieted_matching_the_devices_own_casing():
+    """A parked head gets its idle fan mode, resolved loosely against the device.
+
+    The configured value is free text ("quiet") and the device advertises
+    "Quiet"; an exact-string match silently does nothing, which looks exactly
+    like the fan never being commanded at all.
+    """
+    clear_command_cache()
+    hass, ctrl, _ = _fan_ctrl()
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+    assert _fan_sent(hass) == ["Quiet"]
+
+
+@pytest.mark.asyncio
+async def test_working_head_gets_its_air_back():
+    """Out of the park and outside the night window: back to auto."""
+    clear_command_cache()
+    hass, ctrl, _ = _fan_ctrl(fan_mode="Quiet")
+    with patch("custom_components.roommind.control.mpc_controller.in_night_quiet_window", return_value=False):
+        await ctrl.async_apply("cooling", TargetTemps(heat=None, cool=21.0), power_fraction=1.0, current_temp=24.0)
+    assert _fan_sent(hass) == ["Auto"]
+
+
+@pytest.mark.asyncio
+async def test_working_head_stays_quiet_at_night_while_it_is_coping():
+    """Inside the night window a working head keeps the quiet fan."""
+    clear_command_cache()
+    hass, ctrl, _ = _fan_ctrl(fan_mode="Auto")
+    with patch("custom_components.roommind.control.mpc_controller.in_night_quiet_window", return_value=True):
+        # 0.5 K over target: within NIGHT_QUIET_TOLERANCE_C, quiet is enough.
+        await ctrl.async_apply("cooling", TargetTemps(heat=None, cool=21.0), power_fraction=0.3, current_temp=21.5)
+    assert _fan_sent(hass) == ["Quiet"]
+
+
+@pytest.mark.asyncio
+async def test_night_quiet_yields_when_the_room_is_not_keeping_up():
+    """Quiet costs a head much of its capacity, so "sufficient" is checked.
+
+    A room well the wrong side of target at night is not being served by a
+    quiet fan — it would simply sit warm until morning.
+    """
+    clear_command_cache()
+    hass, ctrl, _ = _fan_ctrl(fan_mode="Quiet")
+    with patch("custom_components.roommind.control.mpc_controller.in_night_quiet_window", return_value=True):
+        # 3 K over target, far past NIGHT_QUIET_TOLERANCE_C.
+        await ctrl.async_apply("cooling", TargetTemps(heat=None, cool=21.0), power_fraction=1.0, current_temp=24.0)
+    assert _fan_sent(hass) == ["Auto"]
+
+
+@pytest.mark.asyncio
+async def test_fan_is_not_recommanded_when_already_there():
+    """Every cycle passes through here; a cloud-backed head must not be spammed."""
+    clear_command_cache()
+    hass, ctrl, _ = _fan_ctrl(fan_mode="Quiet")
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+    assert _fan_sent(hass) == []
+
+
+@pytest.mark.asyncio
+async def test_head_being_switched_off_is_not_given_a_fan_command():
+    """A unit told to stop has no fan to quieten, and the command can wake it."""
+    clear_command_cache()
+    hass, ctrl, _ = _fan_ctrl(idle_action="off")
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+    assert _fan_sent(hass) == []
+
+
+def test_night_quiet_window_boundaries():
+    """23:00 through 05:59 local, wrapping midnight."""
+    from datetime import time as dt_time
+
+    from custom_components.roommind.control.mpc_controller import in_night_quiet_window
+
+    assert in_night_quiet_window(dt_time(23, 0))
+    assert in_night_quiet_window(dt_time(2, 30))
+    assert in_night_quiet_window(dt_time(5, 59))
+    assert not in_night_quiet_window(dt_time(6, 0))
+    assert not in_night_quiet_window(dt_time(22, 59))
+    assert not in_night_quiet_window(dt_time(12, 0))

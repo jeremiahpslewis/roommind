@@ -11,7 +11,7 @@ VERSION = "1.7.6"
 # Fork build stamp, bumped on every ship. Surfaced in diagnostics and the
 # startup log so the code actually running is never in doubt (a stale tarball
 # or an un-reloaded module looks identical to the new one otherwise).
-BUILD_ID = "2026-09-11.3-park-interval"
+BUILD_ID = "2026-09-11.4-park-margin-quiet"
 
 # Platforms
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BINARY_SENSOR, Platform.CLIMATE]
@@ -114,6 +114,28 @@ AC_MAX_HEAD_GAP_C = 6.0
 # DEFAULT_IDLE_SETBACK_OFFSET, which sizes TRV/thermostat setbacks that have
 # no learned offset to lean on.
 AC_RELEASE_PARK_C = 1.0
+
+# How far past its OWN reading a parked AC head is set. The head reports the
+# reading it regulates against, so this is the margin by which the unit is
+# satisfied — and the report is quantized (these heads publish whole degrees),
+# so the true margin is this less up to one step. Wide enough that the parked
+# unit's own thermostat cannot become the room's controller between MPC cycles.
+AC_PARK_MARGIN_C = 3.0
+
+# Fan mode commanded to an AC that is actively working. Parked heads get the
+# device's configured idle_fan_mode instead.
+AC_ACTIVE_FAN_MODE = "auto"
+
+# Night window (local time, start inclusive, end exclusive) in which a working
+# AC keeps its quiet idle fan rather than returning to auto.
+NIGHT_QUIET_START_H = 23
+NIGHT_QUIET_END_H = 6
+
+# How far behind target the room may sit at night before the quiet fan is
+# judged insufficient and released to auto. Quiet costs a head a large part of
+# its capacity, so a room that is genuinely failing to reach target must be
+# allowed the air rather than sit warm all night.
+NIGHT_QUIET_TOLERANCE_C = 1.0
 
 PROPORTIONAL_DEADBAND_C = 0.5  # Minimum proportional setpoint change (°C) to resend, in the gentle regime
 PROPORTIONAL_DEADBAND_NEAR_TARGET_C = 0.2  # Finer proportional deadband (°C) within 1°C of target
