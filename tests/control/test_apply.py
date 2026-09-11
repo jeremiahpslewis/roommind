@@ -4888,13 +4888,44 @@ async def test_setback_cooling_head_offset_capped():
 
 
 @pytest.mark.asyncio
-async def test_setback_cooling_ignores_cool_reading_head():
-    """A head reading cooler than the room parks just past THAT reading.
+async def test_setback_cooling_with_a_cool_head_clears_the_room_target():
+    """A head reading cooler than the room still parks at or past the target.
 
-    The head is satisfied at 18.5 whatever the room sensor says — parking
-    higher only widens the swing on the next re-engage."""
+    Head 18, room 19, cool target 20.5. The head is satisfied at 18.5 — but a
+    unit idled there re-arms the moment its reading reaches 18.5, the room at
+    19.5, a full degree under the target the idle was supposed to respect. It
+    then holds the room there, and since the room never shows a deficit the
+    MPC never takes the device back. The idle setpoint is floored at the
+    target's own level, 20.5, where the head is equally satisfied today and
+    the unit cannot undercut the target tomorrow."""
     temp = await _setback_sent_temp("cool", TargetTemps(heat=None, cool=20.5), head_temp=18.0, current_temp=19.0)
-    assert temp == 18.5
+    assert temp == 20.5
+
+
+@pytest.mark.asyncio
+async def test_setback_floor_carries_a_configured_direct_offset():
+    """A direct-mode offset (#369) declares the head reads 1 K warm: the floor moves with it.
+
+    Same head and room as above. Floored at the bare 20.5 the parked head would
+    hold the room near 19.5; the declared bias puts the floor at 21.5."""
+    hass = build_hass()
+    hass.states.get = MagicMock(return_value=_setback_ac_state("cool", 18.0))
+    devices = [
+        {
+            "entity_id": "climate.ac",
+            "type": "ac",
+            "role": "auto",
+            "idle_action": "setback",
+            "setpoint_mode": "direct",
+            "setpoint_offset": 1.0,
+        }
+    ]
+    _last_commands.clear()
+    await async_idle_device(
+        hass, "climate.ac", devices, area_id="test", targets=TargetTemps(heat=None, cool=20.5), current_temp=19.0
+    )
+    temp_calls = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert temp_calls[0][0][2]["temperature"] == 21.5
 
 
 @pytest.mark.asyncio
