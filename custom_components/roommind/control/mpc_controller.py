@@ -1609,6 +1609,12 @@ class MPCController:
             _desired = self._desired_fan_mode(_eid, _fan_mode, current_temp, effective_target)
             if _desired is not None:
                 self._intended_airflow[_eid] = airflow_class(_desired)
+        # The room's thermal model has one set of actuator gains loaded at a
+        # time; point it at the same class, so a plan for a quiet run is drawn
+        # against a quiet room's cooling rate rather than a full-airflow one.
+        _classes = set(self._intended_airflow.values())
+        if len(_classes) == 1 and self._model_manager is not None:
+            self._model_manager.set_airflow(self._area_id, _classes.pop())
 
         can_heat, can_cool = self._get_can_heat_cool()
 

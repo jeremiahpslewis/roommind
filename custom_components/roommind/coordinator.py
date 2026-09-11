@@ -47,6 +47,7 @@ from .const import (
     make_roommind_context,
 )
 from .control.gap_response import (
+    AIRFLOW_NORMAL,
     MAX_OBSERVATION_DT,
     MIN_OBSERVATION_DT,
     RUNNING_STATES,
@@ -1224,6 +1225,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 can_cool=can_cool,
                 dt_minutes=UPDATE_INTERVAL / 60.0,
                 q_occupancy=q_occupancy,
+                airflow=self._room_airflow(room),
             )
         else:
             self._ekf_training.clear(area_id)
@@ -1612,6 +1614,23 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 except (ValueError, TypeError):
                     continue
         return None
+
+    def _room_airflow(self, room: dict) -> str:
+        """Airflow class the room's AC heads were actually running at.
+
+        The actuator gains the EKF is about to train belong to the capacity
+        that produced the observed temperature change, which is the fan the
+        heads were on — not whatever they are about to be set to. Rooms with
+        no AC, or heads that disagree, fall back to the normal class.
+        """
+        classes = set()
+        for entity_id in get_ac_eids(room.get("devices", [])):
+            state = self.hass.states.get(entity_id)
+            if state is not None:
+                classes.add(airflow_class(state.attributes.get("fan_mode")))
+        if len(classes) == 1:
+            return classes.pop()
+        return AIRFLOW_NORMAL
 
     def _read_device_setpoint(self, devices: list[dict]) -> float | None:
         """Setpoint (°C) the first readable climate device is currently holding."""

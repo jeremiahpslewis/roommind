@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 import math
 
+from .gap_response import AIRFLOW_NORMAL
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -268,6 +270,14 @@ class ThermalEKF:
       - Zamani et al. (2025): UKF for RC model estimation (PMC 11798724)
     """
 
+    # State indices of the ACTUATOR gains. These, and only these, depend on
+    # how hard the device's blower is turning: beta_h and beta_c are what the
+    # unit delivers, while alpha, the solar and occupancy gains, the
+    # disturbance and the ventilation coupling are properties of the room and
+    # are shared across airflow classes. Splitting the whole filter per class
+    # would halve the data behind parameters that cannot differ.
+    _ACTUATOR_IDX: tuple[int, ...] = (2, 3)
+
     # Threshold below which we use the linearized model to avoid 1/alpha
     _ALPHA_SMALL: float = 0.01
 
@@ -388,8 +398,67 @@ class ThermalEKF:
         self._initialized: bool = False
         self._k_window: float = self._K_WINDOW_DEFAULT
         self._k_window_n: int = 0
+        # Actuator gains banked per airflow class. One set is live in _x at a
+        # time; the rest wait here with their own variances.
+        self._airflow: str = AIRFLOW_NORMAL
+        self._beta_bank: dict[str, tuple[list[float], list[float]]] = {}
 
     # -- public API ----------------------------------------------------------
+
+    @property
+    def airflow(self) -> str:
+        """Airflow class whose actuator gains are currently loaded."""
+        return self._airflow
+
+    def set_airflow(self, airflow: str) -> None:
+        """Load the actuator gains learned under *airflow*.
+
+        A bank of gains over one shared room filter, rather than a filter per
+        class. The room parameters are estimated from every observation
+        regardless of fan speed — they cannot depend on it — while beta_h and
+        beta_c are swapped so that a quiet run trains and predicts against the
+        capacity a quiet head actually delivers.
+
+        The incoming gains arrive with no cross-covariance to the rest of the
+        state: those correlations were built by the other class's history and
+        do not transfer. Zeroing them is conservative — the first update after
+        a switch attributes a little less to the gain and the correlation
+        rebuilds within a few cycles — and, unlike carrying them over, it
+        cannot leave P non-PSD.
+        """
+        if airflow == self._airflow:
+            return
+        self._beta_bank[self._airflow] = (
+            [self._x[i] for i in self._ACTUATOR_IDX],
+            [self._P[i][i] for i in self._ACTUATOR_IDX],
+        )
+        stashed = self._beta_bank.get(airflow)
+        if stashed is None:
+            # First time in this class: keep the gains as the best guess going
+            # in, but restore the initial uncertainty so its own data can move
+            # them. A quiet head is not a broken head — it is a weaker one.
+            values = [self._x[i] for i in self._ACTUATOR_IDX]
+            variances = [self._P_INIT_BETA] * len(self._ACTUATOR_IDX)
+        else:
+            values, variances = stashed
+        for k, i in enumerate(self._ACTUATOR_IDX):
+            self._x[i] = values[k]
+            for j in range(self._N):
+                self._P[i][j] = 0.0
+                self._P[j][i] = 0.0
+            self._P[i][i] = variances[k]
+        self._airflow = airflow
+        self._clamp_parameters()
+        self._enforce_psd()
+
+    def gains_for(self, airflow: str) -> tuple[float, float] | None:
+        """(beta_h, beta_c) as banked for *airflow*, or None if never loaded."""
+        if airflow == self._airflow:
+            return (self._x[2], self._x[3])
+        stashed = self._beta_bank.get(airflow)
+        if stashed is None:
+            return None
+        return (stashed[0][0], stashed[0][1])
 
     @property
     def confidence(self) -> float:
@@ -1002,6 +1071,8 @@ class ThermalEKF:
             "initialized": self._initialized,
             "k_window": self._k_window,
             "k_window_n": self._k_window_n,
+            "airflow": self._airflow,
+            "beta_bank": {k: [list(v[0]), list(v[1])] for k, v in self._beta_bank.items()},
         }
 
     def boost_covariance(self, factor: float = 2.5, floor_frac: float = 0.3) -> None:
@@ -1063,6 +1134,14 @@ class ThermalEKF:
         ekf._initialized = data.get("initialized", ekf._n_updates > 0)
         ekf._k_window = data.get("k_window", cls._K_WINDOW_DEFAULT)
         ekf._k_window_n = data.get("k_window_n", 0)
+        # Absent on pre-airflow state: the loaded gains simply become the
+        # normal class's, and the first quiet run seeds itself from them.
+        ekf._airflow = data.get("airflow", AIRFLOW_NORMAL)
+        for key, pair in (data.get("beta_bank") or {}).items():
+            try:
+                ekf._beta_bank[key] = ([float(v) for v in pair[0]], [float(v) for v in pair[1]])
+            except (TypeError, ValueError, IndexError):
+                continue
         # Recovery migrations for models with alpha pegged at the upper bound.
         # Such models cannot escape on their own: 4-sigma anomaly detection
         # soft-rejects the large innovations and cross-covariance pulls alpha
@@ -1246,10 +1325,12 @@ class RoomModelManager:
         q_solar: float = 0.0,
         q_residual: float = 0.0,
         q_occupancy: float = 0.0,
+        airflow: str = AIRFLOW_NORMAL,
     ) -> None:
         """Feed an observed transition to the room's estimator."""
         est = self.get_estimator(area_id)
         est.set_applicable_modes(can_heat, can_cool)
+        est.set_airflow(airflow)
         est.update(
             T_new,
             T_outdoor,
@@ -1273,6 +1354,14 @@ class RoomModelManager:
     ) -> float:
         """Predict future temperature for *area_id*."""
         return self.get_estimator(area_id).get_model().predict(T_room, T_outdoor, Q_active, dt_minutes)
+
+    def set_airflow(self, area_id: str, airflow: str) -> None:
+        """Load the actuator gains for *airflow* before planning or training.
+
+        Sticky: every get_model() after this reads the gains for that class,
+        so the many read sites need no airflow argument of their own.
+        """
+        self.get_estimator(area_id).set_airflow(airflow)
 
     def get_model(self, area_id: str) -> RCModel:
         """Return the learned RCModel for *area_id* (C=1 normalization).
