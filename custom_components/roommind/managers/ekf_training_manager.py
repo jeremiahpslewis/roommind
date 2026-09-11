@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from ..const import EKF_UPDATE_MIN_DT
+from ..control.gap_response import AIRFLOW_NORMAL
 
 if TYPE_CHECKING:
     from ..control.thermal_model import RoomModelManager
@@ -20,6 +21,7 @@ class EkfTrainingManager:
         self._model_manager = model_manager
         self._accumulated_dt: dict[str, float] = {}
         self._accumulated_mode: dict[str, str] = {}
+        self._accumulated_airflow: dict[str, str] = {}
         self._accumulated_pf: dict[str, float] = {}
         # dt-weighted mean AC rebound charge of the batch: it decays within minutes,
         # so the value at flush time would understate the batch.
@@ -42,9 +44,10 @@ class EkfTrainingManager:
         shading_factor: float = 1.0,
         q_occupancy: float = 0.0,
     ) -> None:
-        """Flush accumulated EKF update (on mode change or window open)."""
+        """Flush accumulated EKF update (on mode/airflow change or window open)."""
         accumulated = self._accumulated_dt.pop(area_id, 0.0)
         prev_mode = self._accumulated_mode.pop(area_id, None)
+        prev_airflow = self._accumulated_airflow.pop(area_id, AIRFLOW_NORMAL)
         pf = self._accumulated_pf.pop(area_id, 1.0)
         q_rebound = self._accumulated_rebound.pop(area_id, None)
         if accumulated > 0 and prev_mode is not None:
@@ -61,6 +64,7 @@ class EkfTrainingManager:
                 q_residual=q_residual,
                 q_occupancy=q_occupancy,
                 q_rebound=q_rebound,
+                airflow=prev_airflow,
             )
 
     def process(
@@ -80,6 +84,7 @@ class EkfTrainingManager:
         dt_minutes: float,
         q_occupancy: float = 0.0,
         q_rebound: float | None = None,
+        airflow: str = AIRFLOW_NORMAL,
     ) -> None:
         """Process an EKF training step for a room.
 
@@ -124,7 +129,13 @@ class EkfTrainingManager:
             self.clear(area_id)
         else:
             prev_mode = self._accumulated_mode.get(area_id)
-            if prev_mode is not None and prev_mode != ekf_mode:
+            prev_airflow = self._accumulated_airflow.get(area_id)
+            # An airflow change is the same kind of boundary as a mode change:
+            # the interval either side was delivered by a different capacity,
+            # and averaging across it trains both classes on neither.
+            if (prev_mode is not None and prev_mode != ekf_mode) or (
+                prev_airflow is not None and prev_airflow != airflow
+            ):
                 self.flush(
                     area_id,
                     current_temp,
@@ -149,6 +160,7 @@ class EkfTrainingManager:
                     self._accumulated_rebound[area_id] = (old_rebound * old_dt + q_rebound * dt_minutes) / new_dt
             self._accumulated_dt[area_id] = new_dt
             self._accumulated_mode[area_id] = ekf_mode
+            self._accumulated_airflow[area_id] = airflow
 
             if self._accumulated_dt[area_id] >= EKF_UPDATE_MIN_DT:
                 pf = self._accumulated_pf.pop(area_id, 1.0)
@@ -166,6 +178,7 @@ class EkfTrainingManager:
                     q_residual=q_residual,
                     q_occupancy=q_occupancy,
                     q_rebound=batch_rebound,
+                    airflow=airflow,
                 )
                 self._accumulated_dt[area_id] = 0.0
 
@@ -177,6 +190,7 @@ class EkfTrainingManager:
         self._accumulated_mode.pop(area_id, None)
         self._accumulated_pf.pop(area_id, None)
         self._accumulated_rebound.pop(area_id, None)
+        self._accumulated_airflow.pop(area_id, None)
 
     def remove_room(self, area_id: str) -> None:
         """Clean up all state for a removed room."""
