@@ -1456,19 +1456,8 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         _relevant_offsets = {_direct_offsets.get(eid, 0.0) for eid in _mode_relevant_eids}
         _display_offset = _relevant_offsets.pop() if _all_direct and len(_relevant_offsets) == 1 else 0.0
 
-        return {
-            "area_id": area_id,
-            "current_temp": current_temp,
-            "current_temp_raw": current_temp_raw,
-            "current_humidity": current_humidity,
-            "target_temp": target_temp,
-            "heat_target": targets.heat,
-            "cool_target": targets.cool,
-            "schedule_temp_warnings": schedule_temp_warnings,
-            "mode": display_mode,
-            "commanded_mode": mode,
-            "heating_power": round(display_pf * 100) if display_mode != MODE_IDLE else 0,
-            "device_setpoint": self._compute_device_setpoint_orchestrated(
+        _device_setpoint = (
+            self._compute_device_setpoint_orchestrated(
                 heat_source_plan,
                 current_temp,
                 target_temp,
@@ -1493,7 +1482,28 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 direct_offset=_display_offset,
                 ac_setpoint_limit=ac_setpoint_limit,
                 head_frame_shift=head_frame_shift,
-            ),
+            )
+        )
+        if _device_setpoint is None:
+            # An idle/parked device has no computed setpoint, but it is still
+            # holding one — and that parked level IS the control action while
+            # nothing is running. Reporting None hid a park that walked two
+            # levels across a single night from the history CSV entirely.
+            _device_setpoint = self._read_device_setpoint(_room_devices)
+
+        return {
+            "area_id": area_id,
+            "current_temp": current_temp,
+            "current_temp_raw": current_temp_raw,
+            "current_humidity": current_humidity,
+            "target_temp": target_temp,
+            "heat_target": targets.heat,
+            "cool_target": targets.cool,
+            "schedule_temp_warnings": schedule_temp_warnings,
+            "mode": display_mode,
+            "commanded_mode": mode,
+            "heating_power": round(display_pf * 100) if display_mode != MODE_IDLE else 0,
+            "device_setpoint": _device_setpoint,
             "window_open": window_open,
             **build_override_live(
                 room,
@@ -1749,6 +1759,18 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                     return float(state.attributes["current_temperature"])
                 except (ValueError, TypeError):
                     continue
+        return None
+
+    def _read_device_setpoint(self, devices: list[dict]) -> float | None:
+        """Setpoint (°C) the first readable climate device is currently holding."""
+        for entity_id in get_all_entity_ids(devices):
+            state = self.hass.states.get(entity_id)
+            if state is None or state.attributes.get("temperature") is None:
+                continue
+            try:
+                return round(ha_temp_to_celsius(self.hass, float(state.attributes["temperature"])), 1)
+            except (TypeError, ValueError):
+                continue
         return None
 
     def _observe_device_action(self, room: dict) -> tuple[str | None, float]:
