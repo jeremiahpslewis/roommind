@@ -1494,3 +1494,53 @@ def test_night_quiet_window_boundaries():
     assert not in_night_quiet_window(dt_time(6, 0))
     assert not in_night_quiet_window(dt_time(22, 59))
     assert not in_night_quiet_window(dt_time(12, 0))
+
+
+@pytest.mark.asyncio
+async def test_controller_reads_the_airflow_class_it_is_about_to_command():
+    """The setpoint is sized from the capacity it will actually be delivered under.
+
+    On the cycle where the fan changes, the head is still reporting the old
+    speed. Reading the old class's offset there sizes the command from the
+    wrong capacity — the changeover cycle is precisely when the two estimates
+    differ most.
+    """
+    from custom_components.roommind.control.gap_response import (
+        AIRFLOW_NORMAL,
+        AIRFLOW_QUIET,
+        GapResponseManager,
+    )
+
+    clear_command_cache()
+    # Head currently on Auto; the room is parked, so it is about to go Quiet.
+    hass, _, _ = _fan_ctrl(fan_mode="Auto")
+    gap_mgr = GapResponseManager()
+    for _ in range(60):
+        gap_mgr.observe_offset("climate.ac1", 25.0, 22.0, is_running=True, airflow=AIRFLOW_QUIET)
+        gap_mgr.observe_offset("climate.ac1", 22.5, 22.0, is_running=True, airflow=AIRFLOW_NORMAL)
+
+    room = make_room(thermostats=[], acs=["climate.ac1"])
+    room["devices"] = [
+        {
+            "entity_id": "climate.ac1",
+            "type": "ac",
+            "role": "auto",
+            "heating_system_type": "",
+            "idle_action": "setback",
+            "idle_fan_mode": "quiet",
+        }
+    ]
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=30.0,
+        settings={},
+        has_external_sensor=True,
+        gap_manager=gap_mgr,
+    )
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+
+    # It resolved the quiet class despite the head still reporting Auto.
+    assert ctrl._intended_airflow["climate.ac1"] == AIRFLOW_QUIET
+    assert ctrl.head_frame_shift("climate.ac1", 22.0) == pytest.approx(3.0, abs=0.2)
