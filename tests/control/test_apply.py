@@ -4686,7 +4686,15 @@ async def test_setback_without_room_temp_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_setback_heating_widens_for_cold_head_sensor():
-    """Heating mirror: park AC_PARK_MARGIN_C below the head's reading (18.0 → 15.0)."""
-    temp = await _setback_sent_temp("heat", TargetTemps(heat=21.0, cool=None), head_temp=18.0, current_temp=21.0)
-    assert temp == 15.0
+async def test_setback_heating_park_margin_follows_demand():
+    """Heating mirror, and the margin follows demand on both sides.
+
+    A room sitting AT target still has something to hold, and a head parked
+    the full margin past its reading is off — so it parks lean, one step past
+    the reading, where it trickles. Only once the room is clear of target
+    (nothing left to hold) does it take the full AC_PARK_MARGIN_C.
+    """
+    at_target = await _setback_sent_temp("heat", TargetTemps(heat=21.0, cool=None), head_temp=18.0, current_temp=21.0)
+    assert at_target == 17.5, "a room at target must keep the trickle"
+    no_demand = await _setback_sent_temp("heat", TargetTemps(heat=21.0, cool=None), head_temp=18.0, current_temp=23.0)
+    assert no_demand == 15.0, "a room well past target has nothing to hold"

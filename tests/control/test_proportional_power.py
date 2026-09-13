@@ -1459,3 +1459,83 @@ async def test_release_and_reengage_stay_within_adjacent_levels():
         await ctrl.async_apply("cooling", 21.0, power_fraction=0.15, current_temp=21.3)
     assert _sent_temps(hass)[-1] == 23.0
     mc.clear_command_cache()
+
+
+# ---------------------------------------------------------------------------
+# The park margin follows demand. A head parked AC_PARK_MARGIN_C past its own
+# reading is genuinely off, and a unit that is off holds nothing — which is
+# right once the room is clear of target, and wrong near it, where the trickle
+# at the lean park is the only thing regulating between MPC cycles.
+# ---------------------------------------------------------------------------
+
+
+def test_park_margin_follows_demand_not_the_clock():
+    from custom_components.roommind.control.mpc_controller import (
+        AC_PARK_MARGIN_C,
+        HOLD_PARK_BAND_C,
+        park_margin_for,
+    )
+
+    # Cooling: below target by more than the band = nothing left to hold.
+    assert park_margin_for(20.0, 22.0, "cool") == AC_PARK_MARGIN_C
+    assert park_margin_for(22.0 - HOLD_PARK_BAND_C - 0.01, 22.0, "cool") == AC_PARK_MARGIN_C
+    # At or near target, and above it, the trickle is wanted.
+    assert park_margin_for(22.0, 22.0, "cool") == 0.0
+    assert park_margin_for(21.8, 22.0, "cool") == 0.0
+    assert park_margin_for(23.0, 22.0, "cool") == 0.0
+    # Heating mirrors it.
+    assert park_margin_for(23.0, 21.0, "heat") == AC_PARK_MARGIN_C
+    assert park_margin_for(21.0, 21.0, "heat") == 0.0
+    # No room reading: no "near" to be in, so the safe answer is the full margin.
+    assert park_margin_for(None, 22.0, "cool") == AC_PARK_MARGIN_C
+
+
+def test_a_lean_latched_park_still_deepens_when_the_room_stops_needing_it():
+    """The latch must not hold a trickling park into a room with no demand.
+
+    It exists to stop the level following the HEAD upward. A margin change is
+    the room's demand changing, not the head moving, so it re-latches.
+    """
+    from custom_components.roommind.control import mpc_controller as mc
+
+    mc.clear_command_cache()
+    hass, _ = _head_ctrl(head_temp=22.0, step=1.0)
+    lean = mc.observed_park_level(hass, "climate.ac", "cool", margin_c=0.0)
+    assert lean == 23.0
+    # Head warms a degree: the latch holds, no ratchet.
+    hass.states.get.return_value.attributes["current_temperature"] = 23.0
+    assert mc.observed_park_level(hass, "climate.ac", "cool", margin_c=0.0) == 23.0
+    # The room falls away from target; the margin deepens and the latch yields.
+    assert mc.observed_park_level(hass, "climate.ac", "cool", margin_c=mc.AC_PARK_MARGIN_C) == 26.0
+    mc.clear_command_cache()
+
+
+@pytest.mark.asyncio
+async def test_learned_excursion_is_bounded_by_the_error_it_corrects():
+    """A confident curve may size the gap, but not reach past the limit.
+
+    Field case (bedroom, 12-13 Sep): a room a few tenths over target commanded
+    the device minimum, 17, all night. The curve is right about how much output
+    a gap buys — that is why the proportional map is bypassed — but the
+    excursion limit is a different claim, that a command may not reach further
+    past target than the error being corrected warrants.
+    """
+    from custom_components.roommind.control import mpc_controller as mc
+    from custom_components.roommind.control.gap_response import GapResponseManager
+
+    mc.clear_command_cache()
+    gap_mgr = GapResponseManager()
+    curve = gap_mgr.curve("climate.ac", "cooling")
+    # A curve that is confident and says even a huge gap buys more cooling.
+    for gap in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0):
+        for _ in range(8):
+            curve.observe(gap, 0.2 + gap * 0.6)
+    assert curve.is_confident()
+
+    hass, ctrl = _head_ctrl(head_temp=22.0, step=1.0)
+    ctrl._gap_manager = gap_mgr
+    # Room only 0.3 K over target: a gentle nudge, not a reason to go to 17.
+    await ctrl.async_apply("cooling", 22.0, power_fraction=1.0, current_temp=22.3)
+    sent = _sent_temps(hass)
+    assert sent, "expected a command"
+    assert min(sent) > 17.0, f"learned path still reached the device minimum: {sent}"
