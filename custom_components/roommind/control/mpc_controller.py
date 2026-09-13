@@ -122,9 +122,12 @@ HOLD_RUNG_DWELL_S = 900.0
 HOLD_RUNG_BAND_C = 0.15
 # Past this far on the no-demand side the servo gives up and parks fully.
 HOLD_PARK_BAND_C = 0.5
-# Latched park level per entity: {entity_id: setpoint_c}. Held for as long as
-# the device stays parked, and dropped the moment an active command is sent.
-_park_latch: dict[str, float] = {}
+# Latched park per entity: {entity_id: (setpoint_c, margin_c)}. Held for as
+# long as the device stays parked at the same margin, and dropped the moment an
+# active command is sent. The margin is part of the key because it tracks the
+# room's demand, not the head: a level latched while the room still needed
+# holding must not survive into a room that has stopped needing anything.
+_park_latch: dict[str, tuple[float, float]] = {}
 
 
 def clear_command_cache() -> None:
@@ -155,6 +158,29 @@ def _device_step_c(hass: HomeAssistant, eid: str | None) -> float | None:
     if step <= 0:
         return None
     return ha_delta_to_celsius(hass, step)
+
+
+def park_margin_for(current_temp: float | None, target: float | None, intent: str) -> float:
+    """Park margin (K) this room has earned: the full one only with no demand.
+
+    A head parked AC_PARK_MARGIN_C past its own reading is genuinely off, and
+    a unit that is off holds nothing. That is fine once the room is clear of
+    target — there is nothing to hold — but near target it removes the only
+    thing regulating between MPC cycles. The lean park sits one step past the
+    reading, where the unit keeps trickling, and that trickle IS the holding
+    output that balances a small steady load; replacing it everywhere with the
+    full margin is what turned a smooth equilibrium into a sawtooth between a
+    setpoint 3-4 K above target and an excursion to the device minimum.
+
+    So the margin follows demand, on the same band the holding servo already
+    uses to decide it has given up on an equilibrium (HOLD_PARK_BAND_C).
+    Without a room reading there is no "near" to be in, and the full margin is
+    the safe answer.
+    """
+    if current_temp is None or target is None:
+        return AC_PARK_MARGIN_C
+    error = (current_temp - target) if intent == "cool" else (target - current_temp)
+    return AC_PARK_MARGIN_C if error < -HOLD_PARK_BAND_C else 0.0
 
 
 def no_demand_level(
@@ -253,12 +279,19 @@ def observed_park_level(
     if not latch:
         return base
     held = _park_latch.get(eid)
-    # Keep the latched level whenever it still clears the head reading (the
-    # unit is satisfied there) AND still leaves the room alone. Never raise it
-    # to follow the head: that is the ratchet this latch exists to prevent.
-    if held is not None and (held - head_c) * sign >= 0 and (park_floor is None or (held - park_floor) * sign >= 0):
-        return held
-    _park_latch[eid] = base
+    # Keep the latched level whenever it was taken at THIS margin, still clears
+    # the head reading (the unit is satisfied there), and still leaves the room
+    # alone. Never raise it to follow the head: that is the ratchet this latch
+    # exists to prevent. A change of margin is not the head moving — it is the
+    # room's demand changing — so it re-latches.
+    if (
+        held is not None
+        and held[1] == margin_c
+        and (held[0] - head_c) * sign >= 0
+        and (park_floor is None or (held[0] - park_floor) * sign >= 0)
+    ):
+        return held[0]
+    _park_latch[eid] = (base, margin_c)
     return base
 
 
@@ -710,6 +743,7 @@ async def async_idle_device(
                     intent,
                     step=_device_step_c(hass, entity_id),
                 ),
+                margin_c=park_margin_for(current_temp, target, intent),
             )
             if is_ac
             else None
@@ -1968,11 +2002,21 @@ class MPCController:
                         # the output until it has been tried.
                         ac_cool_target = self._holding_rung(eid, effective_target, current_temp, "cool")
                     elif learned is not None:
-                        # Learned response: the gap is already sized from the
-                        # device's measured behaviour, so the heuristic clamps
-                        # (proportional map, error limit) do not apply. Only the
-                        # device's own range still binds.
-                        ac_cool_target = max(ac_cool_boost, learned)
+                        # Learned response: the gap is sized from the device's
+                        # measured behaviour, so the PROPORTIONAL MAP does not
+                        # apply — that is a guess about how much output a gap
+                        # buys, and the curve knows better. The excursion limit
+                        # is a different thing and does still apply: it bounds
+                        # how far past target a command may reach, keeping the
+                        # excursion proportional to the error being corrected.
+                        # Exempting it let a confident curve command the device
+                        # minimum for a room a few tenths over target — the 17s
+                        # on a 20-22 target all night. The bound is the same
+                        # room-frame floor the heuristic uses, carried into the
+                        # head's frame, which is where `learned` lives.
+                        _limit = self.ac_setpoint_limit(current_temp, effective_target, mode, eid)
+                        _floor = effective_target - _limit + self.head_frame_shift(eid, current_temp)
+                        ac_cool_target = max(ac_cool_boost, _floor, learned)
                     else:
                         # Anchor at the release position: when the room is
                         # already at or below the target (cold evening,
@@ -2226,6 +2270,7 @@ class MPCController:
                     head_shift=self.head_frame_shift(eid, current_temp, release_intent=intent, learned_only=True),
                     step=self._setpoint_step(eid),
                 ),
+                margin_c=park_margin_for(current_temp, release_bound, intent),
             )
             if observed is not None:
                 return self._clamp_to_device_range(eid, observed)
