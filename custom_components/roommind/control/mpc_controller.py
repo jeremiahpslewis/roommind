@@ -128,6 +128,11 @@ HOLD_PARK_BAND_C = 0.5
 # room's demand, not the head: a level latched while the room still needed
 # holding must not survive into a room that has stopped needing anything.
 _park_latch: dict[str, tuple[float, float]] = {}
+# Hysteresis state for the lean/full park regime: {entity_id: fully parked}.
+_no_demand_regime: dict[str, bool] = {}
+# The room must be back at target before the lean (trickling) park returns.
+# Paired with HOLD_PARK_BAND_C this gives the regime a 0.5 K dead band.
+PARK_REGIME_RELEASE_C = 0.0
 
 
 def clear_command_cache() -> None:
@@ -136,6 +141,7 @@ def clear_command_cache() -> None:
     _setpoint_override_warned.clear()
     _hold_rungs.clear()
     _park_latch.clear()
+    _no_demand_regime.clear()
 
 
 def reset_park_latch(eid: str) -> None:
@@ -160,7 +166,51 @@ def _device_step_c(hass: HomeAssistant, eid: str | None) -> float | None:
     return ha_delta_to_celsius(hass, step)
 
 
-def park_margin_for(current_temp: float | None, target: float | None, intent: str) -> float:
+def in_no_demand_regime(
+    eid: str,
+    current_temp: float | None,
+    target: float | None,
+    intent: str,
+) -> bool:
+    """Is this room clear enough of target that the unit should be fully off?
+
+    Two regimes, and the difference between them is a real setpoint gap: near
+    target the unit is parked LEAN (one step past the head reading) so it
+    keeps trickling, and that trickle is the holding output balancing a small
+    load; clear of target it is parked by the full AC_PARK_MARGIN_C, genuinely
+    off, because there is nothing left to hold.
+
+    Deciding that on a bare threshold makes the boundary a place the room can
+    sit. Field data: a room hovering at 21.92-22.08 against a 22.5 target
+    straddled the -0.5 K entry line and flipped the park between 24 and 26 on
+    0.06 K of sensor wiggle — a 2 K actuator swing driven by noise. So the
+    decision is a Schmitt trigger: enter below -HOLD_PARK_BAND_C, and leave
+    only once the room is genuinely back at target. Crossing the gap now takes
+    a real excursion, and the transition that remains is a true regime change
+    rather than chatter.
+
+    Losing the room reading is not a reason to switch either: with no new
+    information the current regime stands (a room that never had a reading
+    gets the full margin, which is the safe answer).
+    """
+    if current_temp is None or target is None:
+        return _no_demand_regime.setdefault(eid, True)
+    held = _no_demand_regime.get(eid, False)
+    error = (current_temp - target) if intent == "cool" else (target - current_temp)
+    if error < -HOLD_PARK_BAND_C:
+        held = True
+    elif error >= PARK_REGIME_RELEASE_C:
+        held = False
+    _no_demand_regime[eid] = held
+    return held
+
+
+def park_margin_for(
+    eid: str,
+    current_temp: float | None,
+    target: float | None,
+    intent: str,
+) -> float:
     """Park margin (K) this room has earned: the full one only with no demand.
 
     A head parked AC_PARK_MARGIN_C past its own reading is genuinely off, and
@@ -172,15 +222,9 @@ def park_margin_for(current_temp: float | None, target: float | None, intent: st
     full margin is what turned a smooth equilibrium into a sawtooth between a
     setpoint 3-4 K above target and an excursion to the device minimum.
 
-    So the margin follows demand, on the same band the holding servo already
-    uses to decide it has given up on an equilibrium (HOLD_PARK_BAND_C).
-    Without a room reading there is no "near" to be in, and the full margin is
-    the safe answer.
+    The regime is hysteretic — see :func:`in_no_demand_regime`.
     """
-    if current_temp is None or target is None:
-        return AC_PARK_MARGIN_C
-    error = (current_temp - target) if intent == "cool" else (target - current_temp)
-    return AC_PARK_MARGIN_C if error < -HOLD_PARK_BAND_C else 0.0
+    return AC_PARK_MARGIN_C if in_no_demand_regime(eid, current_temp, target, intent) else 0.0
 
 
 def no_demand_level(
@@ -743,7 +787,7 @@ async def async_idle_device(
                     intent,
                     step=_device_step_c(hass, entity_id),
                 ),
-                margin_c=park_margin_for(current_temp, target, intent),
+                margin_c=park_margin_for(entity_id, current_temp, target, intent),
             )
             if is_ac
             else None
@@ -2307,7 +2351,7 @@ class MPCController:
                     head_shift=self.head_frame_shift(eid, current_temp, release_intent=intent, learned_only=True),
                     step=self._setpoint_step(eid),
                 ),
-                margin_c=park_margin_for(current_temp, release_bound, intent),
+                margin_c=park_margin_for(eid, current_temp, release_bound, intent),
             )
             if observed is not None:
                 return self._clamp_to_device_range(eid, observed)
@@ -2430,7 +2474,10 @@ class MPCController:
         parity = effective_target + self.head_frame_shift(eid, current_temp)
         # error > 0 = the room needs more output; error < 0 = it got too much
         error = (current_temp - effective_target) * sign
-        parked = error < -HOLD_PARK_BAND_C
+        # Same regime the park margin uses, and hysteretic for the same
+        # reason: re-thresholding here would let a room sitting on the
+        # boundary flip the servo and the margin against each other.
+        parked = in_no_demand_regime(eid, current_temp, effective_target, intent)
         # Two different levels, and conflating them starves the servo. A full
         # park is AC_PARK_MARGIN_C past the reading — wide, because the unit
         # must not regulate the room between cycles. The servo's GENTLE BOUND

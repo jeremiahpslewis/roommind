@@ -1470,24 +1470,78 @@ async def test_release_and_reengage_stay_within_adjacent_levels():
 
 
 def test_park_margin_follows_demand_not_the_clock():
+    from custom_components.roommind.control import mpc_controller as mc
     from custom_components.roommind.control.mpc_controller import (
         AC_PARK_MARGIN_C,
         HOLD_PARK_BAND_C,
         park_margin_for,
     )
 
+    def margin(current, target, intent="cool"):
+        # Fresh state per call: this asserts the entry decision, not the
+        # hysteresis (which test_park_margin_does_not_chatter covers).
+        mc.clear_command_cache()
+        return park_margin_for("climate.ac", current, target, intent)
+
     # Cooling: below target by more than the band = nothing left to hold.
-    assert park_margin_for(20.0, 22.0, "cool") == AC_PARK_MARGIN_C
-    assert park_margin_for(22.0 - HOLD_PARK_BAND_C - 0.01, 22.0, "cool") == AC_PARK_MARGIN_C
+    assert margin(20.0, 22.0) == AC_PARK_MARGIN_C
+    assert margin(22.0 - HOLD_PARK_BAND_C - 0.01, 22.0) == AC_PARK_MARGIN_C
     # At or near target, and above it, the trickle is wanted.
-    assert park_margin_for(22.0, 22.0, "cool") == 0.0
-    assert park_margin_for(21.8, 22.0, "cool") == 0.0
-    assert park_margin_for(23.0, 22.0, "cool") == 0.0
+    assert margin(22.0, 22.0) == 0.0
+    assert margin(21.8, 22.0) == 0.0
+    assert margin(23.0, 22.0) == 0.0
     # Heating mirrors it.
-    assert park_margin_for(23.0, 21.0, "heat") == AC_PARK_MARGIN_C
-    assert park_margin_for(21.0, 21.0, "heat") == 0.0
-    # No room reading: no "near" to be in, so the safe answer is the full margin.
-    assert park_margin_for(None, 22.0, "cool") == AC_PARK_MARGIN_C
+    assert margin(23.0, 21.0, "heat") == AC_PARK_MARGIN_C
+    assert margin(21.0, 21.0, "heat") == 0.0
+    # No reading and no regime yet: the safe answer is the full margin.
+    assert margin(None, 22.0) == AC_PARK_MARGIN_C
+    mc.clear_command_cache()
+
+
+def test_park_margin_does_not_chatter_on_the_band_edge():
+    """The lean/full regime is a Schmitt trigger, not a bare threshold.
+
+    Field case (bedroom, 14 Sep): the room hovered at 21.92-22.08 against a
+    22.5 target, straddling the -0.5 K entry line, and the park flipped
+    between 24 and 26 twice in an hour on 0.06 K of sensor wiggle.
+    """
+    from custom_components.roommind.control import mpc_controller as mc
+    from custom_components.roommind.control.mpc_controller import (
+        AC_PARK_MARGIN_C,
+        park_margin_for,
+    )
+
+    mc.clear_command_cache()
+    eid = "climate.ac"
+    # Near target: lean park, the unit trickles and holds the room.
+    assert park_margin_for(eid, 22.20, 22.5, "cool") == 0.0
+    # Drifts clear of target: enter the full margin.
+    assert park_margin_for(eid, 21.92, 22.5, "cool") == AC_PARK_MARGIN_C
+    # The exact wiggle that used to flip it back — now inside the dead band.
+    assert park_margin_for(eid, 22.00, 22.5, "cool") == AC_PARK_MARGIN_C
+    assert park_margin_for(eid, 22.30, 22.5, "cool") == AC_PARK_MARGIN_C
+    # A lost reading is no information, so it must not switch either.
+    assert park_margin_for(eid, None, 22.5, "cool") == AC_PARK_MARGIN_C
+    # Genuinely back at target: the trickle is wanted again.
+    assert park_margin_for(eid, 22.50, 22.5, "cool") == 0.0
+    assert park_margin_for(eid, 22.30, 22.5, "cool") == 0.0
+    mc.clear_command_cache()
+
+
+def test_park_regime_hysteresis_mirrors_for_heating():
+    from custom_components.roommind.control import mpc_controller as mc
+    from custom_components.roommind.control.mpc_controller import (
+        AC_PARK_MARGIN_C,
+        park_margin_for,
+    )
+
+    mc.clear_command_cache()
+    eid = "climate.trv"
+    assert park_margin_for(eid, 20.8, 21.0, "heat") == 0.0
+    assert park_margin_for(eid, 21.6, 21.0, "heat") == AC_PARK_MARGIN_C  # clear above target
+    assert park_margin_for(eid, 21.2, 21.0, "heat") == AC_PARK_MARGIN_C  # dead band holds
+    assert park_margin_for(eid, 21.0, 21.0, "heat") == 0.0  # back at target
+    mc.clear_command_cache()
 
 
 def test_a_lean_latched_park_still_deepens_when_the_room_stops_needing_it():
