@@ -11,7 +11,7 @@ VERSION = "1.7.7"
 # Fork build stamp, bumped on every ship. Surfaced in diagnostics and the
 # startup log so the code actually running is never in doubt (a stale tarball
 # or an un-reloaded module looks identical to the new one otherwise).
-BUILD_ID = "2026-09-14.1-hysteretic-park-regime"
+BUILD_ID = "2026-09-16.1-on-v1.7.7"
 
 # Platforms
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BINARY_SENSOR, Platform.CLIMATE]

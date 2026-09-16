@@ -1116,6 +1116,8 @@ def test_simulate_plan_replays_directed_actions():
     heated = optimizer.simulate_plan(heat_plan, 18.0, [10.0] * 4, 5)
     idled = optimizer.simulate_plan(idle_plan, 18.0, [10.0] * 4, 5)
     assert heated[-1] > idled[-1]
+
+
 # --- absent targets must not invert the dead band -----------------------------
 
 
