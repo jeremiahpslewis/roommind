@@ -210,7 +210,9 @@ async def test_heat_source_plan_active_ac_inactive_trv():
         active_sources="secondary",
         reason="test",
     )
-    # current=19, target=21, ac_boost=30 -> ac = 19 + 0.8*(30-19) = 27.8
+    # current=19, target=21, ac_boost=30 -> ac = 19 + 0.8*(30-19) = 27.8, capped
+    # by the error-scaled AC setpoint limit at the default slider (gain 1.2):
+    # 21 + 1.2*2.0 = 23.4
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
@@ -239,7 +241,7 @@ async def test_heat_source_plan_active_ac_inactive_trv():
 
     ac_temp = [c for c in calls if c[0][1] == "set_temperature" and c[0][2]["entity_id"] == "climate.ac1"]
     assert len(ac_temp) == 1
-    assert ac_temp[0][0][2]["temperature"] == 27.8
+    assert ac_temp[0][0][2]["temperature"] == 23.4
 
 
 @pytest.mark.asyncio
@@ -431,7 +433,8 @@ async def test_heat_source_plan_both_active_different_fractions():
         reason="test",
     )
     # current=20, trv_boost=30: trv = 20 + 1.0*(30-20) = 30.0
-    # current=20, ac_boost=30:  ac  = 20 + 0.5*(30-20) = 25.0
+    # current=20, ac_boost=30:  ac  = 20 + 0.5*(30-20) = 25.0, capped by the
+    #                           error-scaled AC limit: 21 + 1.2*1.0 = 22.2
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
@@ -448,7 +451,7 @@ async def test_heat_source_plan_both_active_different_fractions():
 
     ac_temp = [c for c in calls if c[0][1] == "set_temperature" and c[0][2]["entity_id"] == "climate.ac1"]
     assert len(ac_temp) == 1
-    assert ac_temp[0][0][2]["temperature"] == 25.0
+    assert ac_temp[0][0][2]["temperature"] == 22.2
 
 
 @pytest.mark.asyncio
@@ -591,7 +594,8 @@ async def test_heat_source_plan_ac_heat_cool_mode():
         active_sources="secondary",
         reason="test",
     )
-    # current=20, ac_boost=30 -> 20 + 0.5*(30-20) = 25.0
+    # current=20, ac_boost=30 -> 20 + 0.5*(30-20) = 25.0, capped by the
+    # error-scaled AC limit: 21 + 1.2*1.0 = 22.2
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
@@ -607,7 +611,7 @@ async def test_heat_source_plan_ac_heat_cool_mode():
 
     ac_temp = [c for c in calls if c[0][1] == "set_temperature" and c[0][2]["entity_id"] == "climate.ac1"]
     assert len(ac_temp) == 1
-    assert ac_temp[0][0][2]["temperature"] == 25.0
+    assert ac_temp[0][0][2]["temperature"] == 22.2
 
 
 @pytest.mark.asyncio
@@ -643,7 +647,8 @@ async def test_heat_source_plan_ac_auto_mode():
         active_sources="secondary",
         reason="test",
     )
-    # current=20, ac_boost=30 -> 20 + 0.5*(30-20) = 25.0
+    # current=20, ac_boost=30 -> 20 + 0.5*(30-20) = 25.0, capped by the
+    # error-scaled AC limit: 21 + 1.2*1.0 = 22.2
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
@@ -659,7 +664,7 @@ async def test_heat_source_plan_ac_auto_mode():
 
     ac_temp = [c for c in calls if c[0][1] == "set_temperature" and c[0][2]["entity_id"] == "climate.ac1"]
     assert len(ac_temp) == 1
-    assert ac_temp[0][0][2]["temperature"] == 25.0
+    assert ac_temp[0][0][2]["temperature"] == 22.2
     assert ac_temp[0][0][2]["hvac_mode"] == "auto"
 
 
@@ -1034,13 +1039,14 @@ async def test_heat_source_plan_ac_heating_boost_cap_at_efficiency():
         active_sources="secondary",
         reason="test",
     )
-    # pf=1.0, current=18, ac_boost=30 -> raw 18 + 1.0*(30-18) = 30
-    # cap: min(30, target(21) + 3, 30) = 24.0
+    # pf=1.0, current=15, ac_boost=30 -> raw 15 + 1.0*(30-15) = 30. Room 6°C
+    # under target so the error-scaled limit (gain 0.5 at comfort_weight 0 ->
+    # 3.0) is slack and the slider cap binds: min(30, target(21) + 3, 30) = 24.0
     await ctrl.async_apply(
         mode=MODE_HEATING,
         targets=TargetTemps(heat=21.0, cool=None),
         power_fraction=1.0,
-        current_temp=18.0,
+        current_temp=15.0,
         heat_source_plan=plan,
     )
 

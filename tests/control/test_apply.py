@@ -877,7 +877,9 @@ async def test_apply_heating_mixed_trv_and_ac():
         settings={},
         has_external_sensor=True,
     )
-    await ctrl.async_apply("heating", 21.0, power_fraction=1.0, current_temp=18.0)
+    # Room 8°C under target so the error-scaled AC setpoint limit is slack and
+    # both devices reach their boost targets.
+    await ctrl.async_apply("heating", 21.0, power_fraction=1.0, current_temp=13.0)
 
     calls = hass.services.async_call.call_args_list
     # TRV should get boost target (30°C)
@@ -887,7 +889,7 @@ async def test_apply_heating_mixed_trv_and_ac():
     assert trv_temp_calls
     assert trv_temp_calls[0][0][2]["temperature"] == HEATING_BOOST_TARGET
 
-    # AC should get proportional boost: 18 + 1.0*(30-18) = 30.0
+    # AC should get proportional boost: 13 + 1.0*(30-13) = 30.0
     ac_temp_calls = [c for c in calls if c[0][1] == "set_temperature" and c[0][2].get("entity_id") == "climate.hp"]
     assert ac_temp_calls
     assert ac_temp_calls[0][0][2]["temperature"] == 30.0
