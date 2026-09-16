@@ -175,7 +175,8 @@ async def test_off_is_sent_once_for_a_device_without_state_however_long_it_idles
 async def test_valid_state_devices_ignore_the_ttl():
     """The TTL only concerns the cache path; a device with a real state is compared against that state."""
     hass = build_hass()
-    hass.states.get = MagicMock(return_value=_state("heat", 29.5))
+    # 21 + the error-scaled AC limit for a 3 K deficit
+    hass.states.get = MagicMock(return_value=_state("heat", 24.6))
     ctrl = _ctrl(hass)
     clock = {"t": 1000.0}
 

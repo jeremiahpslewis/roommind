@@ -118,11 +118,12 @@ async def test_ac_boost_stays_below_max_temp():
     hass.states.get = MagicMock(return_value=_state(30.0, min_temp=16.0, modes=("heat", "cool", "off")))
     ctrl = _controller(hass, make_room(thermostats=[], acs=["climate.ac"]))
 
+    # Room 8 K under target so the error-scaled AC setpoint limit is slack
     await ctrl.async_apply(
         MODE_HEATING,
         TargetTemps(heat=21.0, cool=None),
         power_fraction=1.0,
-        current_temp=15.0,
+        current_temp=13.0,
         ac_heating_boost_target=30.0,
     )
 
@@ -150,11 +151,12 @@ async def test_orchestrated_secondary_thermostat_boost_stays_below_max_temp():
         reason="large gap",
     )
 
+    # Room 8 K under target so the error-scaled AC setpoint limit is slack
     await ctrl.async_apply(
         MODE_HEATING,
         TargetTemps(heat=21.0, cool=None),
         power_fraction=1.0,
-        current_temp=15.0,
+        current_temp=13.0,
         heating_boost_target=37.0,
         ac_heating_boost_target=30.0,
         heat_source_plan=plan,

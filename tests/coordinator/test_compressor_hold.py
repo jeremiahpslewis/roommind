@@ -106,14 +106,19 @@ class TestHoldKeepsSetpoint:
 
     @pytest.mark.asyncio
     async def test_setpoint_does_not_pendulum_between_heating_and_hold(self, hass, mock_config_entry):
-        """Heating -> idle -> heating around the target must not alternate setpoints (#416)."""
+        """Heating -> idle -> heating around the target must not alternate setpoints (#416).
+
+        The AC heating setpoint is error-scaled, so a smaller deficit gets a smaller
+        setpoint once; what must not happen is the hold sending anything, or the same
+        room state sending again.
+        """
         coordinator = await _setup(hass, mock_config_entry)
         ac = {"state": _ac_state("off", 16.0)}
-        sent: list[float] = []
+        sent: list[list[float]] = []
 
         def _track():
+            sent.append([c[0][2]["temperature"] for c in _calls(hass, "set_temperature")])
             for c in _calls(hass, "set_temperature"):
-                sent.append(c[0][2]["temperature"])
                 ac["state"] = _ac_state("heat", c[0][2]["temperature"])
             hass.services.async_call.reset_mock()
 
@@ -126,7 +131,7 @@ class TestHoldKeepsSetpoint:
             _track()
 
         assert modes == [MODE_HEATING, MODE_IDLE, MODE_HEATING, MODE_IDLE, MODE_HEATING]
-        assert len(sent) == 1, f"setpoint pendulums: {sent}"
+        assert sent[1] == sent[3] == sent[4] == [], f"setpoint pendulums: {sent}"
 
     @pytest.mark.asyncio
     async def test_overshooting_holds_throttle_once_each_and_boost_only_on_a_new_start(self, hass, mock_config_entry):
@@ -151,8 +156,11 @@ class TestHoldKeepsSetpoint:
         boost = per_tick[0][0]
         assert per_tick[1] == [22.5]  # throttled to the unit's reading (no own sensor: the room)
         assert per_tick[2] == []  # same hold: nothing more
-        assert per_tick[3] and per_tick[3][-1] > 22.5  # new heating start: boost again
-        assert per_tick[4] == [22.5]
+        # New heating start: an active setpoint again. The error-scaled AC limit sizes it from
+        # the 0.5 K deficit, so it already sits below the next hold's reading and that hold has
+        # nothing left to throttle.
+        assert per_tick[3] and 21.0 < per_tick[3][-1] < 22.5
+        assert per_tick[4] == []
         assert per_tick[5] == []
         assert boost > 22.5
 

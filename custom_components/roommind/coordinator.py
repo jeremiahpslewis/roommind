@@ -49,6 +49,12 @@ from .const import (
     is_override_suppressed,
     make_roommind_context,
 )
+from .control.gap_response import (
+    MAX_OBSERVATION_DT,
+    MIN_OBSERVATION_DT,
+    RUNNING_STATES,
+    GapResponseManager,
+)
 from .control.mpc_controller import (
     DEFAULT_OUTDOOR_TEMP_FALLBACK,
     MPCController,
@@ -172,6 +178,10 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         self._window_manager = WindowManager()
         self._previous_modes: dict[str, str] = {}
         self._model_manager: RoomModelManager = RoomModelManager()
+        self._gap_manager: GapResponseManager = GapResponseManager()
+        # Previous (room temp, monotonic timestamp, mode) per area, for deriving
+        # the incremental cooling rate a commanded head gap actually produced.
+        self._gap_prev: dict[str, tuple[float, float, str]] = {}
         self._model_loaded = False
         self._thermal_save_count: int = 0
         self._history_store: HistoryStore | None = None
@@ -280,6 +290,8 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 self._model_manager = RoomModelManager.from_dict(thermal_data)
                 self._ekf_training._model_manager = self._model_manager
                 self._cover_orchestrator._model_manager = self._model_manager
+                if thermal_data.get("gap_response"):
+                    self._gap_manager = GapResponseManager.from_dict(thermal_data["gap_response"])
             self._valve_manager.load_actuation_data(settings.get("valve_last_actuation", {}))
             self._coil_dry_manager.load_state(settings.get("coil_dry_state", {}))
             self._head_offsets.load_state(settings.get("ac_head_offsets", {}))
@@ -403,7 +415,9 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         self._thermal_save_count += 1
         if self._thermal_save_count >= THERMAL_SAVE_CYCLES:
             self._thermal_save_count = 0
-            await store.async_save_thermal_data(self._model_manager.to_dict())
+            thermal_payload = self._model_manager.to_dict()
+            thermal_payload["gap_response"] = self._gap_manager.to_dict()
+            await store.async_save_thermal_data(thermal_payload)
 
         # Rotate history periodically
         self._history_rotate_count += 1
@@ -812,6 +826,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             q_rebound=q_rebound,
             previous_heat_sources=self._heat_source_states.get(area_id, "none"),
             head_offsets=self._head_offsets,
+            gap_manager=self._gap_manager,
         )
         mode, power_fraction = await controller.async_evaluate(current_temp, targets)
 
@@ -1151,6 +1166,22 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             except Exception:  # noqa: BLE001
                 mpc_active = False
 
+        # Learn what the commanded head gap actually bought. Observation only —
+        # it never affects the command issued this cycle.
+        try:
+            self._observe_gap_response(
+                area_id=area_id,
+                room=room,
+                current_temp=current_temp,
+                mode=mode,
+                has_external_sensor=has_external_sensor,
+                q_solar=self._current_q_solar * (shading_factor if shading_factor is not None else 1.0),
+                q_residual=q_residual,
+                q_occupancy=q_occupancy,
+            )
+        except Exception:  # noqa: BLE001 — learning must never break control
+            _LOGGER.debug("gap-response observation failed for '%s'", area_id, exc_info=True)
+
         display_mode, display_pf = await self._observe_and_train(
             area_id=area_id,
             room=room,
@@ -1203,6 +1234,9 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             cover_eids=cover_eids,
             cover_result=cover_result,
             mpc_active=mpc_active,
+            ac_setpoint_limit=(
+                controller.ac_setpoint_limit(current_temp, target_temp, mode) if target_temp is not None else None
+            ),
             compressor_protection_reason=compressor_protection_reason,
             coil_dry=coil_dry,
         )
@@ -1449,6 +1483,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         cover_eids: list[str],
         cover_result: CoverResult,
         mpc_active: bool,
+        ac_setpoint_limit: float | None = None,
         compressor_protection_reason: str | None = None,
         coil_dry: CoilDryRoomResult | None = None,
     ) -> dict:
@@ -1510,6 +1545,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 direct_offsets=_direct_offsets,
                 direct_target=direct_target,
                 head_offsets=_ac_heat_shifts,
+                ac_setpoint_limit=ac_setpoint_limit,
             )
             if heat_source_plan is not None
             else self._compute_device_setpoint(
@@ -1526,6 +1562,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 direct_offset=_display_offset,
                 direct_target=direct_target,
                 head_offset=_head_shift,
+                ac_setpoint_limit=ac_setpoint_limit,
             ),
             "window_open": window_open,
             **build_override_live(
@@ -1570,6 +1607,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         direct_offsets: dict[str, float] | None = None,
         direct_target: float | None = None,
         head_offsets: dict[str, float] | None = None,
+        ac_setpoint_limit: float | None = None,
     ) -> float | None:
         """Compute device setpoint from the orchestrated heat source plan.
 
@@ -1594,6 +1632,10 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         sp = round(current_temp + cmd.power_fraction * (boost - current_temp), 1)
         sp = max(target_temp, sp)
         sp = min(boost, sp)
+        # ACs are additionally bounded by the error-scaled setpoint limit, so
+        # the displayed value has to match what async_apply actually sends.
+        if cmd.device_type != "thermostat" and ac_setpoint_limit is not None:
+            sp = min(sp, target_temp + ac_setpoint_limit)
         if cmd.device_type == "ac" and head_offsets:
             sp = min(boost, round(sp + head_offsets.get(cmd.entity_id, 0.0), 1))
         return sp
@@ -1613,11 +1655,14 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         direct_offset: float = 0.0,
         direct_target: float | None = None,
         head_offset: float = 0.0,
+        ac_setpoint_limit: float | None = None,
     ) -> float | None:
         """Compute the device setpoint for UI display (Full Control only).
 
-        ``head_offset`` is the learned AC sensor offset; it moves an AC-only room's value
-        into the device's frame, as async_apply() sends it.
+        Mirrors the clamps in MPCController.async_apply — including the
+        error-scaled AC limit — so the "Device set to" value the user reads is
+        the value the device is actually given. head_offset is the learned AC
+        sensor offset; it moves an AC-only room's value into the device's frame.
         """
         if not has_external_sensor or current_temp is None or target_temp is None:
             return None
@@ -1629,17 +1674,25 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             boost = device_max_temp if device_max_temp is not None else default_boost
             if not has_thermostats and not has_acs:
                 return None
-            sp = round(current_temp + power_fraction * (boost - current_temp), 1)
+            # Release-position anchor — must mirror mpc_controller.async_apply
+            anchor = min(current_temp, target_temp)
+            sp = round(anchor + power_fraction * (boost - anchor), 1)
             sp = max(target_temp, sp)
             sp = min(boost, sp)
+            if not has_thermostats and ac_setpoint_limit is not None:
+                sp = min(sp, target_temp + ac_setpoint_limit)
             if not has_thermostats:
                 sp = min(boost, round(sp + head_offset, 1))
             return sp
 
         if mode == MODE_COOLING and has_acs:
             boost = device_min_temp if device_min_temp is not None else AC_COOLING_BOOST_TARGET
-            sp = round(current_temp - power_fraction * (current_temp - boost), 1)
+            # Release-position anchor — must mirror mpc_controller.async_apply
+            anchor = max(current_temp, target_temp)
+            sp = round(anchor - power_fraction * (anchor - boost), 1)
             sp = max(boost, sp)
+            if ac_setpoint_limit is not None:
+                sp = max(sp, target_temp - ac_setpoint_limit)
             sp = min(target_temp, sp)
             return max(boost, round(sp + head_offset, 1))
 
@@ -1662,6 +1715,82 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             # on, and some integrations stop updating current_temperature while the unit is off
             action = state.attributes.get("hvac_action") if state.state in _HEAD_OFFSET_HVAC_MODES else None
             self._head_offsets.observe(eid, action, device_temp, room_temp, now)
+
+    def _observe_gap_response(
+        self,
+        *,
+        area_id: str,
+        room: dict,
+        current_temp: float | None,
+        mode: str,
+        has_external_sensor: bool,
+        q_solar: float,
+        q_residual: float,
+        q_occupancy: float,
+    ) -> None:
+        """Record what the head gap RoomMind commanded actually bought.
+
+        Runs every cycle in Full Control. The AC reports both its own sensor
+        (``current_temperature``) and the setpoint it is regulating against
+        (``temperature``), so the gap driving its compressor is directly
+        observable — no need to remember what was sent. The room's own change
+        over the interval, minus the passive drift the RC model predicts, is the
+        work the unit did.
+
+        Observation only: learning here never changes this cycle's command.
+        """
+        if not has_external_sensor or current_temp is None:
+            return
+
+        now = time.monotonic()
+        prev = self._gap_prev.get(area_id)
+        self._gap_prev[area_id] = (current_temp, now, mode)
+        if prev is None:
+            return
+        prev_temp, prev_ts, prev_mode = prev
+        dt_minutes = (now - prev_ts) / 60.0
+        if not (MIN_OBSERVATION_DT <= dt_minutes <= MAX_OBSERVATION_DT):
+            return
+        # A mode change mid-interval mixes two dynamics into one residual.
+        if prev_mode != mode or mode not in (MODE_HEATING, MODE_COOLING):
+            return
+
+        model = self._model_manager.get_model(area_id)
+        t_out = self.outdoor_temp_effective
+        if t_out is None:
+            return
+        passive = model.predict(
+            prev_temp,
+            t_out,
+            Q_active=0.0,
+            dt_minutes=dt_minutes,
+            q_solar=q_solar,
+            q_residual=q_residual,
+            q_occupancy=q_occupancy,
+        )
+        for eid in get_ac_eids(room.get("devices", [])):
+            state = self.hass.states.get(eid)
+            if state is None or state.state not in RUNNING_STATES.get(mode, frozenset()):
+                continue
+            head = state.attributes.get("current_temperature")
+            setpoint = state.attributes.get("temperature")
+            if head is None or setpoint is None:
+                continue
+            try:
+                head_c = ha_temp_to_celsius(self.hass, float(head), entity_id=eid)
+                setpoint_c = ha_temp_to_celsius(self.hass, float(setpoint), entity_id=eid)
+            except (TypeError, ValueError):
+                continue
+            self._gap_manager.observe_offset(eid, head_c, current_temp, is_running=True)
+            gap = head_c - setpoint_c if mode == MODE_COOLING else setpoint_c - head_c
+            self._gap_manager.observe_response(
+                eid,
+                mode,
+                gap=gap,
+                observed_temp_change=current_temp - prev_temp,
+                predicted_passive_change=passive - prev_temp,
+                dt_minutes=dt_minutes,
+            )
 
     def _read_device_temp(self, room: dict) -> float | None:
         """Read current_temperature from the first thermostat or AC entity."""

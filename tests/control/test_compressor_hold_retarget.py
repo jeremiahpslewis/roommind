@@ -460,7 +460,8 @@ async def test_orchestrated_parked_ac_reporting_off_is_not_switched_on_again():
 @pytest.mark.asyncio
 async def test_target_change_during_active_cycles_still_reaches_the_hold():
     """Eco arrives while the unit still heats on its boost: no command goes out, so the hold must still send it."""
-    hass, ctrl = _setup(_state("heat"))
+    # 17.6 is the eco command in a 19 °C room (target + the error-scaled AC floor)
+    hass, ctrl = _setup(_state("heat", temperature=17.6))
     eco = TargetTemps(heat=17.0, cool=27.0)
     await _run_active(hass, ctrl, MODE_HEATING, COMFORT, current_temp=19.0)
     hass.services.async_call.reset_mock()
@@ -478,7 +479,8 @@ async def test_target_change_during_active_cycles_still_reaches_the_hold():
 
 @pytest.mark.asyncio
 async def test_cool_side_change_during_active_cycles_still_reaches_the_hold():
-    hass, ctrl = _setup(_state("cool", temperature=16.0))
+    # 28.4 is the eco command in a 28 °C room (target - the error-scaled AC floor)
+    hass, ctrl = _setup(_state("cool", temperature=28.4))
     eco = TargetTemps(heat=17.0, cool=29.0)
     await _run_active(hass, ctrl, "cooling", COMFORT, current_temp=28.0)
     hass.services.async_call.reset_mock()
@@ -522,7 +524,8 @@ async def test_failed_hold_send_is_retried_once_per_cycle():
 @pytest.mark.asyncio
 async def test_reference_starts_from_a_running_unit_after_a_reload():
     """The unit already shows its boost when the module state is fresh: confirmed ticks must still seed the reference."""
-    hass, ctrl = _setup(_state("heat"))
+    # 23.4 is the comfort command for a 2 K deficit under the error-scaled AC limit
+    hass, ctrl = _setup(_state("heat", temperature=23.4))
     eco = TargetTemps(heat=17.0, cool=27.0)
     await ctrl.async_apply(MODE_HEATING, COMFORT, power_fraction=1.0, current_temp=19.0)
     assert _sent(hass) == []
@@ -534,7 +537,8 @@ async def test_reference_starts_from_a_running_unit_after_a_reload():
 
 @pytest.mark.asyncio
 async def test_seeding_never_replaces_a_remembered_reference():
-    hass, ctrl = _setup(_state("heat"))
+    # 17.6 is the eco command in a 19 °C room (target + the error-scaled AC floor)
+    hass, ctrl = _setup(_state("heat", temperature=17.6))
     eco = TargetTemps(heat=17.0, cool=27.0)
     await _run_active(hass, ctrl, MODE_HEATING, COMFORT, current_temp=19.0)
     await ctrl.async_apply(MODE_HEATING, eco, power_fraction=1.0, current_temp=19.0)  # confirmed, not sent
