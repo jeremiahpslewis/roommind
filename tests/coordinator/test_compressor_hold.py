@@ -106,14 +106,19 @@ class TestHoldKeepsSetpoint:
 
     @pytest.mark.asyncio
     async def test_setpoint_does_not_pendulum_between_heating_and_hold(self, hass, mock_config_entry):
-        """Heating -> idle -> heating around the target must not alternate setpoints (#416)."""
+        """Heating -> idle -> heating around the target must not alternate setpoints (#416).
+
+        The AC heating setpoint is error-scaled, so a smaller deficit gets a smaller
+        setpoint once; what must not happen is the hold sending anything, or the same
+        room state sending again.
+        """
         coordinator = await _setup(hass, mock_config_entry)
         ac = {"state": _ac_state("off", 16.0)}
-        sent: list[float] = []
+        sent: list[list[float]] = []
 
         def _track():
+            sent.append([c[0][2]["temperature"] for c in _calls(hass, "set_temperature")])
             for c in _calls(hass, "set_temperature"):
-                sent.append(c[0][2]["temperature"])
                 ac["state"] = _ac_state("heat", c[0][2]["temperature"])
             hass.services.async_call.reset_mock()
 
@@ -126,7 +131,7 @@ class TestHoldKeepsSetpoint:
             _track()
 
         assert modes == [MODE_HEATING, MODE_IDLE, MODE_HEATING, MODE_IDLE, MODE_HEATING]
-        assert len(sent) == 1, f"setpoint pendulums: {sent}"
+        assert sent[1] == sent[3] == sent[4] == [], f"setpoint pendulums: {sent}"
 
 
 class TestHoldFollowsDeliberateTargetChange:
@@ -222,14 +227,19 @@ class TestHoldFollowsDeliberateTargetChange:
             hass.states.get = MagicMock(side_effect=lambda eid: ac["state"] if eid == AC else base(eid))
 
         hass.services.async_call.reset_mock()
-        data = await coordinator._async_update_data()  # mode min-run: still heating, the boost is unchanged
+        data = await coordinator._async_update_data()  # mode min-run: still heating
         assert data["rooms"][AREA]["mode"] == MODE_HEATING
-        assert _calls(hass, "set_temperature") == []
+        # The AC heating setpoint is sized from the target (error-scaled limit), so the
+        # lowered target already goes out with the active command, before the hold
+        (active,) = [c[0][2]["temperature"] for c in _calls(hass, "set_temperature")]
+        assert expected <= active < expected + 1.0
+        ac["state"] = _ac_state("heat", active)
 
+        hass.services.async_call.reset_mock()
         _age_mode(coordinator)
         data = await coordinator._async_update_data()
         assert data["rooms"][AREA]["mode"] == MODE_IDLE
-        assert [c[0][2]["temperature"] for c in _calls(hass, "set_temperature")] == [expected]
+        assert _calls(hass, "set_temperature") == []
 
     @pytest.mark.asyncio
     async def test_target_reached_without_a_change_still_sends_nothing(self, hass, mock_config_entry):

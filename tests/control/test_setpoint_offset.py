@@ -135,8 +135,8 @@ async def test_offset_ignored_in_proportional_mode():
 
     await ctrl.async_apply(MODE_COOLING, TargetTemps(heat=None, cool=24.0), power_fraction=1.0, current_temp=27.0)
 
-    # Full-power proportional cooling heads for the device minimum, no offset involved
-    assert _sent(hass) == [16.0]
+    # Full-power proportional cooling, bounded by the error-scaled AC limit (24 - 3.5), no offset involved
+    assert _sent(hass) == [20.5]
 
 
 @pytest.mark.asyncio

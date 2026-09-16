@@ -6,7 +6,11 @@ import math
 
 import pytest
 
-from custom_components.roommind.const import MIN_POWER_FRACTION, MODE_COOLING, MODE_HEATING
+from custom_components.roommind.const import (
+    MIN_POWER_FRACTION,
+    MODE_COOLING,
+    MODE_HEATING,
+)
 from custom_components.roommind.control.mpc_optimizer import MPCOptimizer, MPCPlan
 from custom_components.roommind.control.thermal_model import RCModel
 
@@ -792,3 +796,117 @@ def test_approach_rate_widens_cooling_band_symmetrically():
     assert m1 == MODE_COOLING and m2 == MODE_COOLING
     assert pf_gentle < pf_full
     assert pf_gentle >= MIN_POWER_FRACTION
+
+
+# ---------------------------------------------------------------------------
+# Counter-demand power fraction (cold-evening AC overshoot fix)
+# ---------------------------------------------------------------------------
+
+
+def test_min_run_hold_with_counter_demand_gets_zero_power():
+    """A forced min-run cooling continuation with the room already below the
+    cool target must command zero power, not full power.
+
+    Cold-evening scenario: the room starts just above the cool target, one
+    cooling block drives it below target, and min_run forces the run to
+    continue. The analytic demand now points the other way (heating), which
+    previously was either misapplied as a cooling fraction or bumped to full
+    power — driving the room further below target.
+    """
+    # C=1-normalized model (as the EKF produces) with a strong AC:
+    # one full-power block drives the room past the cool target.
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=14.0)
+    opt = MPCOptimizer(model, can_heat=True, can_cool=True, min_run_blocks=3)
+    plan = opt.optimize(
+        T_room=22.0,
+        T_outdoor_series=[20.5] * 12,
+        heat_target_series=[19.0] * 12,
+        cool_target_series=[21.0] * 12,
+        dt_minutes=5,
+    )
+    assert plan.actions[0] == "cooling"
+    assert plan.power_fractions[0] > 0.0
+    # Proportional power lands the room at the target after one block
+    assert plan.temperatures[1] == pytest.approx(21.0, abs=0.1)
+    # The forced min-run continuation must not keep cooling the room down:
+    # the run stays alive, but at zero power. The old code bumped pf to 1.0
+    # here, driving the planned trajectory ~1°C+ below target per block.
+    assert plan.actions[1] == "cooling"
+    assert plan.power_fractions[1] == 0.0
+    assert min(plan.temperatures) > 20.5
+
+
+def test_preheat_zero_demand_keeps_full_power():
+    """A deliberately chosen heating block with zero instantaneous demand
+    (schedule-driven pre-heating) keeps full power."""
+    model = RCModel(C=200.0, U=50.0, Q_heat=1000.0, Q_cool=1500.0)
+    opt = MPCOptimizer(model)
+    targets = [17.0] * 6 + [21.0] * 18
+    plan = opt.optimize(
+        T_room=17.0,
+        T_outdoor_series=[17.0] * 24,
+        heat_target_series=targets,
+        dt_minutes=5,
+    )
+    first_heat = next(i for i, a in enumerate(plan.actions) if a == "heating")
+    assert first_heat < 6  # pre-heating starts before the target rises
+    assert plan.power_fractions[first_heat] == 1.0
+
+
+def test_zero_demand_block_falls_back_to_min_power_not_full_power():
+    """A block the analytical power law prices at zero must not run at full power.
+
+    At the efficiency end of the slider the energy bias cancels the small
+    residual demand of a near-target block, so compute_optimal_power returns
+    IDLE while the lookahead still wants COOLING. Falling back to 1.0 there
+    made maximum efficiency the most aggressive setting.
+    """
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    opt = MPCOptimizer(
+        model=model,
+        can_heat=False,
+        can_cool=True,
+        w_comfort=1.0,  # comfort_weight = 0
+        w_energy=10.0,
+        min_run_blocks=2,
+        approach_rate=0.2,
+    )
+    n = 24
+    plan = opt.optimize(
+        T_room=22.1,
+        T_outdoor_series=[30.0] * n,
+        heat_target_series=[18.0] * n,
+        cool_target_series=[22.0] * n,
+        dt_minutes=5.0,
+    )
+    # Sanity: the block really does exercise the zero-demand path
+    pf_analytic, _ = opt.compute_optimal_power(22.1, 30.0, 22.0, 5.0)
+    assert pf_analytic == 0.0
+
+    assert plan.get_current_action() == MODE_COOLING
+    assert plan.get_current_power_fraction() == MIN_POWER_FRACTION
+
+
+def test_efficiency_slider_is_not_more_aggressive_than_comfort():
+    """Power demand for a near-target block must be monotone in comfort_weight."""
+    model = RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0)
+    n = 24
+    fractions = []
+    for w_comfort, w_energy, approach in ((1.0, 10.0, 0.2), (5.0, 5.0, 0.77), (10.0, 1.0, 1.0)):
+        plan = MPCOptimizer(
+            model=model,
+            can_heat=False,
+            can_cool=True,
+            w_comfort=w_comfort,
+            w_energy=w_energy,
+            min_run_blocks=2,
+            approach_rate=approach,
+        ).optimize(
+            T_room=22.1,
+            T_outdoor_series=[30.0] * n,
+            heat_target_series=[18.0] * n,
+            cool_target_series=[22.0] * n,
+            dt_minutes=5.0,
+        )
+        fractions.append(plan.get_current_power_fraction())
+    assert fractions == sorted(fractions)

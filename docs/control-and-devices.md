@@ -11,6 +11,39 @@ In `Settings -> Control -> Priority`, the slider balances comfort against runtim
 
 This setting does **not** change your schedule targets, overrides, comfort temperature, or eco temperature. It only changes how aggressively MPC tries to reach and hold those targets.
 
+## How Far AC Setpoints Are Pushed
+
+For climate devices RoomMind sends a setpoint past the room target to shape output (see `Proportional` below). An AC's compressor speed and fan speed both rise with the gap between the room and the setpoint it was given — a unit told `19°C` in a `22°C` room does not ease toward it, it runs hard and loud. The same command is also the temperature the unit will eventually drive the room to.
+
+So the excursion past target is kept proportional to the error RoomMind is actually correcting, and the `Priority` slider sets how aggressive that proportion is:
+
+- toward `Efficiency`: a small excursion, so the unit runs quietly and takes longer
+- toward `Comfort`: a larger excursion, so the unit works harder and corrects sooner
+
+Only error in the direction being corrected counts — a room that has already overshot past target gets the minimum excursion, not the largest.
+
+For a room `0.1°C` above a `22°C` cooling target, the device is given roughly `21.7°C` at full `Efficiency` and `21.2°C` at full `Comfort`, rather than being sent to its minimum. A room several degrees above target still gets the full pull-down setpoint.
+
+On a device that only accepts whole-degree setpoints the excursion is rounded up to one whole step, because a fraction of a degree would round back onto the target and leave the unit with no demand at all.
+
+### Learned Gap Response (beta)
+
+The rules above are a heuristic: they assume how much cooling a given gap buys. RoomMind can instead **measure** it, per device.
+
+Your AC reports two things HA can read — its own sensor (`current_temperature`) and the setpoint it is regulating against. The difference is the gap actually driving its compressor and fan. RoomMind compares the room's temperature change against the passive drift its thermal model predicts, and the residual is the work the unit did. That gives a curve of gap → °C/h, plus the `T_head − T_room` offset, which is why a "boost" was ever needed: the unit stops when *its* sensor reads the setpoint, not yours.
+
+Once identified, commanding becomes a measurement rather than a guess:
+
+```
+setpoint = (room temperature + offset) − gap_that_delivers_the_required_rate
+```
+
+Because the learned curve saturates, it also knows the point past which more gap buys noise instead of cooling — something no fixed rule can know per device.
+
+This is **observation-only until it has enough data**: it needs a spread of different gaps, not just many samples at one, so it activates after the room has been through some varied conditions. Until then the heuristic above stays in charge. Cooling only for now; heating is learned but still commanded by the heuristic.
+
+To inspect it, download diagnostics (`Settings → Devices & Services → RoomMind → ⋮ → Download diagnostics`) and look for `gap_response` under the room. `driving_setpoints` tells you whether the curve is in charge yet, `gap_spread_K` how much variety it has seen, and `rate_degC_per_h` is the curve itself. Set the `custom_components.roommind` logger to `debug` to watch each observation as it lands.
+
 ## Thermostat vs Climate Device
 
 Both options are Home Assistant `climate.*` entities, but RoomMind treats them differently:
