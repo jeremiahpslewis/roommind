@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from custom_components.roommind.const import MIN_POWER_FRACTION, MODE_COOLING, MODE_HEATING
+from custom_components.roommind.const import MIN_POWER_FRACTION, MODE_COOLING, MODE_HEATING, MODE_IDLE
 from custom_components.roommind.control.mpc_optimizer import MPCOptimizer, MPCPlan
 from custom_components.roommind.control.thermal_model import RCModel
 
@@ -904,3 +904,61 @@ def test_simulate_plan_reproduces_a_plan_that_holds_at_target():
     assert held, plan.actions
 
     assert opt.simulate_plan(plan, 23.0, outdoor, 5) == plan.temperatures
+
+
+# ---------------------------------------------------------------------------
+# Starting a run costs something: steady-state cycling consolidates
+# ---------------------------------------------------------------------------
+
+
+def _cooling_runs(actions: list[str]) -> int:
+    """Number of separate cooling runs in a plan (a run is a C block group)."""
+    return sum(1 for i, a in enumerate(actions) if a == MODE_COOLING and (i == 0 or actions[i - 1] != MODE_COOLING))
+
+
+def _steady_state_plan(initial_mode: str, n: int = 48):
+    """Plan for a room sitting just above target under a persistent warm load."""
+    return _regulated_ac_optimizer().optimize(
+        T_room=21.6,
+        T_outdoor_series=[26.0] * n,
+        heat_target_series=[5.0] * n,
+        cool_target_series=[21.5] * n,
+        dt_minutes=5,
+        initial_mode=initial_mode,
+    )
+
+
+def test_continuing_the_running_mode_is_free():
+    """The same state continues a live run but would not start a fresh one.
+
+    Without initial_mode the optimizer assumed every plan began from idle, so
+    continuing a run was priced as if it were a restart.
+    """
+    assert _steady_state_plan(MODE_COOLING).actions[0] == MODE_COOLING
+    assert _steady_state_plan(MODE_IDLE).actions[0] == MODE_IDLE
+
+
+def test_start_penalty_consolidates_steady_state_cycling(monkeypatch):
+    """Near steady state, pricing starts stretches cycles instead of chattering.
+
+    Unpriced, a run that buys a few hundredths of a degree-squared starts
+    again as soon as the min-run floor allows -- forever. The room is allowed
+    to drift a little further instead, well inside the comfort band.
+    """
+    priced = _cooling_runs(_steady_state_plan(MODE_COOLING).actions)
+    monkeypatch.setattr("custom_components.roommind.control.mpc_optimizer.MODE_START_PENALTY", 0.0)
+    unpriced = _cooling_runs(_steady_state_plan(MODE_COOLING).actions)
+    assert priced < unpriced, f"priced {priced} runs, unpriced {unpriced}"
+
+
+def test_start_penalty_does_not_block_a_real_demand():
+    """A room well above target still starts cooling immediately."""
+    plan = _regulated_ac_optimizer().optimize(
+        T_room=23.0,
+        T_outdoor_series=[26.0] * 24,
+        heat_target_series=[5.0] * 24,
+        cool_target_series=[21.5] * 24,
+        dt_minutes=5,
+        initial_mode=MODE_IDLE,
+    )
+    assert plan.actions[0] == MODE_COOLING
