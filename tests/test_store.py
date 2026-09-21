@@ -495,7 +495,7 @@ async def test_migration_legacy_room_gets_devices(store):
         "role": "auto",
         "heating_system_type": "radiator",
         "idle_action": "off",
-        "idle_fan_mode": "low",
+        "idle_fan_mode": "quiet",
         "setpoint_mode": "proportional",
         "coil_dry": "inherit",
         "coil_dry_minutes": 0,
@@ -508,7 +508,7 @@ async def test_migration_legacy_room_gets_devices(store):
         "role": "auto",
         "heating_system_type": "",
         "idle_action": "off",
-        "idle_fan_mode": "low",
+        "idle_fan_mode": "quiet",
         "setpoint_mode": "proportional",
         "coil_dry": "inherit",
         "coil_dry_minutes": 0,
@@ -654,6 +654,48 @@ async def test_migration_heat_pump_to_ac(store):
     # heat_pump should be migrated to ac
     assert room["devices"][1]["type"] == "ac"
     assert room["acs"] == ["climate.hp1"]
+
+
+@pytest.mark.asyncio
+async def test_migration_idle_fan_mode_low_to_quiet(store):
+    """Devices left on the old "low" backoff speed load as "quiet"."""
+    stored_data = {
+        "rooms": {
+            "wohnzimmer": {
+                "area_id": "wohnzimmer",
+                "thermostats": [],
+                "acs": ["climate.ac1", "climate.ac2"],
+                "devices": [
+                    {
+                        "entity_id": "climate.ac1",
+                        "type": "ac",
+                        "role": "auto",
+                        "heating_system_type": "",
+                        "idle_action": "fan_only",
+                        "idle_fan_mode": "low",
+                    },
+                    {
+                        "entity_id": "climate.ac2",
+                        "type": "ac",
+                        "role": "auto",
+                        "heating_system_type": "",
+                        "idle_action": "fan_only",
+                        "idle_fan_mode": "medium",
+                    },
+                ],
+                "schedules": [],
+            }
+        }
+    }
+    store._store.async_load = AsyncMock(return_value=stored_data)
+    await store.async_load()
+
+    assert store._store.async_save.called
+
+    room = store.get_room("wohnzimmer")
+    assert room["devices"][0]["idle_fan_mode"] == "quiet"
+    # An explicit speed is a choice, not the old default.
+    assert room["devices"][1]["idle_fan_mode"] == "medium"
 
 
 def test_migrate_override_auto_creates_dead_band():

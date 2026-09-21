@@ -41,6 +41,7 @@ from .utils.device_utils import (
     DEFAULT_COIL_DRY_FAN_MODE,
     DEFAULT_COIL_DRY_MIN_COOLING_MINUTES,
     DEFAULT_COIL_DRY_MINUTES,
+    DEFAULT_IDLE_FAN_MODE,
     SETPOINT_OFFSET_MAX,
     SETPOINT_OFFSET_MIN,
 )
@@ -358,7 +359,7 @@ async def websocket_list_rooms(
                     vol.Optional("role", default="auto"): vol.In(["primary", "secondary", "auto"]),
                     vol.Optional("heating_system_type", default=""): vol.In(["", "radiator", "underfloor"]),
                     vol.Optional("idle_action", default="off"): vol.In(["off", "fan_only", "setback", "low"]),
-                    vol.Optional("idle_fan_mode", default="low"): str,
+                    vol.Optional("idle_fan_mode", default=DEFAULT_IDLE_FAN_MODE): str,
                     vol.Optional("setpoint_mode", default="proportional"): vol.In(["proportional", "direct"]),
                     vol.Optional("setpoint_offset", default=0.0): vol.All(
                         vol.Coerce(float), vol.Range(min=SETPOINT_OFFSET_MIN, max=SETPOINT_OFFSET_MAX)

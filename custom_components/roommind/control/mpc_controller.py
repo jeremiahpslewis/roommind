@@ -62,6 +62,7 @@ from ..utils.device_utils import (
     IDLE_ACTION_LOW,
     IDLE_ACTION_OFF,
     IDLE_ACTION_SETBACK,
+    QUIET_FAN_FALLBACKS,
     get_ac_eids,
     get_all_entity_ids,
     get_direct_setpoint_eids,
@@ -535,6 +536,16 @@ def _resolve_fan_mode(state: Any, desired: str | None) -> str | None:
     for mode in modes:
         if norm(mode) == want:
             return mode
+    # A head that does not advertise the requested slow speed under that name
+    # almost always has it under another one, and leaving the blower where it
+    # was is the failure backing off exists to prevent — air over a cold coil
+    # that the room feels as the AC never easing up. Only the slow end falls
+    # through: nothing sensible substitutes for "turbo".
+    if want in QUIET_FAN_FALLBACKS:
+        for alt in QUIET_FAN_FALLBACKS:
+            for mode in modes:
+                if norm(mode).startswith(alt):
+                    return mode
     return None
 
 
@@ -1099,8 +1110,9 @@ async def async_idle_device(
         return
 
     # A fan mode the device does not have is left alone, like an empty idle_fan_mode:
-    # waiting for the device to report it would resend fan_only every cycle.
-    fan_mode = match_fan_mode(state, idle_fan_mode) if idle_fan_mode else None
+    # waiting for the device to report it would resend fan_only every cycle. The
+    # fork's resolver also falls through to the device's own name for the slow end.
+    fan_mode = _resolve_fan_mode(state, idle_fan_mode) if idle_fan_mode else None
     if idle_fan_mode and fan_mode is None:
         _LOGGER.debug(
             "Area '%s': device '%s' does not support fan_mode '%s' (available: %s)",
