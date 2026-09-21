@@ -55,6 +55,7 @@ from ..utils.device_utils import (
     IDLE_ACTION_LOW,
     IDLE_ACTION_OFF,
     IDLE_ACTION_SETBACK,
+    QUIET_FAN_FALLBACKS,
     get_ac_eids,
     get_direct_setpoint_eids,
     get_idle_action,
@@ -358,6 +359,16 @@ def _resolve_fan_mode(state: Any, desired: str | None) -> str | None:
     for mode in modes:
         if norm(mode) == want:
             return mode
+    # A head that does not advertise the requested slow speed under that name
+    # almost always has it under another one, and leaving the blower where it
+    # was is the failure backing off exists to prevent — air over a cold coil
+    # that the room feels as the AC never easing up. Only the slow end falls
+    # through: nothing sensible substitutes for "turbo".
+    if want in QUIET_FAN_FALLBACKS:
+        for alt in QUIET_FAN_FALLBACKS:
+            for mode in modes:
+                if norm(mode).startswith(alt):
+                    return mode
     return None
 
 
@@ -882,10 +893,15 @@ async def async_idle_device(
         await async_turn_off_climate(hass, entity_id, area_id=area_id, fallback_setpoint=fallback_temp)
         return
 
+    # The configured name is free text and devices spell the same speed their
+    # own way, so match it against what this head advertises (and fall through
+    # to its own name for the slow end) before comparing or commanding.
+    resolved_fan = _resolve_fan_mode(state, idle_fan_mode)
+
     # Redundancy check: already in fan_only with correct fan_mode
     if state and state.state == "fan_only":
         current_fan = state.attributes.get("fan_mode")
-        if not idle_fan_mode or current_fan == idle_fan_mode:
+        if not idle_fan_mode or current_fan == resolved_fan:
             return
 
     # Cache fallback for IR devices (only when device has no reliable state)
@@ -914,13 +930,12 @@ async def async_idle_device(
         return
 
     if idle_fan_mode:
-        fan_modes: list[str] = (state.attributes.get("fan_modes") or []) if state else []
-        if idle_fan_mode in fan_modes:
+        if resolved_fan is not None:
             try:
                 await hass.services.async_call(
                     "climate",
                     "set_fan_mode",
-                    {"entity_id": entity_id, "fan_mode": idle_fan_mode},
+                    {"entity_id": entity_id, "fan_mode": resolved_fan},
                     blocking=True,
                     context=make_roommind_context(),
                 )
@@ -928,7 +943,7 @@ async def async_idle_device(
                 _LOGGER.warning(
                     "Area '%s': climate.set_fan_mode('%s') failed on '%s'",
                     area_id,
-                    idle_fan_mode,
+                    resolved_fan,
                     entity_id,
                     exc_info=True,
                 )
@@ -938,7 +953,7 @@ async def async_idle_device(
                 area_id,
                 entity_id,
                 idle_fan_mode,
-                fan_modes,
+                (state.attributes.get("fan_modes") if state else None),
             )
 
 

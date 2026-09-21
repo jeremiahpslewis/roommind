@@ -28,6 +28,7 @@ from custom_components.roommind.utils.device_utils import (
     is_trv_type,
     legacy_to_devices,
     migrate_heat_pump_devices,
+    migrate_idle_fan_mode_default,
     room_contributes_to_group,
 )
 
@@ -67,7 +68,7 @@ def test_legacy_to_devices_basic():
         "role": "auto",
         "heating_system_type": "",
         "idle_action": "off",
-        "idle_fan_mode": "low",
+        "idle_fan_mode": "quiet",
         "setpoint_mode": "proportional",
         "coil_dry": "inherit",
         "coil_dry_minutes": 0,
@@ -379,23 +380,52 @@ def test_migrate_heat_pump_devices_no_change():
 
 
 # ---------------------------------------------------------------------------
+# migrate_idle_fan_mode_default
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_idle_fan_mode_default():
+    """A stored "low" is the old default, so it moves to the new one."""
+    devices = [
+        {"entity_id": "climate.ac1", "type": "ac", "idle_fan_mode": "low"},
+        {"entity_id": "climate.ac2", "type": "ac", "idle_fan_mode": "quiet"},
+    ]
+    assert migrate_idle_fan_mode_default(devices) is True
+    assert devices[0]["idle_fan_mode"] == "quiet"
+    assert devices[1]["idle_fan_mode"] == "quiet"
+
+
+def test_migrate_idle_fan_mode_default_leaves_deliberate_values():
+    """Anything else, "" ("don't change the fan") included, is a choice."""
+    devices = [
+        {"entity_id": "climate.ac1", "type": "ac", "idle_fan_mode": ""},
+        {"entity_id": "climate.ac2", "type": "ac", "idle_fan_mode": "medium"},
+        {"entity_id": "climate.trv1", "type": "trv"},
+    ]
+    assert migrate_idle_fan_mode_default(devices) is False
+    assert devices[0]["idle_fan_mode"] == ""
+    assert devices[1]["idle_fan_mode"] == "medium"
+    assert "idle_fan_mode" not in devices[2]
+
+
+# ---------------------------------------------------------------------------
 # get_idle_action
 # ---------------------------------------------------------------------------
 
 
 def test_legacy_to_devices_includes_idle_defaults():
-    """legacy_to_devices produces devices with idle_action='off' and idle_fan_mode='low'."""
+    """legacy_to_devices produces devices with idle_action='off' and idle_fan_mode='quiet'."""
     devices = legacy_to_devices(["climate.x"], [])
     assert len(devices) == 1
     assert devices[0]["idle_action"] == "off"
-    assert devices[0]["idle_fan_mode"] == "low"
+    assert devices[0]["idle_fan_mode"] == "quiet"
 
 
 def test_get_idle_action_defaults():
-    """Empty devices list returns default ('off', 'low')."""
+    """Empty devices list returns default ('off', 'quiet')."""
     action, fan_mode = get_idle_action([], "climate.nonexistent")
     assert action == "off"
-    assert fan_mode == "low"
+    assert fan_mode == "quiet"
 
 
 def test_get_idle_action_configured():

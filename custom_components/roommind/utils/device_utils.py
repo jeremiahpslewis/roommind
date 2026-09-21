@@ -23,7 +23,17 @@ HST_PRIORITY = {"underfloor": 2, "radiator": 1, "": 0}
 
 IDLE_ACTION_OFF = "off"
 IDLE_ACTION_FAN_ONLY = "fan_only"
-DEFAULT_IDLE_FAN_MODE = "low"
+# Fan speed a backed-off (parked or idled) head is put on. "quiet" rather than
+# "low": on the units that name both, quiet is the slower of the two, and a
+# head that has stopped calling for compressor is exactly where the extra
+# silence costs nothing. Heads that do not advertise it fall through
+# QUIET_FAN_FALLBACKS to whatever they do call their slowest speed.
+DEFAULT_IDLE_FAN_MODE = "quiet"
+# Names the same "as slow as it goes" speed goes by, in the order to try them.
+# A head that advertises none of these keeps the fan it has, which is the
+# pre-existing behaviour for an unsupported fan mode. Mirrors the quiet class
+# in control/gap_response.py, which stays import-free by design.
+QUIET_FAN_FALLBACKS: tuple[str, ...] = ("quiet", "silent", "night", "eco", "low", "min")
 IDLE_ACTION_SETBACK = "setback"
 IDLE_ACTION_LOW = "low"
 DEFAULT_IDLE_SETBACK_OFFSET = 2.0
@@ -294,6 +304,23 @@ def migrate_heat_pump_devices(devices: list[dict]) -> bool:
     for d in devices:
         if d.get("type") == "heat_pump":
             d["type"] = DEVICE_TYPE_AC
+            migrated = True
+    return migrated
+
+
+def migrate_idle_fan_mode_default(devices: list[dict]) -> bool:
+    """Move devices off the old "low" backoff speed. Returns True if any moved.
+
+    "low" was the default written into every device at creation and at the
+    legacy migration, so a stored "low" is the old default far more often than
+    it is a choice — and leaving it there would mean the quiet default only
+    ever reached new installs. Any other value, including "" ("don't change
+    the fan"), is left alone.
+    """
+    migrated = False
+    for d in devices:
+        if d.get("idle_fan_mode") == "low":
+            d["idle_fan_mode"] = DEFAULT_IDLE_FAN_MODE
             migrated = True
     return migrated
 

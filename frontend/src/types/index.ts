@@ -80,7 +80,7 @@ export interface DeviceConfig {
   role: DeviceRole;
   heating_system_type?: string;
   idle_action?: "off" | "fan_only" | "setback" | "low"; // default "off"
-  idle_fan_mode?: string; // default "low"
+  idle_fan_mode?: string; // default "quiet"
   setpoint_mode?: "proportional" | "direct"; // default "proportional"
   coil_dry?: "inherit" | "on" | "off"; // default "inherit"
   coil_dry_minutes?: number; // 0 = inherit global

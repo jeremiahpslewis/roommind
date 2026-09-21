@@ -753,7 +753,9 @@ export class RsDeviceSection extends LitElement {
                       <ha-select
                         .label=${localize("devices.idle_fan_mode", lang)}
                         .value=${
-                          device.idle_fan_mode === "" ? "__keep__" : (device.idle_fan_mode ?? "low")
+                          device.idle_fan_mode === ""
+                            ? "__keep__"
+                            : (device.idle_fan_mode ?? "quiet")
                         }
                         .options=${[
                           {
@@ -1075,7 +1077,7 @@ export class RsDeviceSection extends LitElement {
       if (d.entity_id !== entityId) return d;
       const updated = { ...d, idle_action: idleAction as "off" | "fan_only" | "setback" | "low" };
       if (idleAction === "fan_only" && !d.idle_fan_mode) {
-        updated.idle_fan_mode = "low";
+        updated.idle_fan_mode = "quiet";
       }
       return updated;
     });

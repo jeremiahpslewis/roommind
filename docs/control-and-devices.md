@@ -106,6 +106,8 @@ RoomMind turns the device off, or falls back to the device's minimum/off-like be
 
 RoomMind keeps the device running in fan mode without active heating/cooling.
 
+The fan speed is configurable per device and defaults to the head's quietest speed (`quiet`, or whatever the unit calls the slow end — `silent`, `night`, `eco`, `low`). A device that advertises none of those keeps the fan speed it is on.
+
 Useful when you want:
 
 - air circulation

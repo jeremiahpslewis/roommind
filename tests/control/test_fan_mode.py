@@ -14,6 +14,7 @@ from custom_components.roommind.control.mpc_controller import (
     clear_command_cache,
 )
 from custom_components.roommind.control.thermal_model import RoomModelManager
+from custom_components.roommind.utils.device_utils import DEFAULT_IDLE_FAN_MODE, get_idle_action
 
 from .conftest import build_hass, make_room
 
@@ -1544,3 +1545,120 @@ async def test_controller_reads_the_airflow_class_it_is_about_to_command():
     # It resolved the quiet class despite the head still reporting Auto.
     assert ctrl._intended_airflow["climate.ac1"] == AIRFLOW_QUIET
     assert ctrl.head_frame_shift("climate.ac1", 22.0) == pytest.approx(3.0, abs=0.2)
+
+
+# ---------------------------------------------------------------------------
+# Backing off defaults to the quiet end, under whatever name the head has for
+# it. "quiet" is the configured default, but plenty of units only advertise
+# "low", "Silent" or "Night" — leaving the blower where it was on those is the
+# failure backing off exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+def _fan_ctrl_modes(fan_modes, *, fan_mode="Auto", idle_fan_mode=None):
+    """Controller over one head advertising ``fan_modes``.
+
+    ``idle_fan_mode`` left as None omits the key entirely, so the device falls
+    back to DEFAULT_IDLE_FAN_MODE the same way an unmigrated config does.
+    """
+    hass = build_hass()
+    state = MagicMock()
+    state.state = "cool"
+    state.attributes = {
+        "hvac_modes": ["off", "auto", "cool", "heat", "dry", "fan_only"],
+        "fan_modes": fan_modes,
+        "fan_mode": fan_mode,
+        "temperature": 23.0,
+        "current_temperature": 22.0,
+        "min_temp": 17.0,
+        "max_temp": 30.0,
+        "target_temp_step": 1.0,
+    }
+    hass.states.get = MagicMock(return_value=state)
+    room = make_room(thermostats=[], acs=["climate.ac1"])
+    device = {
+        "entity_id": "climate.ac1",
+        "type": "ac",
+        "role": "auto",
+        "heating_system_type": "",
+        "idle_action": "setback",
+    }
+    if idle_fan_mode is not None:
+        device["idle_fan_mode"] = idle_fan_mode
+    room["devices"] = [device]
+    ctrl = MPCController(
+        hass,
+        room,
+        model_manager=RoomModelManager(),
+        outdoor_temp=30.0,
+        settings={},
+        has_external_sensor=True,
+    )
+    return hass, ctrl
+
+
+def test_default_idle_fan_mode_is_quiet():
+    """An unconfigured device backs off to quiet, not low."""
+    assert DEFAULT_IDLE_FAN_MODE == "quiet"
+    assert get_idle_action([], "climate.nonexistent")[1] == "quiet"
+
+
+@pytest.mark.asyncio
+async def test_parked_head_takes_quiet_over_low_when_it_has_both():
+    """On a head naming both, quiet is the slower speed and the one to park on."""
+    clear_command_cache()
+    hass, ctrl = _fan_ctrl_modes(["Auto", "Quiet", "Low", "Medium", "High"])
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+    assert _fan_sent(hass) == ["Quiet"]
+
+
+@pytest.mark.asyncio
+async def test_parked_head_without_quiet_falls_back_to_low():
+    """The default must still quieten a head that only advertises low."""
+    clear_command_cache()
+    hass, ctrl = _fan_ctrl_modes(["auto", "low", "medium", "high"])
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+    assert _fan_sent(hass) == ["low"]
+
+
+@pytest.mark.asyncio
+async def test_parked_head_falls_back_to_the_name_it_does_use():
+    """Silent/Night/Eco are the same speed under another vendor's name."""
+    clear_command_cache()
+    hass, ctrl = _fan_ctrl_modes(["Auto", "Silent", "Turbo"])
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+    assert _fan_sent(hass) == ["Silent"]
+
+
+@pytest.mark.asyncio
+async def test_parked_head_with_no_slow_speed_keeps_its_fan():
+    """No name for the slow end: leave the fan alone rather than guess."""
+    clear_command_cache()
+    hass, ctrl = _fan_ctrl_modes(["Auto", "Turbo"])
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+    assert _fan_sent(hass) == []
+
+
+@pytest.mark.asyncio
+async def test_configured_low_still_matches_low_exactly():
+    """The fallback never overrides a name the head does advertise."""
+    clear_command_cache()
+    hass, ctrl = _fan_ctrl_modes(["Auto", "Quiet", "Low", "High"], idle_fan_mode="low")
+    await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=23.5), current_temp=22.5)
+    assert _fan_sent(hass) == ["Low"]
+
+
+@pytest.mark.asyncio
+async def test_idle_fan_only_default_quiet_resolves_against_the_device():
+    """fan_only idle with the default speed reaches a head that calls it 'low'."""
+    _last_commands.clear()
+    hass = build_hass()
+    state = MagicMock()
+    state.state = "cool"
+    state.attributes = {"hvac_modes": ["cool", "fan_only", "off"], "fan_modes": ["low", "medium", "high"]}
+    hass.states.get = MagicMock(return_value=state)
+
+    devices = [{"entity_id": "climate.ac1", "type": "ac", "role": "auto", "idle_action": "fan_only"}]
+    await async_idle_device(hass, "climate.ac1", devices, area_id="living_room")
+
+    assert _fan_sent(hass) == ["low"]
