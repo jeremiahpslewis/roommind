@@ -827,9 +827,11 @@ class ThermalEKF:
             F[i][i] = 1.0
 
         vent_on = T_vent is not None and alpha_v > 0.0
+        # Narrowed for the vent terms below, which are only read when vent_on
+        T_v = T_vent if T_vent is not None else T_out
         if vent_on:
             alpha_eff = alpha + alpha_v
-            T_ref = (alpha * T_out + alpha_v * T_vent) / alpha_eff
+            T_ref = (alpha * T_out + alpha_v * T_v) / alpha_eff
         else:
             alpha_eff, T_ref = alpha, T_out
 
@@ -850,7 +852,7 @@ class ThermalEKF:
             # Disturbance: always observable
             F[0][6] = dt_h
             if vent_on:
-                F[0][7] = -(T - T_vent) * dt_h
+                F[0][7] = -(T - T_v) * dt_h
         else:
             decay = math.exp(-alpha_eff * dt_h)
             one_minus_decay = 1.0 - decay
@@ -873,7 +875,7 @@ class ThermalEKF:
             # Disturbance: always observable
             F[0][6] = (1.0 / alpha_eff) * one_minus_decay
             if vent_on:
-                F[0][7] = ((T_vent - T_eq) / alpha_eff) * one_minus_decay - (T - T_eq) * dt_h * decay
+                F[0][7] = ((T_v - T_eq) / alpha_eff) * one_minus_decay - (T - T_eq) * dt_h * decay
         return F
 
     def _predict_step(
