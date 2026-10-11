@@ -305,8 +305,14 @@ class MPCOptimizer:
                     rebound_charge=charge,
                 )
                 pf = max(pf, MIN_POWER_FRACTION) if pf_mode == best_action else MIN_POWER_FRACTION
-            elif pf == 0.0:
-                pf = 1.0  # pre-heating/pre-cooling for a later target: full power
+            elif pf_mode != best_action:
+                # compute_optimal_power found no demand in this block's direction: the
+                # deviation is smaller than the energy bias, or the room needs this
+                # direction only later (look-ahead). Its fraction is then 0.0 or belongs to
+                # the other direction, so it is not used. Heating runs at full power, which
+                # pre-heating slow systems relies on. Cooling runs at the minimum, because
+                # full power would drive an AC to its lowest setpoint.
+                pf = 1.0 if best_action == MODE_HEATING else MIN_POWER_FRACTION
 
             # Apply action with proportional Q for accurate forward prediction
             if best_action == MODE_HEATING:
