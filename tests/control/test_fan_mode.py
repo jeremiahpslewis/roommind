@@ -1653,3 +1653,59 @@ async def test_idle_fan_only_default_quiet_resolves_against_the_device():
     await async_idle_device(hass, "climate.ac1", devices, area_id="living_room")
 
     assert _fan_sent(hass) == ["low"]
+
+
+# ---------------------------------------------------------------------------
+# Fan commands to a head without fan_mode feedback go through the per-service
+# command cache (#416): sent once, not every cycle.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_mode_without_feedback_is_sent_once_between_setpoints():
+    from custom_components.roommind.control.mpc_controller import _send_fan_mode
+
+    clear_command_cache()
+    hass = build_hass()
+    state = MagicMock()
+    state.state = "unknown"
+    state.attributes = {"hvac_modes": ["cool", "off"], "fan_modes": ["auto", "quiet", "high"]}
+    hass.states.get = MagicMock(return_value=state)
+    ctrl = MPCController(
+        hass,
+        make_room(thermostats=[], acs=["climate.ir_ac"]),
+        model_manager=RoomModelManager(),
+        outdoor_temp=30.0,
+        settings={},
+        has_external_sensor=True,
+    )
+
+    await _send_fan_mode(hass, "climate.ir_ac", "quiet")
+    # a setpoint in between must not evict the fan entry
+    await ctrl._call("set_temperature", {"entity_id": "climate.ir_ac", "temperature": 24.0})
+    await _send_fan_mode(hass, "climate.ir_ac", "quiet")
+
+    fan_calls = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_fan_mode"]
+    assert len(fan_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fan_mode_without_feedback_is_reasserted_after_the_cache_ttl():
+    from custom_components.roommind.const import COMMAND_CACHE_REASSERT_SECONDS
+    from custom_components.roommind.control.mpc_controller import _send_fan_mode
+
+    clear_command_cache()
+    hass = build_hass()
+    state = MagicMock()
+    state.state = "unknown"
+    state.attributes = {"hvac_modes": ["cool", "off"], "fan_modes": ["auto", "quiet", "high"]}
+    hass.states.get = MagicMock(return_value=state)
+    clock = {"t": 1000.0}
+
+    with patch("custom_components.roommind.control.mpc_controller._now", side_effect=lambda: clock["t"]):
+        await _send_fan_mode(hass, "climate.ir_ac", "quiet")
+        clock["t"] += COMMAND_CACHE_REASSERT_SECONDS
+        await _send_fan_mode(hass, "climate.ir_ac", "quiet")
+
+    fan_calls = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_fan_mode"]
+    assert len(fan_calls) == 2

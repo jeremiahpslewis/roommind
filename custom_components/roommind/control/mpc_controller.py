@@ -122,6 +122,7 @@ def _cache_entry(service: str, data: dict) -> dict[str, Any]:
         "temperature": data.get("temperature"),
         "target_temp_low": data.get("target_temp_low"),
         "target_temp_high": data.get("target_temp_high"),
+        **({"fan_mode": data["fan_mode"]} if "fan_mode" in data else {}),
     }
 
 
@@ -506,9 +507,10 @@ async def _send_fan_mode(hass: HomeAssistant, entity_id: str, desired: str | Non
         return
     if state is not None and state.attributes.get("fan_mode") == resolved:
         return
-    cached = _last_commands.get(entity_id)
-    if cached and cached.get("service") == "set_fan_mode" and cached.get("fan_mode") == resolved:
-        if state is None or state.attributes.get("fan_mode") is None:
+    # No fan_mode feedback: the per-service cache is all there is (#416)
+    if state is None or state.attributes.get("fan_mode") is None:
+        cached = _cached_command(entity_id, "set_fan_mode")
+        if cached and cached.get("fan_mode") == resolved and not _cache_expired(entity_id, "set_fan_mode"):
             return
     try:
         await hass.services.async_call(
@@ -518,7 +520,7 @@ async def _send_fan_mode(hass: HomeAssistant, entity_id: str, desired: str | Non
             blocking=True,
             context=make_roommind_context(),
         )
-        _last_commands[entity_id] = _cache_entry("set_fan_mode", {"fan_mode": resolved})
+        _remember_command(entity_id, "set_fan_mode", {"fan_mode": resolved})
     except Exception:  # noqa: BLE001
         _LOGGER.warning(
             "Area '%s': climate.set_fan_mode('%s') failed on '%s'",
