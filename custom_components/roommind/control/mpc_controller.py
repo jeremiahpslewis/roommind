@@ -2616,7 +2616,6 @@ class MPCController:
         *,
         release_bound: float,
         intent: str,
-        park_on_release: bool = True,
     ) -> float:
         """Translate a room-frame AC setpoint into the device's sensor frame.
 
@@ -2642,15 +2641,13 @@ class MPCController:
             is_release = value >= release_bound and (current_temp is None or current_temp <= release_bound)
         else:
             is_release = value <= release_bound and (current_temp is None or current_temp >= release_bound)
-        if is_release and park_on_release:
+        if is_release:
             # Park one device step past the head's OWN reading — the level at
             # which it is observably satisfied — so a release and the
             # re-engage that follows stay within the two-adjacent-levels
             # dither a whole-degree actuator can do optimally. Falls back to
             # the estimate (adverse learned offset + fixed margin) only when
-            # the head reading is unavailable. Compressor-group holds opt
-            # out (park_on_release=False): a forced-on head must stay gently
-            # engaged at the head-frame target, not be parked off.
+            # the head reading is unavailable.
             observed = observed_park_level(
                 self.hass,
                 eid,
@@ -2671,11 +2668,10 @@ class MPCController:
             reset_park_latch(eid)
         shift = self.head_frame_shift(eid, current_temp, release_intent=intent if is_release else None)
         if is_release:
-            park = AC_RELEASE_PARK_C if park_on_release else 0.0
             if intent == "cool":
-                shift = max(0.0, shift) + park
+                shift = max(0.0, shift) + AC_RELEASE_PARK_C
             else:
-                shift = min(0.0, shift) - park
+                shift = min(0.0, shift) - AC_RELEASE_PARK_C
         shifted = value + shift
         step = self._setpoint_step(eid)
         if step:
