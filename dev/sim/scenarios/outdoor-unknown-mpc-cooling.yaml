@@ -1,0 +1,21 @@
+name: outdoor-unknown-mpc-cooling
+extends: ekf-summer-ac
+description: >
+  Summer AC room with a trained model and no weather entity. On day 5 the outdoor sensor
+  goes unavailable for good. Without a reading or a forecast the MPC horizon is the 10 °C
+  placeholder, and the optimizer's outdoor gate (outdoor_cooling_min 16 °C) dropped every
+  cooling block: the room heated up on a hot afternoon while the AC stayed off (#464).
+  An unknown outdoor temperature must not gate cooling, like it does not in bang-bang.
+refs: [464]
+tags: [ac, outdoor-gate]
+duration: 5d
+roommind:
+  settings:
+    weather_entity-: ~
+timeline:
+  - {at: "+4d", do: entity.unavailable, entity_id: sensor.aussen_temp}
+expect:
+  - {invariant: no_rejected_commands}
+  - {check: "room.wohnzimmer.mode == 'cooling' or room.wohnzimmer.current_temp <= 25.0", at: "+4d14h", label: cools without an outdoor reading (14:00)}
+  - {check: "room.wohnzimmer.mode == 'cooling' or room.wohnzimmer.current_temp <= 25.0", at: "+4d16h", label: cools without an outdoor reading (16:00)}
+  - {check: "true_temp('wohnzimmer') < 26.0", at: "+4d17h", label: room stays near its target without an outdoor reading}
