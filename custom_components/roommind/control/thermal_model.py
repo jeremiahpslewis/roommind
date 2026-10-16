@@ -21,6 +21,8 @@ RCModel solves the ODE analytically (exact for constant inputs over a time step)
 ThermalEKF learns alpha, beta_h, beta_c, beta_s, beta_o, beta_f online from
 temperature measurements using an Extended Kalman Filter with augmented state
 [T, alpha, beta_h, beta_c, beta_s, beta_o, beta_f].
+The fork appends alpha_v, the coupling to a ventilation supply-air temperature
+(state 7, after upstream's states so their indices stay as they are).
 RoomModelManager provides per-room model access for the coordinator.
 """
 
@@ -68,6 +70,7 @@ class RCModel:
         Q_solar: float = DEFAULT_Q_SOLAR,
         Q_occupancy: float = DEFAULT_Q_OCCUPANCY,
         Q_fast: float = DEFAULT_Q_FAST,
+        U_vent: float = 0.0,
     ) -> None:
         self.C = C
         self.U = U
@@ -76,6 +79,11 @@ class RCModel:
         self.Q_solar = Q_solar
         self.Q_occupancy = Q_occupancy
         self.Q_fast = Q_fast
+        # Ventilation coupling toward the supply-air temperature (same units
+        # as U). Active only while vent_temp carries a live reading — the
+        # manager stamps it each cycle; a dead sensor degrades to U-only.
+        self.U_vent = U_vent
+        self.vent_temp: float | None = None
 
     def predict(
         self,
@@ -116,10 +124,19 @@ class RCModel:
         if q_rebound is not None:
             Q_rebound = self.Q_fast * (q_rebound - self.cooling_drive(Q_active))
         Q_total = Q_active + self.Q_solar * q_solar + self.Q_occupancy * q_occupancy + Q_residual + Q_rebound
-        # Equilibrium temperature: T_out + Q/U
-        T_eq = T_outdoor + Q_total / self.U
-        # Decay constant  (U/C has unit 1/h)
-        decay = math.exp(-self.U * dt_hours / self.C)
+        # Two-conductance form when a ventilation supply temperature is live:
+        # dT/dt = (Q - U(T - T_out) - U_vent(T - T_vent)) / C collapses to the
+        # single-node solution with U_eff and a conductance-weighted reference.
+        if self.U_vent > 0 and self.vent_temp is not None:
+            U_eff = self.U + self.U_vent
+            T_ref = (self.U * T_outdoor + self.U_vent * self.vent_temp) / U_eff
+        else:
+            U_eff = self.U
+            T_ref = T_outdoor
+        # Equilibrium temperature: T_ref + Q/U_eff
+        T_eq = T_ref + Q_total / U_eff
+        # Decay constant  (U_eff/C has unit 1/h)
+        decay = math.exp(-U_eff * dt_hours / self.C)
         result = T_eq + (T_room - T_eq) * decay
         # Hard output clamp for safety
         return max(0.0, min(50.0, result))
@@ -205,6 +222,7 @@ class RCModel:
             "Q_solar": self.Q_solar,
             "Q_occupancy": self.Q_occupancy,
             "Q_fast": self.Q_fast,
+            "U_vent": self.U_vent,
         }
 
     @classmethod
@@ -218,6 +236,7 @@ class RCModel:
             Q_solar=max(0.0, data.get("Q_solar", cls.DEFAULT_Q_SOLAR)),
             Q_occupancy=max(0.0, data.get("Q_occupancy", cls.DEFAULT_Q_OCCUPANCY)),
             Q_fast=max(0.0, data.get("Q_fast", cls.DEFAULT_Q_FAST)),
+            U_vent=max(0.0, data.get("U_vent", 0.0)),
         )
 
     def __repr__(self) -> str:
@@ -244,6 +263,7 @@ class ThermalEKF:
       beta_s  = Q_solar/C  solar gain rate [degC/h per kW/m²]
       beta_o  = Q_occupancy/C  occupancy heat gain rate [degC/h]
       beta_f  = Q_fast/C  air/mass offset rate of an AC room [degC/h]
+      alpha_v = U_vent/C ventilation coupling toward the supply-air temp [1/h] (fork)
 
     The EKF uses the analytical 1R1C solution for the predict step and
     a standard Kalman measurement update.  Parameters are modeled as
@@ -282,6 +302,8 @@ class ThermalEKF:
     _BETA_O_MAX: float = 20.0  # large occupancy gain (many people / small room)
     _BETA_F_MIN: float = 0.0  # no air/mass offset (AC blows into a heavy, well-mixed room)
     _BETA_F_MAX: float = 300.0
+    _ALPHA_V_MIN: float = 0.0  # no ventilation coupling
+    _ALPHA_V_MAX: float = 1.5  # strong whole-house ventilation (air-change tau < 1 h)
 
     # Default initial parameter values (C=1 normalization)
     _DEFAULT_ALPHA: float = 0.15  # ~7 h time constant (moderate residential room)
@@ -290,6 +312,7 @@ class ThermalEKF:
     _DEFAULT_BETA_S: float = 0.5  # small initial solar gain; learns from data
     _DEFAULT_BETA_O: float = 0.3  # ~100W body heat, C=1 normalized
     _DEFAULT_BETA_F: float = RCModel.DEFAULT_Q_FAST
+    _DEFAULT_ALPHA_V: float = 0.05  # weak initial coupling; learns when a sensor is wired
 
     # Process noise (diagonal of Q_noise matrix)
     # Higher values keep the filter adaptive; lower values freeze parameters.
@@ -302,6 +325,7 @@ class ThermalEKF:
     _Q_BETA_S: float = 0.002  # solar gain drift
     _Q_BETA_O: float = 0.002  # occupancy gain drift
     _Q_BETA_F: float = 0.005  # same drift as beta_c
+    _Q_ALPHA_V: float = 0.001  # ventilation coupling drift (fan-stage changes)
 
     # Measurement noise
     _R: float = 0.04  # sensor noise variance (0.2 degC std)
@@ -314,6 +338,7 @@ class ThermalEKF:
     _P_INIT_BETA_S: float = 25.0  # σ≈5 around default 0.5
     _P_INIT_BETA_O: float = 10.0  # moderate initial uncertainty for occupancy
     _P_INIT_BETA_F: float = 100.0  # sigma 10 around the default 0 (sim: 3.5 kW split in 26 m², ~24)
+    _P_INIT_ALPHA_V: float = 0.25  # sigma 0.5 around the small default coupling
 
     # Window-open heat exchange multiplier
     _K_WINDOW_DEFAULT: float = 5.0  # initial: 5x faster than closed
@@ -323,8 +348,8 @@ class ThermalEKF:
     _K_WINDOW_MIN_DT: float = 0.25  # min dt (minutes) for learning
     _K_WINDOW_MIN_DELTA_T: float = 0.1  # min |T_outdoor - T_room| for learning
 
-    # Number of state dimensions
-    _N: int = 7
+    # Number of state dimensions (upstream's 7 plus the fork's alpha_v)
+    _N: int = 8
 
     def __init__(self, T_init: float = 20.0) -> None:
         self._x: list[float] = [
@@ -335,6 +360,7 @@ class ThermalEKF:
             self._DEFAULT_BETA_S,
             self._DEFAULT_BETA_O,
             self._DEFAULT_BETA_F,
+            self._DEFAULT_ALPHA_V,
         ]
         diag = self._p_init_diag()
         self._P: list[list[float]] = [[diag[i] if i == j else 0.0 for j in range(self._N)] for i in range(self._N)]
@@ -360,6 +386,7 @@ class ThermalEKF:
             cls._P_INIT_BETA_S,
             cls._P_INIT_BETA_O,
             cls._P_INIT_BETA_F,
+            cls._P_INIT_ALPHA_V,
         ]
 
     # -- public API ----------------------------------------------------------
@@ -569,6 +596,7 @@ class ThermalEKF:
         q_residual: float = 0.0,
         q_occupancy: float = 0.0,
         q_rebound: float | None = None,
+        T_vent: float | None = None,
     ) -> None:
         """Run one full EKF cycle: predict then update with measurement.
 
@@ -583,6 +611,7 @@ class ThermalEKF:
             q_occupancy: occupancy signal (0 = unoccupied, 1 = occupied).
             q_rebound: mean AC rebound charge over the interval (0-1); None
                 leaves beta_f out (no charge tracked).
+            T_vent: ventilation supply-air temperature [degC], None = no coupling.
         """
         if dt_minutes <= 0:
             return
@@ -612,6 +641,7 @@ class ThermalEKF:
             q_residual=q_residual,
             q_occupancy=q_occupancy,
             q_rebound=q_rebound,
+            T_vent=T_vent,
         )
 
         # --- Update step ---
@@ -648,6 +678,7 @@ class ThermalEKF:
             Q_solar=max(self._x[4], 0.0),
             Q_occupancy=max(self._x[5], 0.0),
             Q_fast=max(self._x[6], 0.0),
+            U_vent=max(self._x[7], 0.0),
         )
 
     # -- EKF internals -------------------------------------------------------
@@ -671,16 +702,33 @@ class ThermalEKF:
             return 0.0
         return q_rebound - (1.0 if mode == "cooling" else 0.0)
 
-    def _state_transition(self, T: float, alpha: float, u: float, T_out: float, dt_h: float) -> float:
-        """Compute predicted temperature using the analytical 1R1C solution.
+    def _state_transition(
+        self,
+        T: float,
+        alpha: float,
+        u: float,
+        T_out: float,
+        dt_h: float,
+        *,
+        alpha_v: float = 0.0,
+        T_vent: float | None = None,
+    ) -> float:
+        """Compute predicted temperature using the analytical solution.
 
-        Uses linearized (Euler) form when alpha is very small to avoid
-        division-by-zero in T_eq = T_out + u/alpha.
+        With a live ventilation supply temperature the two-conductance form
+        collapses to the single-node solution with alpha_eff = alpha + alpha_v
+        and a conductance-weighted reference temperature. Uses the linearized
+        (Euler) form when alpha_eff is very small.
         """
-        if abs(alpha) < self._ALPHA_SMALL:
-            return T + dt_h * (u - alpha * (T - T_out))
-        T_eq = T_out + u / alpha
-        decay = math.exp(-alpha * dt_h)
+        if T_vent is None or alpha_v <= 0.0:
+            alpha_eff, T_ref = alpha, T_out
+        else:
+            alpha_eff = alpha + alpha_v
+            T_ref = (alpha * T_out + alpha_v * T_vent) / alpha_eff
+        if abs(alpha_eff) < self._ALPHA_SMALL:
+            return T + dt_h * (u - alpha_eff * (T - T_ref))
+        T_eq = T_ref + u / alpha_eff
+        decay = math.exp(-alpha_eff * dt_h)
         return T_eq + (T - T_eq) * decay
 
     def _compute_jacobian(
@@ -697,8 +745,10 @@ class ThermalEKF:
         q_residual: float = 0.0,
         q_occupancy: float = 0.0,
         q_rebound: float | None = None,
+        alpha_v: float = 0.0,
+        T_vent: float | None = None,
     ) -> list[list[float]]:
-        """Compute the 7x7 Jacobian of the state transition.
+        """Compute the 8x8 Jacobian of the state transition.
 
         F[0][0] = dT_new/dT
         F[0][1] = dT_new/d_alpha
@@ -707,7 +757,8 @@ class ThermalEKF:
         F[0][4] = dT_new/d_beta_s  (nonzero only when q_solar > 0)
         F[0][5] = dT_new/d_beta_o  (nonzero only when q_occupancy > 0)
         F[0][6] = dT_new/d_beta_f  (nonzero while the rebound charge differs from the cooling drive)
-        F[1..6][1..6] = I           (parameters are random walk)
+        F[0][7] = dT_new/d_alpha_v (nonzero only with a live supply-air temp)
+        F[1..7][1..7] = I           (parameters are random walk)
         """
         N = self._N
         F: list[list[float]] = [[0.0] * N for _ in range(N)]
@@ -715,9 +766,18 @@ class ThermalEKF:
             F[i][i] = 1.0
         fast = self._fast_regressor(mode, q_rebound)
 
-        if abs(alpha) < self._ALPHA_SMALL:
+        vent_on = T_vent is not None and alpha_v > 0.0
+        # Narrowed for the vent terms below, which are only read when vent_on
+        T_v = T_vent if T_vent is not None else T_out
+        if vent_on:
+            alpha_eff = alpha + alpha_v
+            T_ref = (alpha * T_out + alpha_v * T_v) / alpha_eff
+        else:
+            alpha_eff, T_ref = alpha, T_out
+
+        if abs(alpha_eff) < self._ALPHA_SMALL:
             # Linearized (Euler) Jacobian
-            F[0][0] = 1.0 - alpha * dt_h
+            F[0][0] = 1.0 - alpha_eff * dt_h
             F[0][1] = -(T - T_out) * dt_h
             if mode == "heating":
                 F[0][2] = power_fraction * dt_h
@@ -730,23 +790,30 @@ class ThermalEKF:
             F[0][4] = q_solar * dt_h
             # Occupancy: dT_new/d_beta_o = q_occupancy * dt_h
             F[0][5] = q_occupancy * dt_h
+            if vent_on:
+                F[0][7] = -(T - T_v) * dt_h
         else:
-            decay = math.exp(-alpha * dt_h)
+            decay = math.exp(-alpha_eff * dt_h)
             one_minus_decay = 1.0 - decay
+            T_eq = T_ref + u / alpha_eff
             F[0][0] = decay
-            # dT_new/d_alpha (derived analytically, see plan for derivation)
-            F[0][1] = -(u / (alpha * alpha)) * one_minus_decay - (T - T_out - u / alpha) * dt_h * decay
+            # dT_new/d_alpha: through T_eq (both the reference weighting and
+            # u/alpha_eff) and through the decay rate. Reduces exactly to the
+            # single-conductance formula when the vent term is off.
+            F[0][1] = ((T_out - T_eq) / alpha_eff) * one_minus_decay - (T - T_eq) * dt_h * decay
             if mode == "heating":
-                F[0][2] = power_fraction * (1.0 / alpha) * one_minus_decay
+                F[0][2] = power_fraction * (1.0 / alpha_eff) * one_minus_decay
             elif mode == "cooling":
-                F[0][3] = -power_fraction * (1.0 / alpha) * one_minus_decay
+                F[0][3] = -power_fraction * (1.0 / alpha_eff) * one_minus_decay
             elif mode == "idle" and q_residual > 0:
-                F[0][2] = q_residual * (1.0 / alpha) * one_minus_decay
-            F[0][6] = fast * (1.0 / alpha) * one_minus_decay
-            # Solar: dT_new/d_beta_s = q_solar * (1/alpha) * (1 - exp(-alpha*dt))
-            F[0][4] = q_solar * (1.0 / alpha) * one_minus_decay
-            # Occupancy: dT_new/d_beta_o = q_occupancy * (1/alpha) * (1 - exp(-alpha*dt))
-            F[0][5] = q_occupancy * (1.0 / alpha) * one_minus_decay
+                F[0][2] = q_residual * (1.0 / alpha_eff) * one_minus_decay
+            F[0][6] = fast * (1.0 / alpha_eff) * one_minus_decay
+            # Solar: dT_new/d_beta_s = q_solar * (1/alpha_eff) * (1 - decay)
+            F[0][4] = q_solar * (1.0 / alpha_eff) * one_minus_decay
+            # Occupancy: dT_new/d_beta_o = q_occupancy * (1/alpha_eff) * (1 - decay)
+            F[0][5] = q_occupancy * (1.0 / alpha_eff) * one_minus_decay
+            if vent_on:
+                F[0][7] = ((T_v - T_eq) / alpha_eff) * one_minus_decay - (T - T_eq) * dt_h * decay
         return F
 
     def _predict_step(
@@ -760,9 +827,10 @@ class ThermalEKF:
         q_residual: float = 0.0,
         q_occupancy: float = 0.0,
         q_rebound: float | None = None,
+        T_vent: float | None = None,
     ) -> None:
         """EKF predict: propagate state and covariance forward."""
-        T, alpha, beta_h, beta_c, beta_s, beta_o, beta_f = self._x
+        T, alpha, beta_h, beta_c, beta_s, beta_o, beta_f, alpha_v = self._x
         u_hvac = self._mode_to_u(mode) * power_fraction
         # Residual heat: during idle, thermal mass continues releasing stored energy
         u_residual = beta_h * q_residual if mode == "idle" and q_residual > 0 else 0.0
@@ -773,8 +841,8 @@ class ThermalEKF:
         u = u_hvac + beta_s * q_solar + beta_o * q_occupancy + u_residual + u_rebound
 
         # State prediction (analytical or linearized)
-        T_new = self._state_transition(T, alpha, u, T_outdoor, dt_h)
-        self._x = [T_new, alpha, beta_h, beta_c, beta_s, beta_o, beta_f]
+        T_new = self._state_transition(T, alpha, u, T_outdoor, dt_h, alpha_v=alpha_v, T_vent=T_vent)
+        self._x = [T_new, alpha, beta_h, beta_c, beta_s, beta_o, beta_f, alpha_v]
 
         # Jacobian at current state
         F = self._compute_jacobian(
@@ -789,6 +857,8 @@ class ThermalEKF:
             q_residual=q_residual,
             q_occupancy=q_occupancy,
             q_rebound=q_rebound,
+            alpha_v=alpha_v,
+            T_vent=T_vent,
         )
         self._excited = [True, True] + [F[0][i] != 0.0 for i in range(2, self._N)]
         # Solar gain is learned from sunny steps without heating only: while
@@ -816,6 +886,8 @@ class ThermalEKF:
             self._Q_BETA_S if solar_learnable else 0.0,
             self._Q_BETA_O if q_occupancy > 0 else 0.0,
             self._Q_BETA_F if fast != 0.0 else 0.0,
+            # Ventilation coupling learns only with a live supply-air reading
+            self._Q_ALPHA_V if T_vent is not None else 0.0,
         ]
 
         # FP = F @ P
@@ -890,6 +962,7 @@ class ThermalEKF:
         self._x[4] = max(self._BETA_S_MIN, min(self._BETA_S_MAX, self._x[4]))
         self._x[5] = max(self._BETA_O_MIN, min(self._BETA_O_MAX, self._x[5]))
         self._x[6] = max(self._BETA_F_MIN, min(self._BETA_F_MAX, self._x[6]))
+        self._x[7] = max(self._ALPHA_V_MIN, min(self._ALPHA_V_MAX, self._x[7]))
 
     def _enforce_psd(self) -> None:
         """Enforce symmetry and positive semi-definiteness of P."""
@@ -917,6 +990,9 @@ class ThermalEKF:
             "x": list(self._x[:6]),
             "P": [list(row[:6]) for row in self._P[:6]],
             "beta_f": {"x": self._x[6], "P": list(self._P[6])},
+            # The fork's own states travel separately too, so upstream's layout and
+            # loader stay untouched (an upstream build simply ignores this key).
+            "fork": {"alpha_v": {"x": self._x[7], "P": list(self._P[7])}},
             "n_updates": self._n_updates,
             "n_heating": self._n_heating,
             "n_cooling": self._n_cooling,
@@ -949,10 +1025,17 @@ class ThermalEKF:
     def from_dict(cls, data: dict) -> ThermalEKF:
         """Restore EKF from persisted data."""
         ekf = cls()
+        ekf_version_raw = data.get("ekf_version", 0)
+        if isinstance(ekf_version_raw, int) and ekf_version_raw > 6 and "fork" not in data:
+            # Earlier fork builds stored their own full-length state vectors
+            # (ekf_version 7-10, disturbance state at index 6). That layout is not
+            # carried over: the room starts learning afresh.
+            _LOGGER.info("ThermalEKF: discarding a model saved by an earlier fork build (v%d)", ekf_version_raw)
+            return ekf
 
         # Older layouts lack trailing parameters (5D: beta_o, 6D: beta_f); their
         # defaults are appended, so learned values are kept.
-        defaults = [cls._DEFAULT_BETA_O, cls._DEFAULT_BETA_F]
+        defaults = [cls._DEFAULT_BETA_O, cls._DEFAULT_BETA_F, cls._DEFAULT_ALPHA_V]
         p_init = cls._p_init_diag()
         x = data.get("x")
         if isinstance(x, list) and 5 <= len(x) <= cls._N:
@@ -985,6 +1068,18 @@ class ThermalEKF:
         ekf._initialized = data.get("initialized", ekf._n_updates > 0)
         ekf._k_window = data.get("k_window", cls._K_WINDOW_DEFAULT)
         ekf._k_window_n = data.get("k_window_n", 0)
+        fork = data.get("fork")
+        vent = fork.get("alpha_v") if isinstance(fork, dict) else None
+        if (
+            isinstance(vent, dict)
+            and isinstance(vent.get("x"), (int, float))
+            and isinstance(vent.get("P"), list)
+            and len(vent["P"]) == cls._N
+        ):
+            ekf._x[7] = float(vent["x"])
+            for j, value in enumerate(vent["P"]):
+                ekf._P[7][j] = float(value)
+                ekf._P[j][7] = float(value)
         # Recovery migrations for models with alpha pegged at the upper bound.
         # Such models cannot escape on their own: 4-sigma anomaly detection
         # soft-rejects the large innovations and cross-covariance pulls alpha
@@ -1020,6 +1115,7 @@ class ThermalEKF:
         ekf._x[4] = cls._DEFAULT_BETA_S
         ekf._x[5] = cls._DEFAULT_BETA_O
         ekf._x[6] = cls._DEFAULT_BETA_F
+        ekf._x[7] = cls._DEFAULT_ALPHA_V
         p_init_diag = cls._p_init_diag()
         for i in range(cls._N):
             for j in range(cls._N):
@@ -1058,6 +1154,14 @@ class RoomModelManager:
 
     def __init__(self) -> None:
         self._estimators: dict[str, ThermalEKF] = {}
+        # Whole-house ventilation supply-air temperature [degC], refreshed by
+        # the coordinator each cycle; None when no sensor is wired or it is
+        # unavailable (the vent coupling then freezes instead of corrupting).
+        self._vent_temp: float | None = None
+
+    def set_vent_temp(self, value: float | None) -> None:
+        """Set the current ventilation supply-air temperature (global)."""
+        self._vent_temp = value
 
     def get_room_ids(self) -> list[str]:
         """Return list of room IDs with learned models."""
@@ -1093,6 +1197,7 @@ class RoomModelManager:
             T_outdoor,
             mode,
             dt_minutes,
+            T_vent=self._vent_temp,
             power_fraction=power_fraction,
             q_solar=q_solar,
             q_residual=q_residual,
@@ -1112,8 +1217,14 @@ class RoomModelManager:
         return self.get_estimator(area_id).get_model().predict(T_room, T_outdoor, Q_active, dt_minutes)
 
     def get_model(self, area_id: str) -> RCModel:
-        """Return the learned RCModel for *area_id* (C=1 normalization)."""
-        return self.get_estimator(area_id).get_model()
+        """Return the learned RCModel for *area_id* (C=1 normalization).
+
+        Stamped with the current ventilation supply-air temperature, so every
+        consumer's predictions include the vent coupling automatically.
+        """
+        model = self.get_estimator(area_id).get_model()
+        model.vent_temp = self._vent_temp
+        return model
 
     def get_confidence(self, area_id: str) -> float:
         """Return model confidence for *area_id* (0.0 if never seen)."""
