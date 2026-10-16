@@ -77,13 +77,15 @@ class HeadOffsetTracker:
             return 0.0
         return round(entry[0], 2)
 
-    def snapshot(self, entity_id: str) -> dict[str, float | None]:
-        """Learned offsets for diagnostics (None while not yet usable)."""
-        out: dict[str, float | None] = {}
-        for intent in _STATES:
-            entry = self._offsets.get(entity_id, {}).get(intent)
-            out[intent] = round(entry[0], 2) if entry is not None and entry[1] >= HEAD_OFFSET_MIN_SAMPLES else None
-        return out
+    def prune(self, known_eids: set[str]) -> None:
+        """Drop offsets of devices that are no longer configured anywhere."""
+        stale = [eid for eid in self._offsets if eid not in known_eids]
+        for eid in stale:
+            del self._offsets[eid]
+        for eid in [eid for eid in self._state_since if eid not in known_eids]:
+            del self._state_since[eid]
+        if stale:
+            self.dirty = True
 
     def get_state(self) -> dict:
         """Persistable state (the settle timers are not kept across restarts)."""

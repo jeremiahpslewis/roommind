@@ -430,6 +430,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             await store.async_save_settings({"valve_last_actuation": self._valve_manager.get_actuation_data()})
             self._valve_manager.actuation_dirty = False
 
+        self._head_offsets.prune(set(build_rooms_devices_map(rooms)))
         # Persist learned AC sensor offsets (piggyback on thermal save cycle)
         if self._head_offsets.dirty and self._thermal_save_count == 0:
             await store.async_save_settings({"ac_head_offsets": self._head_offsets.get_state()})

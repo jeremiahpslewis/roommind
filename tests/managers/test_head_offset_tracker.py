@@ -63,7 +63,6 @@ def test_offset_stays_zero_until_enough_readings():
     tracker = HeadOffsetTracker()
     feed(tracker, "cooling", 25.0, 24.0, n=HEAD_OFFSET_MIN_SAMPLES - 1)
     assert tracker.offset(AC, "cool") == 0.0
-    assert tracker.snapshot(AC)["cool"] is None
 
 
 @pytest.mark.parametrize("action", ["fan", "drying", None])
@@ -111,3 +110,14 @@ def test_state_round_trips_and_skips_malformed_entries():
     assert "climate.broken" not in restored.get_state()
     assert "climate.junk" not in restored.get_state()
     assert not restored.dirty
+
+
+def test_prune_drops_removed_devices():
+    tracker = HeadOffsetTracker()
+    tracker.load_state({AC: {"cool": [1.0, 50]}, "climate.gone": {"idle": [2.0, 50]}})
+    tracker.prune({AC})
+    assert tracker.dirty
+    assert set(tracker.get_state()) == {AC}
+    tracker.dirty = False
+    tracker.prune({AC})
+    assert not tracker.dirty
