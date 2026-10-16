@@ -102,16 +102,16 @@ async def test_a_unit_on_its_setback_feeds_the_idle_offset(hass, mock_config_ent
 @pytest.mark.asyncio
 async def test_learned_offsets_are_loaded_and_saved(hass, mock_config_entry):
     room = _ac_room()
-    saved = {AC: {"cool": [1.2, 40]}}
+    saved = {AC: {"cool": [1.4, 40]}}
     store, coordinator = _setup(hass, mock_config_entry, room, _states(), settings={"ac_head_offsets": saved})
     await coordinator._async_update_data()
-    assert coordinator._head_offsets.offset(AC, "cool") == pytest.approx(1.2)
+    assert coordinator._head_offsets.offset(AC, "cool") == pytest.approx(1.5)
 
     coordinator._head_offsets.dirty = True
     coordinator._thermal_save_count = coordinator_module.THERMAL_SAVE_CYCLES - 1
     await coordinator._async_update_data()
     calls = [c.args[0] for c in store.async_save_settings.call_args_list if "ac_head_offsets" in c.args[0]]
-    assert calls and calls[-1]["ac_head_offsets"][AC]["cool"][0] == pytest.approx(1.2)
+    assert calls and calls[-1]["ac_head_offsets"][AC]["cool"][0] == pytest.approx(1.4)
     assert coordinator._head_offsets.dirty is False
 
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from ..const import (
     HEAD_OFFSET_ALPHA,
+    HEAD_OFFSET_GRID_K,
+    HEAD_OFFSET_HYSTERESIS_K,
     HEAD_OFFSET_MAX_K,
     HEAD_OFFSET_MIN_SAMPLES,
     HEAD_OFFSET_SETTLE_S,
@@ -38,6 +40,8 @@ class HeadOffsetTracker:
         self._offsets: dict[str, dict[str, list[float]]] = {}
         # {entity_id: (state, since)}
         self._state_since: dict[str, tuple[str, float]] = {}
+        # {(entity_id, intent): offset on the HEAD_OFFSET_GRID_K grid handed out last}
+        self._applied: dict[tuple[str, str], float] = {}
         self.dirty = False
 
     def observe(
@@ -75,7 +79,14 @@ class HeadOffsetTracker:
         entry = self._offsets.get(entity_id, {}).get(intent)
         if entry is None or entry[1] < HEAD_OFFSET_MIN_SAMPLES:
             return 0.0
-        return round(entry[0], 2)
+        # On a grid with hysteresis: hundredths of EMA noise moved the setpoint of a
+        # whole-degree device across a rounding edge (a 1 K setback jump from 0.02 K)
+        key = (entity_id, intent)
+        applied = self._applied.get(key)
+        if applied is None or abs(entry[0] - applied) > HEAD_OFFSET_HYSTERESIS_K:
+            applied = round(entry[0] / HEAD_OFFSET_GRID_K) * HEAD_OFFSET_GRID_K + 0.0
+            self._applied[key] = applied
+        return applied
 
     def prune(self, known_eids: set[str]) -> None:
         """Drop offsets of devices that are no longer configured anywhere."""
@@ -84,6 +95,8 @@ class HeadOffsetTracker:
             del self._offsets[eid]
         for eid in [eid for eid in self._state_since if eid not in known_eids]:
             del self._state_since[eid]
+        for key in [key for key in self._applied if key[0] not in known_eids]:
+            del self._applied[key]
         if stale:
             self.dirty = True
 
@@ -94,6 +107,7 @@ class HeadOffsetTracker:
     def load_state(self, data: dict) -> None:
         """Restore persisted offsets, skipping malformed entries."""
         self._offsets = {}
+        self._applied = {}
         for eid, dirs in (data or {}).items():
             if not isinstance(dirs, dict):
                 continue

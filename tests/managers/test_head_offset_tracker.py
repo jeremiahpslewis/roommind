@@ -121,3 +121,22 @@ def test_prune_drops_removed_devices():
     tracker.dirty = False
     tracker.prune({AC})
     assert not tracker.dirty
+
+
+def test_applied_offset_is_on_a_half_degree_grid_with_hysteresis():
+    """EMA noise must not move setpoints: a whole-degree device flipped its setback by 1 K on 0.02 K."""
+    tracker = HeadOffsetTracker()
+
+    def applied(value):
+        tracker._offsets[AC]["idle"][0] = value
+        return tracker.offset(AC, "idle")
+
+    tracker.load_state({AC: {"idle": [0.02, 50]}})
+    assert tracker.offset(AC, "idle") == 0.0
+    # Noise around a grid edge keeps the applied value
+    assert [applied(v) for v in (-0.1, 0.13, 0.3, 0.2, -0.3)] == [0.0] * 5
+    # A real shift moves it to the nearest grid value, and it stays there on the way back
+    assert applied(0.4) == 0.5
+    assert applied(0.2) == 0.5
+    assert applied(1.06) == 1.0
+    assert applied(1.93) == 2.0
