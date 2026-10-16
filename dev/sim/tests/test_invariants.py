@@ -10,6 +10,7 @@ from roommind_sim.analysis.invariants import (
     min_run_hold_keeps_setpoint,
     min_run_respected,
     no_cooling_below_outdoor_min,
+    no_full_cooling_at_target,
     target_never_empty,
     window_open_pauses,
 )
@@ -209,3 +210,20 @@ def test_setpoint_drop_outside_the_hold_is_fine():
     for o in run.observer:
         o["rooms"]["r"]["compressor_protection_active"] = False
     assert min_run_hold_keeps_setpoint(run) == []
+
+
+def _cooling_observer(t: float, temp: float) -> dict:
+    return {"t": t, "rooms": {"r": {"mpc_active": True, "current_temp": temp, "cool_target": 24.5}}}
+
+
+def test_lowest_cool_setpoint_at_the_target_450():
+    probe = _run([False] * 10)
+    t0 = probe.scenario.start
+    cool = {"temperature": 16.0, "hvac_mode": "cool"}
+    observer = [_cooling_observer(t0 + 30, 24.4), _cooling_observer(t0 + 330, 24.7)]
+    at_target = _run([False] * 10, commands=[(10, "set_temperature", cool)], observer=observer)
+    assert no_full_cooling_at_target(at_target)
+    above = _run([False] * 10, commands=[(310, "set_temperature", cool)], observer=observer)
+    assert not no_full_cooling_at_target(above)
+    gentle = _run([False] * 10, commands=[(10, "set_temperature", {**cool, "temperature": 23.3})], observer=observer)
+    assert not no_full_cooling_at_target(gentle)

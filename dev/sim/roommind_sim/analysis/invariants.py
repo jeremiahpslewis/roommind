@@ -280,6 +280,35 @@ def setpoints_within_device_range(run: RunData) -> list[Violation]:
     return out
 
 
+def no_full_cooling_at_target(run: RunData, tolerance_k: float = 0.0, after_s: float = 35.0) -> list[Violation]:
+    """No AC gets its lowest setpoint while the room is at or below its cool target (#450).
+
+    Only MPC rooms. With efficiency weights the plan's no-demand fallback did this inside
+    a cooling min run. Not a default: with comfort weights a closed-form fraction that
+    saturates on a badly learned model sends it too. The room state is read from the
+    observer record right after the command (same cycle).
+    """
+    floors = {
+        d.entity_id: (d.room, float(d.capabilities["min_temp"]))
+        for d in run.scenario.all_devices()
+        if "min_temp" in d.capabilities
+    }
+    out: list[Violation] = []
+    for c in run.commands:
+        dev = floors.get(c["entity_id"])
+        sp = c["data"].get("temperature")
+        if dev is None or sp is None or c["service"] != "set_temperature" or c["data"].get("hvac_mode") != "cool":
+            continue
+        area, floor = dev
+        room = ((run.observer_at(c["t"] + after_s) or {}).get("rooms") or {}).get(area) or {}
+        temp, cool = room.get("current_temp"), room.get("cool_target")
+        if not room.get("mpc_active") or temp is None or cool is None:
+            continue
+        if float(sp) <= floor + 0.05 and temp <= cool + tolerance_k:
+            out.append(Violation(c["t"], f"{c['entity_id']} set to {sp} with {area} at {temp} (cool target {cool})"))
+    return out
+
+
 def no_rejected_commands(run: RunData) -> list[Violation]:
     return [
         Violation(c["t"], f"{c['entity_id']} {c['service']} {c['data']} -> {c['result']}")
@@ -371,6 +400,7 @@ INVARIANTS: dict[str, Callable[..., list[Violation]]] = {
         target_never_empty,
         no_cooling_below_outdoor_min,
         setpoints_within_device_range,
+        no_full_cooling_at_target,
         no_rejected_commands,
         window_open_pauses,
         no_heat_and_cool_same_group,

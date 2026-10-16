@@ -1,0 +1,20 @@
+name: ac-efficiency-near-target
+extends: ekf-summer-ac
+description: >
+  The 3.5 kW AC of ekf-summer-ac with the priority slider at efficiency (comfort_weight 20).
+  The energy bias then removes the small cooling demand of a room just past its target.
+  The plan still chose cooling but had no power fraction for it, fell back to full power,
+  and the AC got its lowest setpoint (16 °C) every time the room touched the target:
+  efficiency weights cooled harder than comfort weights (#450).
+refs: [450]
+tags: [ac, control]
+duration: 3d
+roommind:
+  settings:
+    comfort_weight: 20
+expect:
+  - {invariant: no_rejected_commands}
+  - {invariant: min_run_respected}
+  # seeds 1-3: 10, 11, 8 sends of 16 °C with the room at or below 24.5 °C before the fix, 0 after
+  - {invariant: no_full_cooling_at_target, label: no lowest AC setpoint once the room is at its target}
+  - {metric: comfort.overshoot_kh, room: wohnzimmer, max: 9, label: cooling keeps the room near its target}
