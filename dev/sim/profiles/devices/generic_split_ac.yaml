@@ -17,6 +17,7 @@ params:
   restart_k: 0.5               # back on this far on the demand side
   sensor_offset_heat_k: 1.5    # return-air sensor near the ceiling reads warmer while heating
   sensor_offset_cool_k: 0.0
+  sensor_offset_idle_k: 0.0    # compressor stopped; a unit under the ceiling reads the warm layer once no air moves
   sensor_offset_tau_s: 120     # offset builds up / fades over minutes, not at the compressor edge
   internal_min_run_s: 180
   min_off_s: 180               # restart delay after a stop (anti-short-cycle timer, 3 min in service manuals)

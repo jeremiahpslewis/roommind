@@ -134,7 +134,9 @@ class SplitAc(SimDevice):
 
     The return-air offset builds up and fades with ``sensor_offset_tau_s``: warm air
     collects at the intake while the compressor runs and is still there right after
-    it stops.
+    it stops. With the compressor stopped it settles at ``sensor_offset_idle_k``
+    (default 0): a wall unit under the ceiling reads the warm layer once no air
+    moves past it.
 
     ``capacity_tau_s`` lags the delivered output behind the compressor (inverter soft
     start, refrigerant and coil pull-down; the coil also keeps working briefly after a
@@ -160,7 +162,7 @@ class SplitAc(SimDevice):
 
     def _update_sensor_offset(self, dt: float) -> None:
         p = self.spec.params
-        goal = 0.0
+        goal = float(p.get("sensor_offset_idle_k", 0.0))
         if self.running_mode == "heat":
             goal = float(p.get("sensor_offset_heat_k", 1.5))
         elif self.running_mode == "cool":

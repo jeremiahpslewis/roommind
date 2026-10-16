@@ -120,6 +120,17 @@ def test_split_ac_return_air_offset_builds_up_and_fades():
     assert 0.5 < d.sensor_offset_k < 1.5
 
 
+def test_split_ac_idle_offset_reads_the_warm_layer_once_stopped():
+    w, d = _one("generic_split_ac", temp=26.0, sensor_offset_cool_k=1.0, sensor_offset_idle_k=2.0)
+    run(w, 900)
+    assert d.running_mode is None
+    assert d.sensor_offset_k == pytest.approx(2.0, abs=0.05)
+    d.call("set_temperature", {"temperature": 20, "hvac_mode": "cool"}, w.now)
+    run(w, 900)
+    assert d.running_mode == "cool"
+    assert d.sensor_offset_k == pytest.approx(1.0, abs=0.05)
+
+
 def test_split_ac_cooling_dehumidifies():
     w, d = _one("generic_split_ac", temp=28.0)
     w.zones["r"].set_initial(28.0, 70.0)
