@@ -1,0 +1,25 @@
+name: mpc-cools-room-above-30
+extends: covers-solar-south
+description: >
+  The small AC of covers-solar-south without shading, and climate control switched off
+  for a hot afternoon after three days of learning. The room heats well past 30 °C.
+  When control comes back, the plan clamped every prediction to 30 °C: the AC could not
+  bring the room below 30 within the lookahead, so idle and cooling cost the same and
+  the unit stayed off with MPC active until the evening (#462).
+refs: [462]
+tags: [ac, solar]
+duration: 4d
+roommind:
+  rooms:
+    wohnzimmer: {covers_auto_enabled: false}
+timeline:
+  # climate control off leaves the unit running on its own, so it is switched off by hand
+  - {at: "+3d09h", do: roommind.ws, type: roommind/settings/save, climate_control_active: false}
+  - {at: "+3d09h01m", do: device.manual, entity_id: climate.wz_ac, hvac_mode: "off"}
+  - {at: "+3d15h", do: roommind.ws, type: roommind/settings/save, climate_control_active: true}
+expect:
+  - {invariant: no_rejected_commands}
+  - {check: "room.wohnzimmer.current_temp > 30", at: "+3d15h", label: room heated past 30 °C while control was off}
+  - {check: "room.wohnzimmer.mpc_active", at: "+3d15h10m", label: MPC is in charge}
+  - {check: "room.wohnzimmer.mode == 'cooling'", at: "+3d15h10m", label: cools the hot room}
+  - {check: "room.wohnzimmer.mode == 'cooling' and dev('climate.wz_ac').mode == 'cool'", at: "+3d16h", label: the unit still cools an hour later}
