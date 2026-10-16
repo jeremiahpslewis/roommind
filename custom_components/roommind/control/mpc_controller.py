@@ -1373,14 +1373,19 @@ class MPCController:
         run_system = self._resolve_run_system(current_temp, targets.heat)
         min_run = get_min_run_blocks(run_system, PLAN_DT_MINUTES)
 
+        # Without an outdoor reading or forecast the horizon is DEFAULT_OUTDOOR_TEMP_FALLBACK,
+        # a placeholder below the cooling minimum. Gating on it would bar the room from
+        # cooling until a reading comes back; _get_can_heat_cool() does not gate then either.
+        outdoor_known = self.outdoor_temp is not None or bool(self.outdoor_forecast)
+
         optimizer = MPCOptimizer(
             model=model,
             can_heat=can_heat,
             can_cool=can_cool,
             w_comfort=self._w_comfort,
             w_energy=self._w_energy,
-            outdoor_cooling_min=self.outdoor_cooling_min,
-            outdoor_heating_max=self.outdoor_heating_max,
+            outdoor_cooling_min=self.outdoor_cooling_min if outdoor_known else float("-inf"),
+            outdoor_heating_max=self.outdoor_heating_max if outdoor_known else float("inf"),
             min_run_blocks=min_run,
             cool_min_run_blocks=get_min_run_blocks("", PLAN_DT_MINUTES),
             override_active=is_override_active(self.room_config),

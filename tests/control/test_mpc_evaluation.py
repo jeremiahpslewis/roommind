@@ -1146,3 +1146,62 @@ def test_simulate_plan_replays_directed_actions():
     heated = optimizer.simulate_plan(heat_plan, 18.0, [10.0] * 4, 5)
     idled = optimizer.simulate_plan(idle_plan, 18.0, [10.0] * 4, 5)
     assert heated[-1] > idled[-1]
+
+
+# --- an unknown outdoor temperature must not gate cooling ----------------------
+
+
+def _cool_only_ctrl(hass, outdoor_temp, outdoor_forecast=None):
+    room = make_room(thermostats=[], acs=["climate.ac"], climate_mode="cool_only")
+    model_mgr = RoomModelManager()
+    model_mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
+    model_mgr.get_prediction_std = MagicMock(return_value=0.1)
+    model_mgr.get_mode_counts = MagicMock(return_value=(100, 0, 40))
+    return MPCController(
+        hass,
+        room,
+        model_manager=model_mgr,
+        outdoor_temp=outdoor_temp,
+        outdoor_forecast=outdoor_forecast,
+        settings={},
+        has_external_sensor=True,
+    )
+
+
+def _ac_hass():
+    hass = build_hass()
+    ac = MagicMock()
+    ac.state = "cool"
+    ac.attributes = {"hvac_modes": ["cool", "off"], "temperature": 22.0, "min_temp": 16.0, "max_temp": 30.0}
+    hass.states.get = MagicMock(return_value=ac)
+    return hass
+
+
+@pytest.mark.asyncio
+async def test_unknown_outdoor_temp_does_not_gate_cooling():
+    """No outdoor reading and no forecast: the 10 °C placeholder must not block cooling.
+
+    The deviation is large so the verdict isolates the gate: with the cold placeholder
+    the model predicts a drift down, and for a small deviation waiting for it is a plan.
+    """
+    ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=None)
+    mode, pf = await ctrl.async_evaluate(current_temp=24.0, targets=TargetTemps(heat=None, cool=22.0))
+    assert mode == MODE_COOLING
+    assert pf > 0.0
+
+
+@pytest.mark.asyncio
+async def test_known_cold_outdoor_temp_still_gates_cooling():
+    """A real reading below the cooling minimum still blocks cooling."""
+    ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=10.0)
+    mode, _ = await ctrl.async_evaluate(current_temp=24.0, targets=TargetTemps(heat=None, cool=22.0))
+    assert mode == MODE_IDLE
+
+
+@pytest.mark.asyncio
+async def test_cold_forecast_still_gates_cooling_without_a_reading():
+    """A forecast is a real estimate: without a current reading it still gates."""
+    forecast = [{"temperature": 10.0}] * 24
+    ctrl = _cool_only_ctrl(_ac_hass(), outdoor_temp=None, outdoor_forecast=forecast)
+    mode, _ = await ctrl.async_evaluate(current_temp=24.0, targets=TargetTemps(heat=None, cool=22.0))
+    assert mode == MODE_IDLE
