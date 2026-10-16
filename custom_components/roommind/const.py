@@ -93,6 +93,11 @@ PROPORTIONAL_DEADBAND_C = 0.5  # Minimum proportional setpoint change (°C) to r
 PROPORTIONAL_DEADBAND_NEAR_TARGET_C = 0.2  # Finer proportional deadband (°C) within 1°C of target
 PROPORTIONAL_SETPOINT_DWELL_SECONDS = 300  # Minimum time a proportional setpoint stays on the device before a recomputed one replaces it (one MPC block, #317)
 BOOST_CAP_FALLBACK_STEP = 0.5  # Distance kept below a device's max_temp for proportional heating setpoints when it reports no target_temp_step (#396)
+# AC sensor offset (device reading - room sensor while the compressor runs), see HeadOffsetTracker
+HEAD_OFFSET_SETTLE_S = 240  # Running time before readings count: the offset builds up with the airflow after a start
+HEAD_OFFSET_ALPHA = 0.05  # EMA weight per reading (one per 30 s cycle: ~10 min of running to follow a change)
+HEAD_OFFSET_MIN_SAMPLES = 10  # Readings before the offset is applied to setpoints
+HEAD_OFFSET_MAX_K = 4.0  # Larger differences are a misplaced or broken sensor, not a bias to correct
 # Comfort-weighted cost (°C² equivalent) of starting a run, for slow heating systems (UFH) only.
 # Fast systems get a start hysteresis in the controller; UFH keeps the optimizer's decisions
 # and toggled heat/idle every 30 s cycle at the target without it (#429).

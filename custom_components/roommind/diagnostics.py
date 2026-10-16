@@ -420,6 +420,8 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
         "compressor_groups": compressor,
         "valve_protection": valve,
         "coil_dry_state": (coordinator._coil_dry_manager.get_state() if coordinator is not None else {}),
+        # Live AC sensor offsets {entity: {"heat"|"cool": [offset K, readings]}}; settings hold the last save
+        "ac_head_offsets": (coordinator._head_offsets.get_state() if coordinator is not None else {}),
         "presence": {
             "enabled": settings.get("presence_enabled", False),
             "persons": settings.get("presence_persons", []),

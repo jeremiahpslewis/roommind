@@ -69,6 +69,7 @@ from .managers.compressor_group_manager import (
 )
 from .managers.cover_orchestrator import CoverOrchestrator, CoverResult
 from .managers.ekf_training_manager import EkfTrainingManager
+from .managers.head_offset_tracker import HeadOffsetTracker
 from .managers.heat_source_orchestrator import HeatSourcePlan, evaluate_heat_sources
 from .managers.mold_manager import MoldManager
 from .managers.residual_heat_tracker import AcReboundTracker, ResidualHeatTracker
@@ -186,6 +187,8 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         self._residual_tracker = ResidualHeatTracker()
         # AC rebound charge (air pulled below the building mass while cooling)
         self._rebound_tracker = AcReboundTracker()
+        # Offset of each AC's own sensor from the room sensor while it runs (setpoints in the device's frame)
+        self._head_offsets = HeadOffsetTracker()
         # EKF training accumulation
         self._ekf_training = EkfTrainingManager(self._model_manager)
         # Cover/blind automatic control
@@ -277,6 +280,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 self._cover_orchestrator._model_manager = self._model_manager
             self._valve_manager.load_actuation_data(settings.get("valve_last_actuation", {}))
             self._coil_dry_manager.load_state(settings.get("coil_dry_state", {}))
+            self._head_offsets.load_state(settings.get("ac_head_offsets", {}))
             self._model_loaded = True
 
         # Initialize history store (once)
@@ -423,6 +427,11 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         if self._valve_manager.actuation_dirty and self._thermal_save_count == 0:
             await store.async_save_settings({"valve_last_actuation": self._valve_manager.get_actuation_data()})
             self._valve_manager.actuation_dirty = False
+
+        # Persist learned AC sensor offsets (piggyback on thermal save cycle)
+        if self._head_offsets.dirty and self._thermal_save_count == 0:
+            await store.async_save_settings({"ac_head_offsets": self._head_offsets.get_state()})
+            self._head_offsets.dirty = False
 
         # Coil dry: drop state for devices no longer configured anywhere
         self._coil_dry_manager.prune(set(build_rooms_devices_map(rooms)))
@@ -664,6 +673,9 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 "schedule_temp_warnings": [],
             }
 
+        if has_external_sensor:
+            self._observe_head_offsets(room, current_temp_raw)
+
         # --- Mold risk calculation ---
         (
             mold_risk_level,
@@ -796,6 +808,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             q_occupancy=q_occupancy,
             q_rebound=q_rebound,
             previous_heat_sources=self._heat_source_states.get(area_id, "none"),
+            head_offsets=self._head_offsets,
         )
         mode, power_fraction = await controller.async_evaluate(current_temp, targets)
 
@@ -1454,6 +1467,14 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         # One shown value only when every driven device agrees on the offset
         _relevant_offsets = {_direct_offsets.get(eid, 0.0) for eid in _mode_relevant_eids}
         _display_offset = _relevant_offsets.pop() if _all_direct and len(_relevant_offsets) == 1 else 0.0
+        # Same rule for the learned AC sensor offset: shown only when the room's proportional ACs agree
+        _head_shift = 0.0
+        if has_external_sensor and mode in (MODE_HEATING, MODE_COOLING):
+            _intent = "heat" if mode == MODE_HEATING else "cool"
+            _shifts = {
+                self._head_offsets.offset(eid, _intent) for eid in get_ac_eids(_room_devices) if eid not in _direct_eids
+            }
+            _head_shift = _shifts.pop() if len(_shifts) == 1 else 0.0
 
         return {
             "area_id": area_id,
@@ -1491,6 +1512,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 all_direct=_all_direct,
                 direct_offset=_display_offset,
                 direct_target=direct_target,
+                head_offset=_head_shift,
             ),
             "window_open": window_open,
             **build_override_live(
@@ -1570,8 +1592,13 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         all_direct: bool = False,
         direct_offset: float = 0.0,
         direct_target: float | None = None,
+        head_offset: float = 0.0,
     ) -> float | None:
-        """Compute the device setpoint for UI display (Full Control only)."""
+        """Compute the device setpoint for UI display (Full Control only).
+
+        ``head_offset`` is the learned AC sensor offset; it moves an AC-only room's value
+        into the device's frame, as async_apply() sends it.
+        """
         if not has_external_sensor or current_temp is None or target_temp is None:
             return None
         if all_direct:
@@ -1585,6 +1612,8 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             sp = round(current_temp + power_fraction * (boost - current_temp), 1)
             sp = max(target_temp, sp)
             sp = min(boost, sp)
+            if not has_thermostats:
+                sp = min(boost, round(sp + head_offset, 1))
             return sp
 
         if mode == MODE_COOLING and has_acs:
@@ -1592,9 +1621,26 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             sp = round(current_temp - power_fraction * (current_temp - boost), 1)
             sp = max(boost, sp)
             sp = min(target_temp, sp)
-            return sp
+            return max(boost, round(sp + head_offset, 1))
 
         return None
+
+    def _observe_head_offsets(self, room: dict, room_temp: float | None) -> None:
+        """Feed each AC's own reading against a fresh room reading into the offset tracker."""
+        now = time.time()
+        for eid in get_ac_eids(room.get("devices", [])):
+            state = self.hass.states.get(eid)
+            if state is None or state.state in ("unavailable", "unknown"):
+                self._head_offsets.observe(eid, None, None, None, now)
+                continue
+            raw = state.attributes.get("current_temperature")
+            try:
+                device_temp = ha_temp_to_celsius(self.hass, float(raw)) if raw is not None else None
+            except (TypeError, ValueError):
+                device_temp = None
+            # A device that is off is idle, whether or not its integration still reports an hvac_action
+            action = "off" if state.state == "off" else state.attributes.get("hvac_action")
+            self._head_offsets.observe(eid, action, device_temp, room_temp, now)
 
     def _read_device_temp(self, room: dict) -> float | None:
         """Read current_temperature from the first thermostat or AC entity."""

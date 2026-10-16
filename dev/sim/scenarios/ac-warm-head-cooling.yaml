@@ -1,0 +1,31 @@
+name: ac-warm-head-cooling
+extends: ekf-summer-ac
+description: >
+  The AC of ekf-summer-ac mounted under the ceiling and idling on a setback. Its own
+  sensor reads the warm layer: 1 K above the room sensor while it cools, 2 K once it
+  stops. A setback of cool target + 2 K in the room's frame sits right at the unit's
+  idle reading, so the unit restarted on its own whenever the room reached the target
+  and cooled through every idle phase RoomMind had decided on: over 40 % more starts
+  and runtime than the same unit with a sensor that reads the room, and a cooling
+  gain the EKF learned 1.8-2.2x too high (1.3-1.5x with the offset). RoomMind now
+  learns the offset per state and sends the setpoints in the unit's frame.
+tags: [ac]
+duration: 5d
+house:
+  rooms:
+    wohnzimmer:
+      devices:
+        - {entity_id: climate.wz_ac, profile: generic_split_ac, cool_capacity_w: 3500, sensor_offset_cool_k: 1.0, sensor_offset_idle_k: 2.0}
+roommind:
+  rooms:
+    wohnzimmer:
+      devices: [{entity_id: climate.wz_ac, type: ac, idle_action: setback}]
+expect:
+  - {invariant: no_rejected_commands}
+  # seeds 1-3: 75.0-75.4 a day, as with an unbiased sensor (75.2); 108-110 without the offset
+  - {metric: device.starts_per_day, entity_id: climate.wz_ac, max: 85, label: the unit stays off on its setback}
+  # seeds 1-3: 36.6-37.5 h, unbiased sensor 37.4 h; 51.7-53.2 h without the offset
+  - {metric: device.active_h, entity_id: climate.wz_ac, max: 42, label: no cooling through the idle phases}
+  # seeds 1-3: 3.9-4.6 Kh, unbiased sensor 4.7 Kh (2.6-3.5 Kh without the offset: the unit cooled while idle)
+  - {metric: comfort.overshoot_kh, room: wohnzimmer, max: 9, label: cooling keeps the room near its target}
+  # learned offsets, seeds 1-3: cooling 1.06-1.08 K, idle 1.93-1.99 K

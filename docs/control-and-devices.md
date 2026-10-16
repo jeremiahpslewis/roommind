@@ -81,6 +81,12 @@ Example: the room target is 24°C. While cooling, the device thinks the room is 
 
 The offset is applied before the device limits (`min_temp`/`max_temp`) and the step rounding, and it is kept for the `Setback` idle action. It has no effect in `Proportional` mode. The field is only offered in rooms with an external room sensor, because Managed rooms have no reference to correct against; an old value stays ignored there. On Fahrenheit systems the field is shown in °F.
 
+#### Learned sensor offset (ACs)
+
+An AC regulates on the sensor in its indoor unit. A wall unit under the ceiling often reads the warm layer: warmer than the room sensor while it runs, and warmer still once it stops. RoomMind learns this offset per AC from the device's `current_temperature`, separately for heating, cooling and idle, while the device reports that state in `hvac_action` (readings from the first 4 minutes after a start or stop are skipped). Once an offset has 10 readings, an AC in `Proportional` mode gets its setpoints in its own frame: the proportional heating and cooling setpoint and the setpoint kept during the compressor min-run use the heating or cooling offset, and the `Setback` idle setpoint uses the idle offset. The device then stops and restarts where the room, not its own sensor, is at the intended temperature.
+
+This only applies in rooms with an external room sensor and to devices that report `hvac_action`. `Direct` devices keep the offset you set yourself. Offsets beyond ±4 °C are ignored as a misplaced or broken sensor. The learned values are in the diagnostics download (`ac_head_offsets`).
+
 #### Upper device limit
 
 In `Proportional` mode the boosted heating setpoint stays one step (`target_temp_step`, 0.5 °C if the device reports none) below the device's `max_temp`, and never below the room target. Some integrations reject exactly their own `max_temp`, which made the Dyson Heat/Cool purifier ignore the 37°C setpoint. The cooling floor (`min_temp`) is unchanged.
