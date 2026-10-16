@@ -116,6 +116,15 @@ async def test_learned_offsets_are_loaded_and_saved(hass, mock_config_entry):
 
 
 @pytest.mark.asyncio
+async def test_offsets_of_removed_devices_are_dropped(hass, mock_config_entry):
+    room = _ac_room()
+    saved = {AC: {"cool": [1.4, 40]}, "climate.gone": {"cool": [2.0, 40]}}
+    _, coordinator = _setup(hass, mock_config_entry, room, _states(), settings={"ac_head_offsets": saved})
+    await coordinator._async_update_data()
+    assert set(coordinator._head_offsets.get_state()) == {AC}
+
+
+@pytest.mark.asyncio
 async def test_no_room_sensor_means_no_learning(hass, mock_config_entry):
     """Without an external sensor the room temperature is the device's own reading."""
     room = {**_ac_room(), "temperature_sensor": ""}

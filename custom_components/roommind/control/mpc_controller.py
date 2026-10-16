@@ -259,9 +259,8 @@ def _resolve_step(hass: HomeAssistant, attributes: Any) -> float | None:
 def _learned_setback_step(hass: HomeAssistant, attributes: Any) -> float:
     """Snap step for a setback carrying a learned AC sensor offset, on a device without a step.
 
-    The offset has hundredths, so the setback would land between the values a device
-    can show; one that shows whole degrees reads 27.88 back as 28 and gets it again
-    every cycle.
+    Without a snap the setback can land between the values a device can show: one that
+    shows whole degrees reads 27.5 back as 28 and gets it again every cycle.
     """
     try:
         if float(attributes.get("temperature")).is_integer():
