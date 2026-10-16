@@ -5,7 +5,8 @@ description: >
   for a hot afternoon after three days of learning. The room heats well past 30 °C.
   When control comes back, the plan clamped every prediction to 30 °C: the AC could not
   bring the room below 30 within the lookahead, so idle and cooling cost the same and
-  the unit stayed off with MPC active until the evening (#462).
+  the unit stayed off with MPC active (seed 1: idle 15:00-16:15 at 32.8-33.7 °C, cooling
+  only once clouds cut the solar load).
 refs: [462]
 tags: [ac, solar]
 duration: 4d
@@ -21,5 +22,7 @@ expect:
   - {invariant: no_rejected_commands}
   - {check: "room.wohnzimmer.current_temp > 30", at: "+3d15h", label: room heated past 30 °C while control was off}
   - {check: "room.wohnzimmer.mpc_active", at: "+3d15h10m", label: MPC is in charge}
+  # before the fix (v1.7.9 and main): idle; peak 33.74 °C seed 1, 34.96 °C seed 2,
+  # 160 / 162 Kh above the cool target; with the fix 32.79 / 33.03 °C, 153 / 139 Kh
   - {check: "room.wohnzimmer.mode == 'cooling'", at: "+3d15h10m", label: cools the hot room}
   - {check: "room.wohnzimmer.mode == 'cooling' and dev('climate.wz_ac').mode == 'cool'", at: "+3d16h", label: the unit still cools an hour later}
