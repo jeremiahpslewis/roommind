@@ -500,6 +500,23 @@ async def test_unsupported_fan_mode_is_skipped(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fan_mode_is_matched_to_the_devices_spelling(monkeypatch):
+    """The default coil dry fan mode 'low' reaches a device that calls it 'Low'."""
+    import custom_components.roommind.managers.ac_coil_dry_manager as mod
+
+    now = [0.0]
+    monkeypatch.setattr(mod.time, "time", lambda: now[0])
+    hass = build_hass(fan_modes=["Auto", "Low", "High"], fan_mode="Auto")
+    mgr = AcCoilDryManager(hass)
+
+    await _wet(mgr, now)
+    calls = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_fan_mode"]
+    assert [c[0][2]["fan_mode"] for c in calls] == ["Low"]
+    # The device's name is kept, so the restore recognises the speed it set
+    assert mgr.state_for(AC_EID).fan_mode == "Low"
+
+
+@pytest.mark.asyncio
 async def test_drain_phase_reasserts_idle_each_cycle(monkeypatch):
     """Mid-drain (before phase_until), the device is held off again every cycle.
 

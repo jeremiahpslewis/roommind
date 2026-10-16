@@ -178,6 +178,25 @@ def _should_use_cache(state: Any) -> bool:
     return state.state in ("unavailable", "unknown")
 
 
+def match_fan_mode(state: Any, desired: str) -> str | None:
+    """The device's own name for fan mode *desired*, or None if it has none.
+
+    The configured value is matched against the advertised ``fan_modes``
+    ignoring case and separators, because integrations spell the same speed
+    differently ("Low", "low"; "Medium Low", "medium_low") and the panel's
+    default ("low") is not taken from the device.
+    """
+    modes: list[str] = (state.attributes.get("fan_modes") or []) if state else []
+    if desired in modes:
+        return desired
+
+    def norm(value: str) -> str:
+        return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+    wanted = norm(desired)
+    return next((mode for mode in modes if norm(mode) == wanted), None)
+
+
 def _target_moved(previous: float | None, current: float | None) -> bool:
     if previous is None or current is None:
         return previous is not current
@@ -663,17 +682,29 @@ async def async_idle_device(
         await async_turn_off_climate(hass, entity_id, area_id=area_id, fallback_setpoint=fallback_temp)
         return
 
+    # A fan mode the device does not have is left alone, like an empty idle_fan_mode:
+    # waiting for the device to report it would resend fan_only every cycle.
+    fan_mode = match_fan_mode(state, idle_fan_mode) if idle_fan_mode else None
+    if idle_fan_mode and fan_mode is None:
+        _LOGGER.debug(
+            "Area '%s': device '%s' does not support fan_mode '%s' (available: %s)",
+            area_id,
+            entity_id,
+            idle_fan_mode,
+            (state.attributes.get("fan_modes") or []) if state else [],
+        )
+
     # Redundancy check: already in fan_only with correct fan_mode
     if state and state.state == "fan_only":
         current_fan = state.attributes.get("fan_mode")
-        if not idle_fan_mode or current_fan == idle_fan_mode:
+        if fan_mode is None or current_fan == fan_mode:
             return
 
     # Cache fallback for IR devices (only when device has no reliable state)
     if _should_use_cache(state):
         cached = _last_commands.get(entity_id)
         if cached and cached.get("service") == "set_hvac_mode" and cached.get("hvac_mode") == "fan_only":
-            if not idle_fan_mode:
+            if fan_mode is None:
                 return
 
     try:
@@ -694,32 +725,22 @@ async def async_idle_device(
         )
         return
 
-    if idle_fan_mode:
-        fan_modes: list[str] = (state.attributes.get("fan_modes") or []) if state else []
-        if idle_fan_mode in fan_modes:
-            try:
-                await hass.services.async_call(
-                    "climate",
-                    "set_fan_mode",
-                    {"entity_id": entity_id, "fan_mode": idle_fan_mode},
-                    blocking=True,
-                    context=make_roommind_context(),
-                )
-            except Exception:  # noqa: BLE001
-                _LOGGER.warning(
-                    "Area '%s': climate.set_fan_mode('%s') failed on '%s'",
-                    area_id,
-                    idle_fan_mode,
-                    entity_id,
-                    exc_info=True,
-                )
-        else:
-            _LOGGER.debug(
-                "Area '%s': device '%s' does not support fan_mode '%s' (available: %s)",
+    if fan_mode is not None:
+        try:
+            await hass.services.async_call(
+                "climate",
+                "set_fan_mode",
+                {"entity_id": entity_id, "fan_mode": fan_mode},
+                blocking=True,
+                context=make_roommind_context(),
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Area '%s': climate.set_fan_mode('%s') failed on '%s'",
                 area_id,
+                fan_mode,
                 entity_id,
-                idle_fan_mode,
-                fan_modes,
+                exc_info=True,
             )
 
 

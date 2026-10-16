@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from homeassistant.core import HomeAssistant
 
 from ..const import MODE_COOLING, MODE_HEATING, TargetTemps, make_roommind_context
-from ..control.mpc_controller import async_idle_device
+from ..control.mpc_controller import async_idle_device, match_fan_mode
 from ..utils.device_utils import (
     COIL_DRY_MODE_DRY,
     COIL_DRY_PHASE_BLOW,
@@ -316,8 +316,10 @@ class AcCoilDryManager:
             return
         state = self.hass.states.get(eid)
         fan_modes: list[str] = (state.attributes.get("fan_modes") or []) if state else []
-        if st.fan_mode in fan_modes:
-            await self._call(eid, "set_fan_mode", {"fan_mode": st.fan_mode}, area_id)
+        fan_mode = match_fan_mode(state, st.fan_mode)
+        if fan_mode is not None:
+            st.fan_mode = fan_mode
+            await self._call(eid, "set_fan_mode", {"fan_mode": fan_mode}, area_id)
         else:
             _LOGGER.debug(
                 "Area '%s': device '%s' does not support fan_mode '%s' (available: %s), keeping current",

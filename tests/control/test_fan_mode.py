@@ -188,6 +188,59 @@ async def test_async_idle_device_fan_mode_not_in_fan_modes():
     assert len(fan_calls) == 0
 
 
+def _fan_only_ac(hass, state_name, fan_modes, fan_mode=None, idle_fan_mode="low"):
+    state = MagicMock()
+    state.state = state_name
+    state.attributes = {"hvac_modes": ["cool", "fan_only", "off"], "fan_modes": fan_modes, "fan_mode": fan_mode}
+    hass.states.get = MagicMock(return_value=state)
+    return [
+        {
+            "entity_id": "climate.ac1",
+            "type": "ac",
+            "role": "auto",
+            "idle_action": "fan_only",
+            "idle_fan_mode": idle_fan_mode,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fan_only_uses_the_devices_spelling_of_the_fan_mode():
+    """The default 'low' reaches a device that calls it 'Low' (and 'Medium Low' one that says 'medium_low')."""
+    _last_commands.clear()
+    hass = build_hass()
+    devices = _fan_only_ac(hass, "cool", ["Auto", "Low", "Medium Low", "High"], idle_fan_mode="low")
+    await async_idle_device(hass, "climate.ac1", devices, area_id="living_room")
+    fan_calls = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_fan_mode"]
+    assert [c[0][2]["fan_mode"] for c in fan_calls] == ["Low"]
+
+    hass = build_hass()
+    devices = _fan_only_ac(hass, "cool", ["Auto", "Low", "Medium Low"], idle_fan_mode="medium_low")
+    await async_idle_device(hass, "climate.ac1", devices, area_id="living_room")
+    fan_calls = [c for c in hass.services.async_call.call_args_list if c[0][1] == "set_fan_mode"]
+    assert [c[0][2]["fan_mode"] for c in fan_calls] == ["Medium Low"]
+
+
+@pytest.mark.asyncio
+async def test_fan_only_in_place_under_another_spelling_sends_nothing():
+    """Already in fan_only on 'Low': a configured 'low' is the same speed, so nothing is resent."""
+    _last_commands.clear()
+    hass = build_hass()
+    devices = _fan_only_ac(hass, "fan_only", ["Auto", "Low", "High"], fan_mode="Low")
+    await async_idle_device(hass, "climate.ac1", devices, area_id="living_room")
+    hass.services.async_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fan_only_with_an_unsupported_fan_mode_is_not_resent_every_cycle():
+    """A fan mode the device lacks keeps its speed: fan_only once, not again each cycle."""
+    _last_commands.clear()
+    hass = build_hass()
+    devices = _fan_only_ac(hass, "fan_only", ["Silence", "1", "2", "3"], fan_mode="2")
+    await async_idle_device(hass, "climate.ac1", devices, area_id="living_room")
+    hass.services.async_call.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # async_apply integration tests with fan_only idle_action
 # ---------------------------------------------------------------------------
