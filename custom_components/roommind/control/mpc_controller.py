@@ -117,6 +117,7 @@ def _cache_entry(service: str, data: dict) -> dict[str, Any]:
         "temperature": data.get("temperature"),
         "target_temp_low": data.get("target_temp_low"),
         "target_temp_high": data.get("target_temp_high"),
+        "fan_mode": data.get("fan_mode"),
     }
 
 
@@ -186,15 +187,26 @@ def match_fan_mode(state: Any, desired: str) -> str | None:
     differently ("Low", "low"; "Medium Low", "medium_low") and the panel's
     default ("low") is not taken from the device.
     """
-    modes: list[str] = (state.attributes.get("fan_modes") or []) if state else []
+    raw = (state.attributes.get("fan_modes") or []) if state else []
+    if not isinstance(raw, (list, tuple)):
+        return None
+    modes: list[str] = list(raw)
     if desired in modes:
         return desired
 
-    def norm(value: str) -> str:
-        return "".join(ch for ch in str(value).lower() if ch.isalnum())
+    def fold(value: Any) -> str:
+        return str(value).casefold()
 
-    wanted = norm(desired)
-    return next((mode for mode in modes if norm(mode) == wanted), None)
+    def norm(value: Any) -> str:
+        return "".join(ch for ch in fold(value) if ch.isalnum())
+
+    # Case first, so "High" wins over "High+" for "high"; separators only after that
+    for key in (fold, norm):
+        wanted = key(desired)
+        match = next((mode for mode in modes if key(mode) == wanted), None)
+        if match is not None:
+            return match
+    return None
 
 
 def _target_moved(previous: float | None, current: float | None) -> bool:
@@ -704,7 +716,8 @@ async def async_idle_device(
     if _should_use_cache(state):
         cached = _last_commands.get(entity_id)
         if cached and cached.get("service") == "set_hvac_mode" and cached.get("hvac_mode") == "fan_only":
-            if fan_mode is None:
+            cached_fan = _last_by_service.get((entity_id, "set_fan_mode"))
+            if fan_mode is None or (cached_fan is not None and cached_fan.get("fan_mode") == fan_mode):
                 return
 
     try:
@@ -716,6 +729,9 @@ async def async_idle_device(
             context=make_roommind_context(),
         )
         _remember_command(entity_id, "set_hvac_mode", {"hvac_mode": "fan_only"})
+        # The device may have come back to fan_only on another speed than last time
+        _last_by_service.pop((entity_id, "set_fan_mode"), None)
+        _sent_at.pop((entity_id, "set_fan_mode"), None)
     except Exception:  # noqa: BLE001
         _LOGGER.warning(
             "Area '%s': climate.set_hvac_mode(fan_only) failed on '%s'",
@@ -734,6 +750,7 @@ async def async_idle_device(
                 blocking=True,
                 context=make_roommind_context(),
             )
+            _note_applied(entity_id, "set_fan_mode", {"fan_mode": fan_mode})
         except Exception:  # noqa: BLE001
             _LOGGER.warning(
                 "Area '%s': climate.set_fan_mode('%s') failed on '%s'",
