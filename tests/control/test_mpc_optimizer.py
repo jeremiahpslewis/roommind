@@ -952,3 +952,50 @@ def test_heating_block_does_not_use_a_cooling_fraction():
     hybrid, heat_only = plan(can_cool=True), plan(can_cool=False)
     assert hybrid.actions == heat_only.actions
     assert hybrid.power_fractions == heat_only.power_fractions
+
+
+# Rooms already past the plausibility clamp (temp_min / temp_max)
+# ---------------------------------------------------------------------------
+
+
+def _hot_room_plan(t_room: float):
+    """Weak AC against a strong solar load: it cannot pull the room below 30 °C within the lookahead."""
+    model = RCModel(C=1.0, U=0.0234, Q_heat=3.0, Q_cool=0.97, Q_solar=2.64, Q_occupancy=0.32)
+    return MPCOptimizer(model, can_heat=False, can_cool=True, w_comfort=7.0, w_energy=3.0, min_run_blocks=2).optimize(
+        T_room=t_room,
+        T_outdoor_series=[34.0] * 48,
+        heat_target_series=[5.0] * 48,
+        cool_target_series=[24.5] * 48,
+        dt_minutes=5,
+        solar_series=[0.8] * 48,
+        occupancy_series=[1.0] * 48,
+    )
+
+
+@pytest.mark.parametrize("t_room", [31.0, 33.0, 37.0])
+def test_room_above_temp_max_still_cools(t_room):
+    """Every hypothesis clamped to 30 °C at every block made cooling and idle cost the same,
+    so idle won and the room heated further (sim ekf-summer-ac with a weakly learned AC)."""
+    plan = _hot_room_plan(t_room)
+    assert plan.actions[0] == MODE_COOLING
+    # the forecast starts where the room is instead of snapping to the clamp
+    assert plan.temperatures[1] > 30.0
+
+
+def test_room_below_temp_min_still_heats():
+    """Mirror case: a weak heater that cannot lift a cold room above 5 °C within the lookahead."""
+    model = RCModel(C=1.0, U=0.15, Q_heat=1.0, Q_cool=4.0)
+    plan = MPCOptimizer(model, can_heat=True, can_cool=False, min_run_blocks=2).optimize(
+        T_room=3.0,
+        T_outdoor_series=[-15.0] * 48,
+        heat_target_series=[21.0] * 48,
+        cool_target_series=[30.0] * 48,
+        dt_minutes=5,
+    )
+    assert plan.actions[0] == MODE_HEATING
+    assert plan.temperatures[1] < 5.0
+
+
+def test_clamp_unchanged_for_rooms_inside_the_bounds():
+    opt = MPCOptimizer(RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
+    assert opt._temp_bounds(21.0) == (opt.temp_min, opt.temp_max)
