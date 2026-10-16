@@ -140,3 +140,23 @@ def test_device_setpoint_display_is_in_the_acs_frame():
     assert show("heating", 0.1, 20.5, 21.0, True, head_offset=1.5, **heat_trv) == show(
         "heating", 0.1, 20.5, 21.0, True, **heat_trv
     )
+
+
+def test_orchestrated_device_setpoint_display_is_in_the_acs_frame():
+    from custom_components.roommind.coordinator import RoomMindCoordinator
+    from custom_components.roommind.managers.heat_source_orchestrator import DeviceCommand, HeatSourcePlan
+
+    show = RoomMindCoordinator._compute_device_setpoint_orchestrated
+
+    def plan(eid, device_type):
+        cmd = DeviceCommand(
+            entity_id=eid, role="primary", device_type=device_type, active=True, power_fraction=0.1, reason="t"
+        )
+        return HeatSourcePlan(commands=[cmd], active_sources="primary", reason="test")
+
+    offsets = {AC: 1.5}
+    plain = show(plan(AC, "ac"), 20.5, 21.0, 30.0, 30.0)
+    assert show(plan(AC, "ac"), 20.5, 21.0, 30.0, 30.0, head_offsets=offsets) == pytest.approx(plain + 1.5)
+    # A TRV command keeps its own value
+    trv = plan("climate.trv", "thermostat")
+    assert show(trv, 20.5, 21.0, 30.0, 30.0, head_offsets=offsets) == show(trv, 20.5, 21.0, 30.0, 30.0)

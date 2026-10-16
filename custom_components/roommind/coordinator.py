@@ -1477,6 +1477,15 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 self._head_offsets.offset(eid, _intent) for eid in get_ac_eids(_room_devices) if eid not in _direct_eids
             }
             _head_shift = _shifts.pop() if len(_shifts) == 1 else 0.0
+        _ac_heat_shifts = (
+            {
+                eid: self._head_offsets.offset(eid, "heat")
+                for eid in get_ac_eids(_room_devices)
+                if eid not in _direct_eids
+            }
+            if has_external_sensor
+            else {}
+        )
 
         return {
             "area_id": area_id,
@@ -1499,6 +1508,7 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 direct_eids=_direct_eids,
                 direct_offsets=_direct_offsets,
                 direct_target=direct_target,
+                head_offsets=_ac_heat_shifts,
             )
             if heat_source_plan is not None
             else self._compute_device_setpoint(
@@ -1558,8 +1568,13 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         direct_eids: set[str] | None = None,
         direct_offsets: dict[str, float] | None = None,
         direct_target: float | None = None,
+        head_offsets: dict[str, float] | None = None,
     ) -> float | None:
-        """Compute device setpoint from the orchestrated heat source plan."""
+        """Compute device setpoint from the orchestrated heat source plan.
+
+        ``head_offsets`` are the learned heating offsets of proportional ACs; an AC's value
+        is shown in its own frame, as async_apply() sends it.
+        """
         if current_temp is None or target_temp is None:
             return None
         # Find the most representative active command
@@ -1578,6 +1593,8 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         sp = round(current_temp + cmd.power_fraction * (boost - current_temp), 1)
         sp = max(target_temp, sp)
         sp = min(boost, sp)
+        if cmd.device_type == "ac" and head_offsets:
+            sp = min(boost, round(sp + head_offsets.get(cmd.entity_id, 0.0), 1))
         return sp
 
     @staticmethod
