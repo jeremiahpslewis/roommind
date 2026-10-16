@@ -118,6 +118,8 @@ ROOM_ENTITY_SUFFIXES = (
 COVER_ENTITY_SUFFIXES = ("_cover_auto", "_cover_paused")
 # Device states in which a compressor can be running (fan_only and off do not run it)
 _COMPRESSOR_STATES = ("heat", "cool", "heat_cool", "auto", "dry")
+# hvac modes in which an AC's reading teaches the learned sensor offset (HeadOffsetTracker)
+_HEAD_OFFSET_HVAC_MODES = ("heat", "cool", "heat_cool", "auto")
 
 
 def _match_room_entity(parts: str, rooms: dict) -> tuple[str, str] | None:
@@ -1638,8 +1640,9 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 device_temp = ha_temp_to_celsius(self.hass, float(raw)) if raw is not None else None
             except (TypeError, ValueError):
                 device_temp = None
-            # A device that is off is idle, whether or not its integration still reports an hvac_action
-            action = "off" if state.state == "off" else state.attributes.get("hvac_action")
+            # Only a unit that is on: the idle offset is used for the setback, where the unit stays
+            # on, and some integrations stop updating current_temperature while the unit is off
+            action = state.attributes.get("hvac_action") if state.state in _HEAD_OFFSET_HVAC_MODES else None
             self._head_offsets.observe(eid, action, device_temp, room_temp, now)
 
     def _read_device_temp(self, room: dict) -> float | None:

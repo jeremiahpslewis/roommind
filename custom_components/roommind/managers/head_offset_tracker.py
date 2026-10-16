@@ -26,7 +26,7 @@ from ..const import (
 )
 
 # hvac_action -> offset kept for it. "fan" (air moving, compressor stopped) reads neither.
-_STATE_OF_ACTION = {"heating": "heat", "preheating": "heat", "cooling": "cool", "idle": "idle", "off": "idle"}
+_STATE_OF_ACTION = {"heating": "heat", "preheating": "heat", "cooling": "cool", "idle": "idle"}
 _STATES = ("heat", "cool", "idle")
 
 

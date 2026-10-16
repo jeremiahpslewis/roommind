@@ -77,15 +77,26 @@ async def test_cycles_feed_the_tracker_and_the_controller_gets_it(hass, mock_con
 
 
 @pytest.mark.asyncio
-async def test_a_switched_off_unit_reads_as_idle(hass, mock_config_entry):
-    """Off with a stale hvac_action is still idle: its reading feeds the idle offset."""
+@pytest.mark.parametrize("hvac", ["off", "fan_only", "dry"])
+async def test_a_unit_that_is_not_on_teaches_nothing(hass, mock_config_entry, hvac):
+    """The idle offset is for the setback, where the unit stays on; an off unit may not even update its reading."""
     room = _ac_room()
-    _, coordinator = _setup(hass, mock_config_entry, room, _states(hvac="off", action="cooling", head=30.0))
+    _, coordinator = _setup(hass, mock_config_entry, room, _states(hvac=hvac, action="idle", head=30.0))
     tracker = MagicMock()
     coordinator._head_offsets = tracker
     coordinator._observe_head_offsets(room, 28.0)
     args = tracker.observe.call_args.args
-    assert args[:4] == (AC, "off", 30.0, 28.0)
+    assert args[:4] == (AC, None, 30.0, 28.0)
+
+
+@pytest.mark.asyncio
+async def test_a_unit_on_its_setback_feeds_the_idle_offset(hass, mock_config_entry):
+    room = _ac_room()
+    _, coordinator = _setup(hass, mock_config_entry, room, _states(hvac="cool", action="idle", head=30.0))
+    tracker = MagicMock()
+    coordinator._head_offsets = tracker
+    coordinator._observe_head_offsets(room, 28.0)
+    assert tracker.observe.call_args.args[:4] == (AC, "idle", 30.0, 28.0)
 
 
 @pytest.mark.asyncio

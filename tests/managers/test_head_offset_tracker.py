@@ -30,13 +30,11 @@ def test_learns_the_offset_per_running_direction():
     assert tracker.dirty
 
 
-def test_idle_and_off_feed_the_idle_offset():
+def test_idle_feeds_the_idle_offset_and_off_teaches_nothing():
     tracker = HeadOffsetTracker()
-    t = feed(tracker, "idle", 26.0, 24.0, n=HEAD_OFFSET_MIN_SAMPLES // 2)
-    # Switched off: still the same idle state, no new settle period
-    for _ in range(HEAD_OFFSET_MIN_SAMPLES - HEAD_OFFSET_MIN_SAMPLES // 2):
-        tracker.observe(AC, "off", 26.0, 24.0, t)
-        t += 30.0
+    feed(tracker, "off", 26.0, 24.0)
+    assert tracker.offset(AC, "idle") == 0.0
+    feed(tracker, "idle", 26.0, 24.0, start=10_000.0)
     assert tracker.offset(AC, "idle") == pytest.approx(2.0)
 
 
