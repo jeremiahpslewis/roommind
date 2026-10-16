@@ -397,6 +397,10 @@ async def build_analytics_data(
                         mode_elapsed_minutes=sim_mode_elapsed,
                         # AC heating alone in an orchestrated UFH room runs on AC rules
                         run_system=("" if coordinator._heat_source_states.get(area_id) == "secondary" else system_type),
+                        outdoor_known=(
+                            coordinator.outdoor_temp_effective is not None
+                            or bool(coordinator._weather_manager._outdoor_forecast)
+                        ),
                     ),
                 )
 

@@ -39,6 +39,7 @@ def _closed_loop(
     previous_mode: str = MODE_IDLE,
     elapsed_minutes: float | None = None,
     ac_modes: list[str] | None = None,
+    outdoor_known: bool = True,
 ) -> list[float]:
     """Run the controller every 5 min like the coordinator does and return the temperatures."""
     clock = {"now": START}
@@ -67,7 +68,7 @@ def _closed_loop(
             hass,
             room,
             model_manager=manager,
-            outdoor_temp=outdoor,
+            outdoor_temp=outdoor if outdoor_known else None,
             settings={},
             previous_mode=prev,
             mode_on_since=on_since,
@@ -109,6 +110,7 @@ def _prediction(
     previous_mode: str = MODE_IDLE,
     elapsed_minutes: float | None = None,
     acs_can_heat: bool = False,
+    outdoor_known: bool = True,
 ) -> list[float]:
     # Long enough that the controller's horizon never runs past the forecast
     n = STEPS + 400
@@ -124,6 +126,7 @@ def _prediction(
         heating_system_type=heating_system_type,
         previous_mode=previous_mode,
         mode_elapsed_minutes=elapsed_minutes,
+        outdoor_known=outdoor_known,
     )[:STEPS]
 
 
@@ -131,6 +134,8 @@ TRV = RCModel(C=1.0, U=0.3, Q_heat=10.0, Q_cool=0.0)
 AC = RCModel(C=1.0, U=0.3, Q_heat=20.0, Q_cool=20.0)
 UFH = RCModel(C=1.0, U=0.2, Q_heat=6.0, Q_cool=0.0)
 SLOW_UFH = RCModel(C=1.0, U=0.02, Q_heat=2.0, Q_cool=0.0)
+# Tight room: the drift towards the 10 °C placeholder alone does not bring it to the target
+TIGHT_AC = RCModel(C=1.0, U=0.02, Q_heat=20.0, Q_cool=20.0)
 
 
 @pytest.mark.parametrize(
@@ -189,6 +194,19 @@ SLOW_UFH = RCModel(C=1.0, U=0.02, Q_heat=2.0, Q_cool=0.0)
             },
         ),
         (
+            # #464: without a reading or forecast the series is the 10 °C placeholder,
+            # which must not gate cooling in the prediction either
+            "ac cooling without an outdoor reading",
+            TIGHT_AC,
+            {"climate_mode": "cool_only", "thermostats": [], "acs": ["climate.ac"]},
+            {
+                "T0": 26.0,
+                "outdoor": mc.DEFAULT_OUTDOOR_TEMP_FALLBACK,
+                "outdoor_known": False,
+                "targets": TargetTemps(heat=None, cool=24.0),
+            },
+        ),
+        (
             "hard ceiling ends a run",
             TRV,
             {"climate_mode": "heat_only"},
@@ -217,6 +235,8 @@ def test_prediction_follows_the_controller(monkeypatch, label, model, room, kwar
     )
     predicted = _prediction(model, room_config, acs_can_heat=has_ac or is_ac, **common)
     assert predicted == real, label
+    if not common.get("outdoor_known", True):
+        assert real[0] < common["T0"] - 0.5, "the controller must actually cool"
 
 
 def test_prediction_without_the_controller_rules_would_differ(monkeypatch):

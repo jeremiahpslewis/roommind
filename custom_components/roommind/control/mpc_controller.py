@@ -835,6 +835,18 @@ def get_can_heat_cool(
     return can_heat, can_cool
 
 
+def outdoor_gate_limits(outdoor_known: bool, cooling_min: float, heating_max: float) -> tuple[float, float]:
+    """Optimizer outdoor gate as (cooling_min, heating_max), open when the outdoor temperature is unknown.
+
+    Without a reading or forecast the horizon is DEFAULT_OUTDOOR_TEMP_FALLBACK, a placeholder
+    below the cooling minimum; gating on it barred the room from cooling (#464).
+    get_can_heat_cool() does not gate on a missing reading either.
+    """
+    if outdoor_known:
+        return cooling_min, heating_max
+    return float("-inf"), float("inf")
+
+
 def fill_missing_targets(heat: float | None, cool: float | None, fallback: float) -> tuple[float, float]:
     """Give the optimizer a numeric (heat, cool) pair for a possibly one-sided target.
 
@@ -1373,10 +1385,11 @@ class MPCController:
         run_system = self._resolve_run_system(current_temp, targets.heat)
         min_run = get_min_run_blocks(run_system, PLAN_DT_MINUTES)
 
-        # Without an outdoor reading or forecast the horizon is DEFAULT_OUTDOOR_TEMP_FALLBACK,
-        # a placeholder below the cooling minimum. Gating on it would bar the room from
-        # cooling until a reading comes back; _get_can_heat_cool() does not gate then either.
-        outdoor_known = self.outdoor_temp is not None or bool(self.outdoor_forecast)
+        cooling_min, heating_max = outdoor_gate_limits(
+            self.outdoor_temp is not None or bool(self.outdoor_forecast),
+            self.outdoor_cooling_min,
+            self.outdoor_heating_max,
+        )
 
         optimizer = MPCOptimizer(
             model=model,
@@ -1384,8 +1397,8 @@ class MPCController:
             can_cool=can_cool,
             w_comfort=self._w_comfort,
             w_energy=self._w_energy,
-            outdoor_cooling_min=self.outdoor_cooling_min if outdoor_known else float("-inf"),
-            outdoor_heating_max=self.outdoor_heating_max if outdoor_known else float("inf"),
+            outdoor_cooling_min=cooling_min,
+            outdoor_heating_max=heating_max,
             min_run_blocks=min_run,
             cool_min_run_blocks=get_min_run_blocks("", PLAN_DT_MINUTES),
             override_active=is_override_active(self.room_config),

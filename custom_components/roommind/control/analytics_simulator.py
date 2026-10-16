@@ -31,6 +31,7 @@ from .mpc_controller import (
     heat_start_hysteresis,
     is_mpc_enabled,
     is_slow_heat,
+    outdoor_gate_limits,
 )
 from .mpc_optimizer import MPCOptimizer, preheat_max_blocks, slow_start_penalty
 from .residual_heat import (
@@ -164,6 +165,7 @@ def simulate_prediction(
     mode_elapsed_minutes: float | None = None,
     q_rebound: float | None = None,
     run_system: str | None = None,
+    outdoor_known: bool = True,
 ) -> list[float]:
     """Simulate temperature prediction for the analytics chart.
 
@@ -196,6 +198,7 @@ def simulate_prediction(
             mode_elapsed_minutes=mode_elapsed_minutes,
             q_rebound=q_rebound,
             run_system=rules,
+            outdoor_known=outdoor_known,
         )
 
     return _simulate_bangbang(
@@ -303,6 +306,7 @@ def _simulate_mpc(
     mode_elapsed_minutes: float | None = None,
     q_rebound: float | None = None,
     run_system: str | None = None,
+    outdoor_known: bool = True,
 ) -> list[float]:
     """Rolling-horizon MPC simulation matching the real controller.
 
@@ -310,10 +314,14 @@ def _simulate_mpc(
     controller's own rules (``decide_mpc_action``: hard ceiling, guard, start
     hysteresis, min-run continuation at gentle power, drift pre-heat only for slow
     heat). ``previous_mode``/``mode_elapsed_minutes`` seed the run in progress, so a
-    room inside the hysteresis band keeps heating like the real one.
+    room inside the hysteresis band keeps heating like the real one. ``outdoor_known=False``
+    (no reading, no forecast): the series is the placeholder and gates nothing, as in the controller.
     """
-    ocm = settings.get("outdoor_cooling_min", DEFAULT_OUTDOOR_COOLING_MIN)
-    ohm = settings.get("outdoor_heating_max", DEFAULT_OUTDOOR_HEATING_MAX)
+    ocm, ohm = outdoor_gate_limits(
+        outdoor_known,
+        settings.get("outdoor_cooling_min", DEFAULT_OUTDOOR_COOLING_MIN),
+        settings.get("outdoor_heating_max", DEFAULT_OUTDOOR_HEATING_MAX),
+    )
     override_active = is_override_active(room_config)
     cw = settings.get("comfort_weight", 70)
     w_comfort = max(1.0, cw / 10.0)
