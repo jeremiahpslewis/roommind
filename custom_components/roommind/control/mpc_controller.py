@@ -256,6 +256,21 @@ def _resolve_step(hass: HomeAssistant, attributes: Any) -> float | None:
         return None
 
 
+def _learned_setback_step(hass: HomeAssistant, attributes: Any) -> float:
+    """Snap step for a setback carrying a learned AC sensor offset, on a device without a step.
+
+    The offset has hundredths, so the setback would land between the values a device
+    can show; one that shows whole degrees reads 27.88 back as 28 and gets it again
+    every cycle.
+    """
+    try:
+        if float(attributes.get("temperature")).is_integer():
+            return 1.0
+    except (TypeError, ValueError):
+        pass
+    return 1.0 if hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT else 0.5
+
+
 def clear_command_cache() -> None:
     """Clear the sent-command cache (for tests)."""
     _last_commands.clear()
@@ -655,6 +670,8 @@ async def async_idle_device(
         if max_t is not None:
             ha_t = min(ha_t, float(max_t))
         step = _resolve_step(hass, state.attributes)
+        if step is None and head_offset:
+            step = _learned_setback_step(hass, state.attributes)
         if step is not None:
             ha_t = _snap_to_step(ha_t, step)
             if min_t is not None:

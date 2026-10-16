@@ -145,3 +145,42 @@ async def test_held_unit_gets_a_lowered_target_in_its_frame():
         out.append(_sent(hass))
     assert out[0] == [17.0]
     assert out[1] == [18.5]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle", [1.88, 1.6, 2.0])
+async def test_setback_with_offset_is_not_resent_to_a_whole_degree_device(idle):
+    """A device without target_temp_step that shows whole degrees gets the setback once."""
+    room = make_room(thermostats=[], acs=[AC])
+    room["devices"][0]["idle_action"] = "setback"
+    targets = TargetTemps(heat=None, cool=24.0)
+    state = _ac_state("cool", temperature=26.0)
+    clear_command_cache()
+    hass, ctrl = _ctrl(state, _tracker(idle=idle, cool=1.0), room=room)
+    sent = []
+    for _ in range(3):
+        hass.services.async_call.reset_mock()
+        await ctrl.async_apply(MODE_IDLE, targets, current_temp=23.5)
+        sent.append(_sent(hass))
+        if sent[-1]:
+            # The device keeps whole degrees
+            state.attributes["temperature"] = float(round(sent[-1][-1]))
+    assert sent[0] == [float(round(24.0 + idle + 2.0))]
+    assert sent[1:] == [[], []]
+
+
+@pytest.mark.asyncio
+async def test_setback_with_offset_snaps_to_half_degrees_without_a_step():
+    """A device without a step that shows tenths gets the setback on the 0.5 °C grid."""
+    room = make_room(thermostats=[], acs=[AC])
+    room["devices"][0]["idle_action"] = "setback"
+    state = _ac_state("cool", temperature=26.3)
+    sent = await _apply(
+        _tracker(idle=1.88), MODE_IDLE, TargetTemps(heat=None, cool=24.0), state=state, room=room, current_temp=23.5
+    )
+    assert sent == [28.0]
+    state = _ac_state("cool", temperature=26.3)
+    sent = await _apply(
+        _tracker(idle=1.6), MODE_IDLE, TargetTemps(heat=None, cool=24.0), state=state, room=room, current_temp=23.5
+    )
+    assert sent == [27.5]
