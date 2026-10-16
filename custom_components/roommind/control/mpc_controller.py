@@ -2679,9 +2679,19 @@ class MPCController:
                         # on a 20-22 target all night. The bound is the same
                         # room-frame floor the heuristic uses, carried into the
                         # head's frame, which is where `learned` lives.
+                        #
+                        # The other side is bounded too: an active command never
+                        # sits above the target in the head's frame, the bound the
+                        # heuristic path has. The curve's rates are residuals against
+                        # the thermal model's passive forecast, so they share its
+                        # scale; once the EKF learned the air/mass rebound (beta_f)
+                        # its cooling rate fell to the honest value while the curve
+                        # still credited negative gaps with a full unit's output, and
+                        # the inversion parked a unit the MPC had asked to cool.
+                        _shift = self.head_frame_shift(eid, current_temp)
                         _limit = self.ac_setpoint_limit(current_temp, effective_target, mode, eid)
-                        _floor = effective_target - _limit + self.head_frame_shift(eid, current_temp)
-                        ac_cool_target = max(ac_cool_boost, _floor, learned)
+                        _floor = effective_target - _limit + _shift
+                        ac_cool_target = min(effective_target + _shift, max(ac_cool_boost, _floor, learned))
                     else:
                         # Anchor at the release position: when the room is
                         # already at or below the target (cold evening,

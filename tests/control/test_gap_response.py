@@ -462,6 +462,40 @@ async def test_learned_holding_command_sits_above_the_head():
     assert 20.0 <= sent[-1] <= 20.5, f"expected a level adjacent to the head reading, got {sent[-1]}"
 
 
+@pytest.mark.asyncio
+async def test_active_learned_command_never_parks_a_warm_room():
+    """A curve crediting negative gaps with a full unit's output must not park the unit.
+
+    The curve's rates share the thermal model's scale. Once the EKF learned the air/mass
+    rebound its cooling rate fell to the honest ~1 K/h while the curve still claimed
+    3.4 K/h at a 1 K negative gap (sim ekf-summer-ac): the inversion then commanded
+    setpoints above a 27 °C room against a 24.5 °C target, and the room overheated.
+    """
+    gap_mgr = GapResponseManager()
+    curve = gap_mgr.curve("climate.ac", "cooling")
+    for _ in range(12):
+        for g in curve.knots:
+            curve.observe(g, 3.4 if g < 2.0 else 6.0)
+    assert curve.is_confident()
+    hass = _ac_hass(head_temp=27.0, setpoint=27.0)
+    mgr = RoomModelManager()
+    mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.02, Q_heat=3.0, Q_cool=1.0))
+    ctrl = MPCController(
+        hass,
+        _ac_room(),
+        model_manager=mgr,
+        outdoor_temp=32.0,
+        settings={},
+        has_external_sensor=True,
+        gap_manager=gap_mgr,
+    )
+    # pf 0.8 × Q_cool 1.0 = 0.8 °C/h: below everything the curve claims, so it would
+    # invert to its most negative gap (a setpoint ~2 K above the head)
+    await ctrl.async_apply("cooling", 24.5, power_fraction=0.8, current_temp=27.0)
+    sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    assert sent and sent[-1] <= 24.5, sent
+
+
 # ---------------------------------------------------------------------------
 # Airflow-aware learning. Fan speed changes both learned quantities: the head's
 # offset from the room (less air past the return grille means it reads its own
