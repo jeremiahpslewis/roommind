@@ -456,6 +456,7 @@ class World:
                     "heat_w": round(d.heat_output_w()),
                     "electric_w": round(d.electric_w()),
                     "available": d.available,
+                    **({"fan_mode": d.fan_mode} if d.fan_modes else {}),
                     **({"valve": round(d.valve, 3)} if hasattr(d, "valve") else {}),
                     **({"t_slab": round(d.t_slab, 2)} if getattr(d, "t_slab", None) is not None else {}),
                     **({"t_rad": round(d.t_rad, 2)} if getattr(d, "t_rad", None) is not None else {}),

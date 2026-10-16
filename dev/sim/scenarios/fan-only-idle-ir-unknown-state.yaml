@@ -1,0 +1,20 @@
+name: fan-only-idle-ir-unknown-state
+extends: fan-only-idle-device-spelling
+description: >
+  IR AC with state "unknown" idling in fan_only on a speed the device spells "Low".
+  Without feedback only the sent-command cache can tell that fan_only and the speed are
+  already set; neither may go out again every 30 s cycle (#463, #416).
+refs: [463, 416]
+house:
+  rooms:
+    wohnzimmer:
+      devices:
+        - entity_id: climate.wz_ac
+          profile: broadlink_ir_ac
+          capabilities: {fan_modes: ["Auto", "Low", "Medium", "High"]}
+          quirks: [{type: no_state_feedback, state: unknown}]
+expect:
+  - {metric: device.redundant_commands, entity_id: climate.wz_ac, max: 120, label: "no fan_only or speed frame every cycle (the speed goes out once per idle start, plus the 30 min heating reassert)"}
+  - {metric: device.commands_per_hour, entity_id: climate.wz_ac, max: 15}
+  - {check: "dev('climate.wz_ac').mode == 'fan_only' and dev('climate.wz_ac').fan_mode == 'Low'", at: "+1d03h", label: night idle in fan_only on the device's Low}
+  - {invariant: no_rejected_commands}

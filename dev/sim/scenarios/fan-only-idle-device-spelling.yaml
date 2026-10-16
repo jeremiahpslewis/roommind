@@ -1,0 +1,44 @@
+name: fan-only-idle-device-spelling
+description: >
+  AC idling in fan_only with the default idle fan speed "low", while the integration
+  names its speeds "Auto/Low/Medium/High". The speed must reach the device under its
+  own name, and fan_only must not be resent every 30 s cycle because the device never
+  reports "low" (#463).
+refs: [463]
+tags: [ac, commands]
+start: 2026-01-12T00:00
+duration: 2d
+location: {latitude: 52.5, longitude: 13.4, time_zone: Europe/Berlin}
+weather: {profile: temperate}
+house:
+  building: bestand_teilsaniert
+  outdoor: {sensors: {temperature: sensor.aussen_temp}}
+  rooms:
+    wohnzimmer:
+      floor_area_m2: 24
+      initial: {temperature: 19.0}
+      windows: [{orientation: S, area_m2: 3}]
+      devices:
+        - entity_id: climate.wz_ac
+          profile: generic_split_ac
+          capabilities: {fan_modes: ["Auto", "Low", "Medium", "High"]}
+      sensors: {temperature: {entity_id: sensor.wz_temp}}
+helpers:
+  schedule:
+    tag: {daily: ["06:30-22:30"]}
+roommind:
+  settings:
+    outdoor_temp_sensor: sensor.aussen_temp
+  rooms:
+    wohnzimmer:
+      devices: [{entity_id: climate.wz_ac, type: ac, idle_action: fan_only, idle_fan_mode: low}]
+      temperature_sensor: sensor.wz_temp
+      climate_mode: heat_only
+      schedules: [{entity_id: schedule.tag}]
+      comfort_temp: 21.0
+      eco_temp: 18.0
+expect:
+  - {metric: device.redundant_commands, entity_id: climate.wz_ac, max: 150, label: "fan_only is not resent while the unit idles in it (the speed goes out once per idle start, ~100 starts)"}
+  - {metric: device.commands_per_hour, entity_id: climate.wz_ac, max: 15}
+  - {check: "dev('climate.wz_ac').mode == 'fan_only' and dev('climate.wz_ac').fan_mode == 'Low'", at: "+1d03h", label: night idle in fan_only on the device's Low}
+  - {invariant: no_rejected_commands}
