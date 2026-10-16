@@ -115,6 +115,8 @@ RoomMind keeps the current HVAC mode active, but moves the target away from the 
 - heating setback = `heat target - 2°C`
 - cooling setback = `cool target + 2°C`
 
+A `Direct` device's own offset and, for ACs, the learned idle sensor offset (see [Learned sensor offset](#learned-sensor-offset-acs)) are added to it.
+
 This lets the device back off instead of shutting off completely, so short pauses between runs don't turn into off/on cycles.
 
 Long pauses end in off: once the room has had no heating or cooling demand for an hour, and RoomMind's plan expects no run in the device's mode for the next hour, the device is turned off. When demand returns, RoomMind switches it back on as usual. This needs the predictive control (Full Control with an external sensor and a trained model). In Managed Mode, with `Simple` control, or while the model is still learning, the setback stays until the next run.
