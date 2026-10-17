@@ -6,7 +6,13 @@ import pytest
 from helpers import scenario
 
 from roommind_sim.analysis.load import RunData
-from roommind_sim.analysis.metrics import _cover_metrics, _room_metrics, _truth_beta_device, _truth_beta_s
+from roommind_sim.analysis.metrics import (
+    _cover_metrics,
+    _device_metrics,
+    _room_metrics,
+    _truth_beta_device,
+    _truth_beta_s,
+)
 from roommind_sim.scenario import load_scenario_dict
 
 
@@ -215,3 +221,27 @@ def test_cover_moves_on_a_day_with_a_manual_move_are_left_out_of_the_unattended_
     m = _cover_metrics(run, "cover.r", "r")
     assert m["max_commands_per_day"] == 2
     assert m["max_commands_per_day_unattended"] == 1
+
+
+def test_night_blower_hours_count_the_fast_fan_separately():
+    """Hourly samples from local midnight; each interval is booked at its end."""
+    scn = load_scenario_dict(scenario({"r": {"devices": [{"entity_id": "climate.d", "profile": "generic_split_ac"}]}}))
+    t0 = scn.start
+
+    def dev(hour: int) -> dict:
+        if hour in (0, 1, 2):
+            return {"mode": "cool", "active": False, "fan_mode": "Auto"}
+        if hour in (3, 4, 5):
+            return {"mode": "cool", "active": True, "fan_mode": "Quiet"}
+        if hour == 23:
+            return {"mode": "heat", "active": False, "fan_mode": "Auto"}  # thermo-off: blower stopped
+        return {"mode": "cool", "active": True, "fan_mode": "High"}  # daytime: not counted
+
+    samples = [
+        {"t": t0 + 3600 * i, "devices": {"climate.d": {"electric_w": 0, "heat_w": 0, **dev(i % 24)}}}
+        for i in range(25)
+    ]
+    run = RunData(None, scn, samples, [], [], t0 + 3600 * 24, {})  # type: ignore[arg-type]
+    m = _device_metrics(run, "climate.d", 24.0)
+    assert m["night_blower_h"] == pytest.approx(6.0)  # intervals ending 01-05 and 00 of the next day
+    assert m["night_fast_fan_h"] == pytest.approx(3.0)

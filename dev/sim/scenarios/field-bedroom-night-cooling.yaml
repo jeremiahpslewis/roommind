@@ -1,0 +1,40 @@
+name: field-bedroom-night-cooling
+description: >
+  Hot week, small bedroom under the roof with a 2.5 kW field unit (field_inverter_ac).
+  Comfort 22 °C from 21:30 to 07:00, eco 26 °C during the day. The night is where the
+  blower is heard, and where the quiet fan's lost capacity shows up as a warm room.
+tags: [ac, field]
+start: 2026-07-06T00:00
+duration: 5d
+location: {latitude: 52.5, longitude: 13.4, time_zone: Europe/Berlin}
+weather: {profile: hot-summer}
+house:
+  building: bestand_teilsaniert
+  outdoor: {sensors: {temperature: sensor.aussen_temp}}
+  rooms:
+    schlafzimmer:
+      floor_area_m2: 14
+      exterior_wall_m2: 16
+      initial: {temperature: 26.0, mass_temperature: 26.0}
+      windows: [{orientation: W, area_m2: 2, g_value: 0.6}]
+      devices: [{entity_id: climate.sz_ac, profile: field_inverter_ac, cool_capacity_w: 2500, sensor_offset_cool_k: 0.5, sensor_offset_idle_k: 1.0}]
+      sensors: {temperature: {entity_id: sensor.sz_temp}}
+helpers:
+  schedule:
+    nacht: {daily: ["00:00-07:00", "21:30-24:00"]}
+roommind:
+  settings:
+    outdoor_temp_sensor: sensor.aussen_temp
+    weather_entity: weather.simhome
+    control_mode: mpc
+  rooms:
+    schlafzimmer:
+      devices: [{entity_id: climate.sz_ac, type: ac}]
+      temperature_sensor: sensor.sz_temp
+      climate_mode: cool_only
+      schedules: [{entity_id: schedule.nacht}]
+      comfort_cool: 22.0
+      eco_cool: 26.0
+expect:
+  - {invariant: no_rejected_commands}
+  - {metric: comfort.overshoot_kh, room: schlafzimmer, max: 15, label: the bedroom is cool at night}

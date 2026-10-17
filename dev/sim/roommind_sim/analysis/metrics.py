@@ -169,13 +169,25 @@ def _room_metrics(run: RunData, area: str) -> dict[str, Any]:
     }
 
 
+NIGHT_HOURS = (23, 6)  # local [start, end) of the hours the blower is listened to
+SLOW_FAN_MODES = ("quiet", "silent", "silence", "night", "sleep", "eco", "low", "min")
+
+
+def _blower(d: dict[str, Any]) -> bool:
+    """The indoor fan moves air: always in cool/dry/fan_only, in heat only with the compressor running."""
+    mode = d.get("mode")
+    return mode not in (None, "off") and (mode != "heat" or bool(d.get("active")))
+
+
 def _device_metrics(run: RunData, eid: str, duration_h: float) -> dict[str, Any]:
     cmds = [c for c in run.commands if c["entity_id"] == eid]
     rejected = [c for c in cmds if str(c.get("result", "")).startswith("rejected")]
     noop = [c for c in cmds if c.get("result") == "accepted:no_change"]
     modes = run.commanded_modes(eid)
     runs = [iv for iv in modes if iv.value in ACTIVE_MODES]
-    electric_wh = heat_wh = active_h = 0.0
+    electric_wh = heat_wh = active_h = night_blower_h = night_fast_h = 0.0
+    has_fan = False
+    tz = ZoneInfo(run.scenario.location.time_zone)
     starts = 0
     prev = None
     was_active = False
@@ -189,6 +201,13 @@ def _device_metrics(run: RunData, eid: str, duration_h: float) -> dict[str, Any]
             heat_wh += d["heat_w"] * dt_h
             if d["active"]:
                 active_h += dt_h
+            if "fan_mode" in d:
+                has_fan = True
+                hour = datetime.fromtimestamp(s["t"], tz).hour
+                if (hour >= NIGHT_HOURS[0] or hour < NIGHT_HOURS[1]) and _blower(d):
+                    night_blower_h += dt_h
+                    if str(d["fan_mode"] or "").lower().split(" ")[0] not in SLOW_FAN_MODES:
+                        night_fast_h += dt_h
         if d["active"] and not was_active:
             starts += 1
         was_active = d["active"]
@@ -207,6 +226,9 @@ def _device_metrics(run: RunData, eid: str, duration_h: float) -> dict[str, Any]
         "active_h": round(active_h, 2),
         "electric_kwh": round(electric_wh / 1000, 3),
         "heat_kwh": round(heat_wh / 1000, 3),
+        # blower hours at night, and those on a fan speed above the slow end (a noise proxy)
+        "night_blower_h": round(night_blower_h, 2) if has_fan else None,
+        "night_fast_fan_h": round(night_fast_h, 2) if has_fan else None,
     }
 
 

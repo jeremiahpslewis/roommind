@@ -1,0 +1,14 @@
+name: field-ac-efficiency
+extends: ac-efficiency-near-target
+description: >
+  ac-efficiency-near-target (comfort_weight 20) with the field unit, where a unit held
+  at minimum output costs less per kWh of cooling than one that cycles.
+tags: [ac, field]
+house:
+  rooms:
+    wohnzimmer:
+      devices: [{entity_id: climate.wz_ac, profile: field_inverter_ac, cool_capacity_w: 3500}]
+expect:
+  - {invariant: no_rejected_commands}
+  - {invariant: no_full_cooling_at_target, label: no lowest AC setpoint once the room is at its target}
+  - {metric: comfort.overshoot_kh, room: wohnzimmer, max: 9, label: cooling keeps the room near its target}

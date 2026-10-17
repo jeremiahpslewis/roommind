@@ -1,0 +1,19 @@
+name: field-multisplit-heating
+extends: multisplit-setback-release
+description: >
+  multisplit-setback-release with three field units: whole-degree heads that read
+  1.5 K warm while heating, hvac_action from the mode, start losses and part-load
+  efficiency, and a quiet fan that costs capacity.
+tags: [ac, field, compressor]
+house:
+  rooms:
+    wohnzimmer:
+      devices: [{entity_id: climate.wz_split, profile: field_inverter_ac}]
+    schlafzimmer:
+      devices: [{entity_id: climate.sz_split, profile: field_inverter_ac}]
+    buero:
+      devices: [{entity_id: climate.buero_split, profile: field_inverter_ac}]
+expect:
+  - {invariant: no_rejected_commands}
+  - {invariant: no_heat_and_cool_same_group}
+  - {metric: comfort.in_band_pct, room: schlafzimmer, min: 90, label: the bedroom stays in its band}

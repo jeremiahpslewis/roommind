@@ -145,7 +145,19 @@ class SplitAc(SimDevice):
     Real units ramp up with a time constant of 40-76 s (DOE/AHRI cycling tests). The
     profile keeps ``capacity_tau_s`` at 0: the room's air node reacts 2-4x faster than
     real rooms to an AC, and together with the lag that turns into short cycles and a
-    mislearned model that real data do not show."""
+    mislearned model that real data do not show.
+
+    Off unless a profile sets them:
+
+    - ``fan_capacity`` / ``fan_power_w``: capacity share and blower power per fan mode
+      (case-insensitive). A quiet blower moves less air over the coil, so the unit
+      delivers less at the same compressor demand.
+    - ``part_load_eer``: ``[[output, factor], ...]``, EER/COP multiplier over the
+      delivered share. Inverters are most efficient well below full output.
+    - ``start_loss_s``: after a start the delivered output ramps up linearly over this
+      time while the compressor already draws full power (refrigerant redistribution).
+      Unlike ``capacity_tau_s`` this does not come back after the stop, so every
+      start costs energy, like the cycling degradation of AHRI 210/240."""
 
     model = "ac"
 
@@ -175,6 +187,21 @@ class SplitAc(SimDevice):
 
     def _sensor(self, t_air: float) -> float:
         return t_air + self.sensor_offset_k
+
+    def _per_fan(self, key: str, default: float) -> float:
+        table = {str(k).lower(): float(v) for k, v in (self.spec.params.get(key) or {}).items()}
+        return table.get((self.fan_mode or "").lower(), default)
+
+    def _part_load(self, output: float) -> float:
+        points = sorted((float(x), float(f)) for x, f in self.spec.params.get("part_load_eer") or [])
+        if not points:
+            return 1.0
+        if output <= points[0][0]:
+            return points[0][1]
+        for (x0, f0), (x1, f1) in zip(points, points[1:], strict=False):
+            if output <= x1:
+                return f0 + (f1 - f0) * (output - x0) / (x1 - x0)
+        return points[-1][1]
 
     def _wanted(self, reading: float) -> str | None:
         p = self.spec.params
@@ -253,17 +280,25 @@ class SplitAc(SimDevice):
             self.output, self.output_mode = 0.0, None
         out_mode = self.output_mode
         if out_mode and self.output > 0:
+            fan_share = self._per_fan("fan_capacity", 1.0)
+            efficiency = self._part_load(self.output)
+            start_loss = float(p.get("start_loss_s", 0.0))
+            ramp = 1.0
+            if start_loss > 0 and self.running_mode:
+                ramp = clamp((env.now - self.on_since) / start_loss, 0.0, 1.0)
             if out_mode == "heat":
                 cap = float(p.get("heat_capacity_w", 3500)) * max(
                     0.3, 1 - float(p.get("heat_derate_per_k", 0.02)) * max(0.0, 7 - t_out)
                 )
-                heat_w = cap * self.output
+                drawn = cap * fan_share * self.output
+                heat_w = drawn * ramp
                 a, b = p.get("cop_heat", [3.2, 0.06])
-                electric = heat_w / max(1.5, a + b * t_out)
+                electric = drawn / (max(1.5, a + b * t_out) * efficiency)
             else:
-                q = float(p.get("cool_capacity_w", 3500)) * self.output
+                drawn = float(p.get("cool_capacity_w", 3500)) * fan_share * self.output
+                q = drawn * ramp
                 shr = 0.5 if self.hvac_mode == "dry" else float(p.get("shr", 0.75))
-                electric = q / float(p.get("eer", 3.5))
+                electric = drawn / (float(p.get("eer", 3.5)) * efficiency)
                 if z.x > abs_humidity(COIL_TEMP_C, 100):
                     latent = q * (1 - shr)
                     moisture = -latent / LATENT_HEAT
@@ -280,7 +315,7 @@ class SplitAc(SimDevice):
                 if self.hvac_mode == "fan_only":
                     moisture += evap / dt
         fan_on = self.hvac_mode != "off" and self.available
-        electric += 25.0 if fan_on else 2.0
+        electric += self._per_fan("fan_power_w", 25.0) if fan_on else 2.0
         self.active = self.running_mode is not None
         self.hvac_action = {
             "heat": "heating",

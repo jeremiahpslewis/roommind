@@ -208,3 +208,50 @@ def test_split_ac_waits_for_its_restart_delay():
     run(w, 120)
     assert d.running_mode == "cool"
     assert d.counters.starts == 2
+
+
+def test_split_ac_quiet_fan_delivers_less_and_draws_less():
+    out = {}
+    for fan in ("auto", "quiet"):
+        w, d = _one("generic_split_ac", temp=28.0, fan_capacity={"quiet": 0.6}, fan_power_w={"quiet": 10})
+        d.call("set_temperature", {"temperature": 16, "hvac_mode": "cool"}, w.now)
+        d.fan_mode = fan
+        run(w, 60)
+        out[fan] = (d.heat_output_w(), d.electric_w())
+    assert out["quiet"][0] == pytest.approx(0.6 * out["auto"][0], rel=0.02)
+    assert out["quiet"][1] < out["auto"][1]
+
+
+def test_split_ac_part_load_is_cheaper_per_watt():
+    w, d = _one("generic_split_ac", temp=28.0, part_load_eer=[[0.3, 1.5], [1.0, 1.0]], shr=1.0)
+    d.call("set_temperature", {"temperature": 16, "hvac_mode": "cool"}, w.now)
+    run(w, 60)
+    full = -d.heat_output_w() / (d.electric_w() - 25)
+    d.call("set_temperature", {"temperature": 28, "hvac_mode": "cool"}, w.now)
+    run(w, 30)
+    assert d.modulation == pytest.approx(0.3)
+    low = -d.heat_output_w() / (d.electric_w() - 25)
+    assert full == pytest.approx(3.5, rel=0.01)
+    assert low == pytest.approx(3.5 * 1.5, rel=0.01)
+
+
+def test_split_ac_start_loss_draws_power_before_it_delivers():
+    w, d = _one("generic_split_ac", temp=28.0, start_loss_s=120, shr=1.0)
+    d.call("set_temperature", {"temperature": 16, "hvac_mode": "cool"}, w.now)
+    run(w, 60)
+    assert d.running_mode == "cool"
+    assert 0.3 * 3500 < -d.heat_output_w() < 0.6 * 3500
+    assert d.electric_w() == pytest.approx(3500 / 3.5 + 25, rel=0.01)
+    run(w, 120)
+    assert -d.heat_output_w() == pytest.approx(3500, rel=0.01)
+
+
+def test_action_from_mode_reports_cooling_while_the_unit_idles():
+    w, d = _one("generic_split_ac", temp=20.0, quirks=[{"type": "action_from_mode"}])
+    d.call("set_temperature", {"temperature": 26, "hvac_mode": "cool"}, w.now)
+    run(w, 60)
+    assert d.running_mode is None and d.hvac_action == "idle"
+    assert d.attributes(w.now)["hvac_action"] == "cooling"
+    d.call("set_hvac_mode", {"hvac_mode": "off"}, w.now)
+    run(w, 10)
+    assert d.attributes(w.now)["hvac_action"] == "off"

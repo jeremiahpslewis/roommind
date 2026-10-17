@@ -178,6 +178,19 @@ class NoStateFeedback(Quirk):
         return "unknown" if self.p.get("state") == "unknown" else None
 
 
+@register("action_from_mode")
+class ActionFromMode(Quirk):
+    """hvac_action follows the mode, not the compressor: "cooling" whenever the unit is
+    in cool, also while it idles at its setpoint (many cloud AC integrations)."""
+
+    ACTIONS = {"heat": "heating", "cool": "cooling", "dry": "drying", "fan_only": "fan"}
+
+    def transform_attributes(self, dev, attrs, now):  # noqa: ANN001, ANN201
+        if "hvac_action" not in attrs or dev.hvac_mode not in self.ACTIONS:
+            return attrs
+        return {**attrs, "hvac_action": self.ACTIONS[dev.hvac_mode]}
+
+
 @register("availability")
 class Availability(Quirk):
     """Unavailable after HA start (#437, #181), offline when held off (#183), flapping."""

@@ -1,0 +1,19 @@
+description: >
+  Cloud-backed inverter split as field diagnostics show it: whole-degree setpoints and
+  head reading, hvac_action that follows the mode, a unit that keeps trickling up to
+  1.5 K past its setpoint, a quiet fan that costs about a third of the capacity, best
+  efficiency at part load, and a couple of minutes of lost output after every start.
+extends: generic_split_ac
+capabilities:
+  fan_modes: ["Auto", "Quiet", "Low", "Medium", "High"]
+  target_temp_step: 1
+params:
+  deadband_k: 1.5              # runs on at minimum output a step past its setpoint, stops at 1.5 K
+  fan_capacity: {quiet: 0.68, low: 0.8, medium: 0.9}   # quiet: 1.93 vs 2.83 °C/h learned at the same gap
+  fan_power_w: {quiet: 10, low: 15, medium: 22, auto: 25, high: 35}
+  part_load_eer: [[0.3, 1.5], [0.6, 1.25], [1.0, 1.0]]  # inverter EER at minimum output ~1.5x rated
+  start_loss_s: 120            # output ramps over 2 min while the compressor draws full power
+quirks:
+  - {type: rounding}
+  - {type: action_from_mode}
+  - {type: state_lag, seconds: 30}

@@ -1,0 +1,15 @@
+name: field-ac-summer
+extends: ekf-summer-ac
+description: >
+  ekf-summer-ac with the unit as field diagnostics show it (field_inverter_ac): whole
+  degrees, hvac_action from the mode, trickle past the setpoint, part-load efficiency
+  and start losses. Compares controllers on energy and starts as well as comfort.
+tags: [ac, field]
+duration: 5d
+house:
+  rooms:
+    wohnzimmer:
+      devices: [{entity_id: climate.wz_ac, profile: field_inverter_ac, cool_capacity_w: 3500}]
+expect:
+  - {invariant: no_rejected_commands}
+  - {metric: comfort.overshoot_kh, room: wohnzimmer, max: 9, label: cooling keeps the room near its target}

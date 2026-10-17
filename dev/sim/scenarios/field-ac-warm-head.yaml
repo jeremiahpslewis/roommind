@@ -1,0 +1,15 @@
+name: field-ac-warm-head
+extends: ac-warm-head-cooling
+description: >
+  ac-warm-head-cooling with the field unit: the head reads 1 K warm while cooling and
+  2 K once stopped, in whole degrees, and reports "cooling" whenever it is in cool, so
+  a learner that buckets readings by hvac_action never sees an idle reading.
+tags: [ac, field]
+house:
+  rooms:
+    wohnzimmer:
+      devices:
+        - {entity_id: climate.wz_ac, profile: field_inverter_ac, cool_capacity_w: 3500, sensor_offset_cool_k: 1.0, sensor_offset_idle_k: 2.0}
+expect:
+  - {invariant: no_rejected_commands}
+  - {metric: comfort.overshoot_kh, room: wohnzimmer, max: 9, label: cooling keeps the room near its target}
