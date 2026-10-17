@@ -3113,6 +3113,10 @@ class MPCController:
         """Offset learned by upstream's HeadOffsetTracker for *state* ("heat"/"cool"/"idle"), 0.0 if none."""
         return self._head_offsets.offset(eid, state) if self._head_offsets is not None else 0.0
 
+    def _head_offset_learned(self, eid: str, *states: str) -> bool:
+        """True when any of *states* has a learned offset, a learned 0.0 included."""
+        return self._head_offsets is not None and any(self._head_offsets.learned(eid, s) for s in states)
+
     def head_frame_shift(
         self,
         eid: str,
@@ -3129,8 +3133,9 @@ class MPCController:
         (*intent*, "cool"/"heat") for active commands, the most adverse of that
         and the idle offset for releases (``release_intent`` = "cool"/"heat"),
         because a release must clear the reading the head settles to once the
-        unit stops. Falls back to the instantaneous head-vs-room delta from the
-        device's ``current_temperature`` attribute. Clamped to ±AC_MAX_HEAD_GAP_C
+        unit stops. Until an offset is learned it falls back to the instantaneous
+        head-vs-room delta from the device's ``current_temperature`` attribute
+        (a learned 0.0 counts as learned). Clamped to ±AC_MAX_HEAD_GAP_C
         so a broken head sensor cannot command an absurd setpoint. 0.0 without data.
 
         ``learned_only`` drops that instantaneous fallback. The delta between a
@@ -3146,9 +3151,13 @@ class MPCController:
             running = self._learned_head_offset(eid, release_intent)
             idle = self._learned_head_offset(eid, "idle")
             offset = max(running, idle) if release_intent == "cool" else min(running, idle)
+            learned = self._head_offset_learned(eid, release_intent, "idle")
         else:
             offset = self._learned_head_offset(eid, intent)
-        if not offset and not learned_only:
+            learned = self._head_offset_learned(eid, intent)
+        # A learned 0.0 is a measurement, not a gap to fill with the live delta (which is
+        # the room error as much as a bias): the fallback only stands in until one is learned.
+        if not learned and not learned_only:
             state = self.hass.states.get(eid)
             raw = state.attributes.get("current_temperature") if state else None
             try:

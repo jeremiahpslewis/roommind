@@ -11,7 +11,7 @@ VERSION = "1.7.9"
 # Fork build stamp, bumped on every ship. Surfaced in diagnostics and the
 # startup log so the code actually running is never in doubt (a stale tarball
 # or an un-reloaded module looks identical to the new one otherwise).
-BUILD_ID = "2026-10-17.1-on-upstream-main-2070437"
+BUILD_ID = "2026-10-17.2-on-upstream-main-2070437"
 
 # Platforms
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BINARY_SENSOR, Platform.CLIMATE]

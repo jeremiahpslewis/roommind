@@ -636,3 +636,19 @@ async def test_learned_offset_moves_an_active_ac_setpoint_once():
     plain = await _cooling_sent(head_temp=26.0, offsets=None)
     learned = await _cooling_sent(head_temp=29.0, offsets=_tracker(cool=1.5))
     assert learned == pytest.approx(plain + 1.5)
+
+
+def test_a_learned_zero_offset_is_not_replaced_by_the_live_reading():
+    """The tracker hands out a 0.5 K grid, so a learned ~0 K comes back as 0.0; that is a measurement.
+
+    Falling back to the live head-vs-room delta there made the shift follow the room error
+    every cycle (sim covers-shade-before-cooling: 8 → 21 Kh above target).
+    """
+    hass = _ac_hass(head_temp=23.5)
+    tracker = HeadOffsetTracker()
+    tracker.load_state({"climate.ac": {"cool": [0.04, 50], "idle": [-0.07, 50]}})
+    ctrl = MPCController(hass, _ac_room(), model_manager=RoomModelManager(), settings={}, head_offsets=tracker)
+    assert ctrl.head_frame_shift("climate.ac", 22.0, "cool") == 0.0
+    assert ctrl.head_frame_shift("climate.ac", 22.0, release_intent="cool") == 0.0
+    # Nothing learned for heating yet: the live reading stands in
+    assert ctrl.head_frame_shift("climate.ac", 22.0, "heat") == 1.5

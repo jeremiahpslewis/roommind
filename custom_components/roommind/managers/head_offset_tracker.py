@@ -74,6 +74,11 @@ class HeadOffsetTracker:
             entry[1] += 1
         self.dirty = True
 
+    def learned(self, entity_id: str, intent: str) -> bool:
+        """True once ``offset()`` returns a learned value for *intent*, even if that value is 0.0 (fork)."""
+        entry = self._offsets.get(entity_id, {}).get(intent)
+        return entry is not None and entry[1] >= HEAD_OFFSET_MIN_SAMPLES
+
     def offset(self, entity_id: str, intent: str) -> float:
         """Learned offset (K) for ``intent`` ("heat"/"cool"/"idle"), 0.0 until enough readings."""
         entry = self._offsets.get(entity_id, {}).get(intent)
