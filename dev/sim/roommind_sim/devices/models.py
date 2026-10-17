@@ -154,6 +154,8 @@ class SplitAc(SimDevice):
       delivers less at the same compressor demand.
     - ``part_load_eer``: ``[[output, factor], ...]``, EER/COP multiplier over the
       delivered share. Inverters are most efficient well below full output.
+    - ``ki``: integral action, modulation per K·s of gap. With it the unit reaches its
+      setpoint under load instead of settling past it with a proportional droop.
     - ``start_loss_s``: after a start the delivered output ramps up linearly over this
       time while the compressor already draws full power (refrigerant redistribution).
       Unlike ``capacity_tau_s`` this does not come back after the stop, so every
@@ -171,6 +173,7 @@ class SplitAc(SimDevice):
         self.off_since = -1e12
         self.coil_water_kg = 0.0
         self.sensor_offset_k = 0.0
+        self.integral = 0.0  # PI share of the modulation (``ki``), 0 while stopped
 
     def _update_sensor_offset(self, dt: float) -> None:
         p = self.spec.params
@@ -259,13 +262,20 @@ class SplitAc(SimDevice):
         if self.running_mode:
             if self.running_mode == "heat":
                 sp = self.to_c(self.target_low) if self.target_low is not None else self.target_c
-                err = max(0.0, sp - reading)
+                signed = sp - reading
             else:
-                err = max(0.0, reading - self.target_c)
+                signed = reading - self.target_c
+            err = max(0.0, signed)
             lo = float(p.get("min_modulation", 0.3))
-            self.modulation = 0.4 if self.hvac_mode == "dry" else clamp(lo + float(p.get("kp", 0.6)) * err, lo, 1.0)
+            # Integral action (ki per K·s): a persistent gap ramps the compressor up until
+            # the unit reaches its setpoint, and unwinds once it is past it.
+            self.integral = clamp(self.integral + float(p.get("ki", 0.0)) * signed * dt, 0.0, 1.0 - lo)
+            self.modulation = (
+                0.4 if self.hvac_mode == "dry" else clamp(lo + float(p.get("kp", 0.6)) * err + self.integral, lo, 1.0)
+            )
         else:
             self.modulation = 0.0
+            self.integral = 0.0
         if self.running_mode and self.output_mode not in (None, self.running_mode):
             self.output = 0.0  # reversing the cycle starts from scratch
         tau = float(p.get("capacity_tau_s", 0.0))
@@ -336,6 +346,7 @@ class SplitAc(SimDevice):
             "output_mode": self.output_mode,
             "coil_water_kg": self.coil_water_kg,
             "sensor_offset_k": self.sensor_offset_k,
+            "integral": self.integral,
         }
 
     def _restore_model_state(self, data: dict[str, Any]) -> None:
@@ -346,6 +357,7 @@ class SplitAc(SimDevice):
         self.output_mode = data.get("output_mode")
         self.coil_water_kg = data.get("coil_water_kg", 0.0)
         self.sensor_offset_k = data.get("sensor_offset_k", 0.0)
+        self.integral = data.get("integral", 0.0)
 
 
 @dataclass

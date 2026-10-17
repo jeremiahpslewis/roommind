@@ -255,3 +255,27 @@ def test_action_from_mode_reports_cooling_while_the_unit_idles():
     d.call("set_hvac_mode", {"hvac_mode": "off"}, w.now)
     run(w, 10)
     assert d.attributes(w.now)["hvac_action"] == "off"
+
+
+def test_split_ac_integral_action_reaches_its_setpoint_under_load():
+    """Proportional only, a cooling unit under a heavy load settles past its setpoint."""
+    hot = {"weather": {"profile": "temperate", "fixed": {"temperature": 35.0, "cloud": 0.0, "humidity": 40.0}}}
+    out = {}
+    for ki in (0.0, 0.002):
+        w = world(
+            {
+                "r": {
+                    "initial": {"temperature": 26.0},
+                    "devices": [
+                        {"entity_id": "climate.d", "profile": "generic_split_ac", "cool_capacity_w": 1500, "ki": ki}
+                    ],
+                }
+            },
+            **hot,
+        )
+        d = w.devices["climate.d"]
+        d.call("set_temperature", {"temperature": 24, "hvac_mode": "cool"}, w.now)
+        run(w, 4 * 3600)
+        out[ki] = w.zones["r"].t_air
+    assert out[0.002] < out[0.0]
+    assert out[0.002] == pytest.approx(24.0, abs=0.3)
