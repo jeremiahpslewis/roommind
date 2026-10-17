@@ -39,7 +39,7 @@ On a device that only accepts whole-degree setpoints the excursion is rounded up
 
 The rules above are a heuristic: they assume how much cooling a given gap buys. RoomMind can instead **measure** it, per device.
 
-Your AC reports two things HA can read — its own sensor (`current_temperature`) and the setpoint it is regulating against. The difference is the gap actually driving its compressor and fan. RoomMind compares the room's temperature change against the passive drift its thermal model predicts, and the residual is the work the unit did. That gives a curve of gap → °C/h, plus the `T_head − T_room` offset, which is why a "boost" was ever needed: the unit stops when *its* sensor reads the setpoint, not yours.
+Your AC reports two things HA can read — its own sensor (`current_temperature`) and the setpoint it is regulating against. The difference is the gap actually driving its compressor and fan. RoomMind compares the room's temperature change against the passive drift its thermal model predicts, and the residual is the work the unit did. That gives a curve of gap → °C/h. The `T_head − T_room` offset comes from the [learned sensor offset](#learned-sensor-offset-acs); it is why a "boost" was ever needed: the unit stops when *its* sensor reads the setpoint, not yours.
 
 Once identified, commanding becomes a measurement rather than a guess:
 
@@ -120,6 +120,8 @@ An AC regulates on the sensor in its indoor unit. A wall unit under the ceiling 
 
 This only applies in rooms with an external room sensor and to devices that report `hvac_action`. `Direct` devices keep the offset you set yourself. Offsets beyond ±4 °C are ignored as a misplaced or broken sensor. The learned values are in the diagnostics download (`ac_head_offsets`).
 
+In this fork the AC's proportional setpoints go through its own head frame (quantized to the device step, with the learned gap response and the holding servo) using the same offsets, so the bias is corrected once: the heating or cooling offset for an active command, and the more adverse of that and the idle offset for a release. Until an offset is learned, the head's live `current_temperature` stands in for it.
+
 #### Upper device limit
 
 In `Proportional` mode the boosted heating setpoint stays one step (`target_temp_step`, 0.5 °C if the device reports none) below the device's `max_temp`, and never below the room target. Some integrations reject exactly their own `max_temp`, which made the Dyson Heat/Cool purifier ignore the 37°C setpoint. The cooling floor (`min_temp`) is unchanged.
@@ -151,6 +153,8 @@ RoomMind keeps the current HVAC mode active, but moves the target away from the 
 - cooling setback = `cool target + 2°C`
 
 A `Direct` device's own offset and, for ACs, the learned idle sensor offset (see [Learned sensor offset](#learned-sensor-offset-acs)) are added to it.
+
+In this fork an AC's setback is set from the unit's own reading instead: one step past what its sensor reads, or up to 3 °C past it once the room is clear of the target, floored where the room is left alone. Only a unit that reports no reading gets `target ± 1 °C` plus the learned idle offset.
 
 This lets the device back off instead of shutting off completely, so short pauses between runs don't turn into off/on cycles.
 

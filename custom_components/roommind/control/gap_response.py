@@ -4,8 +4,8 @@ An AC regulates against its own return-air sensor, not the room sensor, and its
 compressor and fan output scale with the gap between that sensor and the
 setpoint it is given. Two quantities fully describe the actuator:
 
-    offset  = T_head - T_room                 (measured, not learned)
-    rate    = f(gap)                          (learned, monotone, saturating)
+    offset  = T_head - T_room                 (HeadOffsetTracker, per heat/cool/idle)
+    rate    = f(gap)                          (learned here, monotone, saturating)
 
 where ``gap`` is measured at the head — ``T_head - setpoint`` — and ``rate`` is
 the *incremental* cooling the room gains in °C/h beyond what it would have done
@@ -82,20 +82,13 @@ RUNNING_STATES: dict[str, frozenset[str]] = {
     "heating": frozenset({"heat", "heat_cool", "auto"}),
 }
 
-# Offset smoothing. Tracked separately for running and idle because a
-# high wall unit reads warm when idle (stratification) and close to return-air
-# temperature once its fan is moving air — the running value is the one that
-# matters when commanding.
-OFFSET_ALPHA = 0.1
-MAX_PLAUSIBLE_OFFSET = 10.0
 
 # --------------------------------------------------------------- airflow class
-# Fan speed changes BOTH quantities this module learns. The head's offset from
-# the room is an airflow artefact before it is a sensor bias — less air past
-# the return grille means the head reads its own stratified corner rather than
-# the room — and the rate a given gap buys scales with the air that carries it,
-# so a quiet head delivers a fraction of the same gap's cooling. Learning them
-# pooled across fan speeds fits a curve that is right for no speed at all.
+# Fan speed changes what this module learns: the rate a given gap buys scales
+# with the air that carries it, so a quiet head delivers a fraction of the same
+# gap's cooling. A curve pooled across fan speeds is right for no speed at all.
+# (The head's offset from the room is learned per heat/cool/idle by
+# HeadOffsetTracker, not per airflow class.)
 #
 # Two classes, not one per named mode. The curves are thin already (a head with
 # 2891 observations still has knots sitting on 11 samples), and splitting seven
@@ -355,116 +348,24 @@ class GapResponse:
         return obj
 
 
-class HeadOffset:
-    """Smoothed T_head - T_room, tracked separately for running and idle."""
-
-    def __init__(self) -> None:
-        self.running: float | None = None
-        self.idle: float | None = None
-        self.n_running: int = 0
-        self.n_idle: int = 0
-
-    def observe(self, head_temp: float, room_temp: float, *, is_running: bool) -> bool:
-        offset = head_temp - room_temp
-        if abs(offset) > MAX_PLAUSIBLE_OFFSET:
-            return False
-        if is_running:
-            self.running = offset if self.running is None else self.running + OFFSET_ALPHA * (offset - self.running)
-            self.n_running += 1
-        else:
-            self.idle = offset if self.idle is None else self.idle + OFFSET_ALPHA * (offset - self.idle)
-            self.n_idle += 1
-        return True
-
-    def commanding_offset(self) -> float:
-        """Offset to apply when commanding a setpoint.
-
-        The running value is the operative one — it is the bias present while
-        the unit is deciding whether it has reached its setpoint. Falls back to
-        the idle estimate, then to zero, so an unknown offset degrades to
-        "trust the device's sensor" rather than to a guess.
-        """
-        if self.running is not None and self.n_running >= MIN_KNOT_SAMPLES:
-            return round(self.running, 2)
-        if self.idle is not None and self.n_idle >= MIN_KNOT_SAMPLES:
-            return round(self.idle, 2)
-        return 0.0
-
-    def release_offset(self, intent: str) -> float:
-        """Offset to apply when commanding a release or hold setpoint.
-
-        A release must clear the reading the head settles to once the fan
-        slows — the idle (stratified) value, which on a high wall unit sits
-        well above the running (return-air) value. Using the running offset
-        there under-shoots the release and re-arms the compressor the moment
-        the fan stops moving air. Take the most adverse of the known
-        estimates for the given intent ("cool": warmest, "heat": coldest);
-        degrade to zero like commanding_offset.
-        """
-        candidates = []
-        if self.running is not None and self.n_running >= MIN_KNOT_SAMPLES:
-            candidates.append(self.running)
-        if self.idle is not None and self.n_idle >= MIN_KNOT_SAMPLES:
-            candidates.append(self.idle)
-        if not candidates:
-            return 0.0
-        return round(max(candidates) if intent == "cool" else min(candidates), 2)
-
-    def seeded_copy(self) -> HeadOffset:
-        """A copy of the estimates, with the sample gates only just satisfied.
-
-        The values themselves converge at OFFSET_ALPHA regardless of count, so
-        only the gates need resetting — the seeded offset is usable at once and
-        is pulled to the new airflow class within a few dozen observations.
-        """
-        obj = HeadOffset()
-        obj.running, obj.idle = self.running, self.idle
-        obj.n_running = min(self.n_running, SEED_PRIOR_COUNT)
-        obj.n_idle = min(self.n_idle, SEED_PRIOR_COUNT)
-        return obj
-
-    def to_dict(self) -> dict:
-        return {
-            "running": self.running,
-            "idle": self.idle,
-            "n_running": self.n_running,
-            "n_idle": self.n_idle,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> HeadOffset:
-        obj = cls()
-        obj.running = data.get("running")
-        obj.idle = data.get("idle")
-        obj.n_running = int(data.get("n_running", 0))
-        obj.n_idle = int(data.get("n_idle", 0))
-        return obj
-
-
 class GapResponseManager:
-    """Per-device, per-mode, per-airflow gap response curves and head offsets.
+    """Per-device, per-mode, per-airflow gap response curves.
 
     Airflow is part of the key because it is part of the physics: the same head
-    at the same gap delivers a different rate, and reads a different offset,
-    depending on how hard its blower is turning. A bucket that has not been
-    seen yet is seeded from the pooled history rather than started empty, so
-    adding the dimension never costs the controller its learned path.
+    at the same gap delivers a different rate depending on how hard its blower
+    is turning. A bucket that has not been seen yet is seeded from the pooled
+    history rather than started empty, so adding the dimension never costs the
+    controller its learned path.
     """
 
     def __init__(self) -> None:
         self._curves: dict[str, GapResponse] = {}
-        self._offsets: dict[str, HeadOffset] = {}
         # Pooled, pre-airflow estimates kept only to seed new buckets.
         self._legacy_curves: dict[str, GapResponse] = {}
-        self._legacy_offsets: dict[str, HeadOffset] = {}
 
     @staticmethod
     def _key(entity_id: str, mode: str, airflow: str = AIRFLOW_NORMAL) -> str:
         return f"{entity_id}|{mode}|{airflow}"
-
-    @staticmethod
-    def _offset_key(entity_id: str, airflow: str = AIRFLOW_NORMAL) -> str:
-        return f"{entity_id}|{airflow}"
 
     def curve(self, entity_id: str, mode: str, airflow: str = AIRFLOW_NORMAL) -> GapResponse:
         key = self._key(entity_id, mode, airflow)
@@ -483,43 +384,6 @@ class GapResponseManager:
             if sibling is not None and sibling.n_observations:
                 return sibling.seeded_copy()
         return GapResponse()
-
-    def offset(self, entity_id: str, airflow: str = AIRFLOW_NORMAL) -> HeadOffset:
-        key = self._offset_key(entity_id, airflow)
-        if key not in self._offsets:
-            self._offsets[key] = self._seed_offset(entity_id, airflow)
-        return self._offsets[key]
-
-    def _seed_offset(self, entity_id: str, airflow: str) -> HeadOffset:
-        legacy = self._legacy_offsets.get(entity_id)
-        if legacy is not None:
-            return legacy.seeded_copy()
-        for other in (AIRFLOW_NORMAL, AIRFLOW_QUIET):
-            if other == airflow:
-                continue
-            sibling = self._offsets.get(self._offset_key(entity_id, other))
-            if sibling is not None and (sibling.n_running or sibling.n_idle):
-                return sibling.seeded_copy()
-        return HeadOffset()
-
-    def observe_offset(
-        self,
-        entity_id: str,
-        head_temp: float,
-        room_temp: float,
-        *,
-        is_running: bool,
-        airflow: str = AIRFLOW_NORMAL,
-    ) -> None:
-        if self.offset(entity_id, airflow).observe(head_temp, room_temp, is_running=is_running):
-            _LOGGER.debug(
-                "gap-response: %s offset observation head=%.2f room=%.2f delta=%.2f running=%s",
-                entity_id,
-                head_temp,
-                room_temp,
-                head_temp - room_temp,
-                is_running,
-            )
 
     def observe_response(
         self,
@@ -563,10 +427,7 @@ class GapResponseManager:
         )
 
     def to_dict(self) -> dict:
-        return {
-            "curves": {k: v.to_dict() for k, v in self._curves.items()},
-            "offsets": {k: v.to_dict() for k, v in self._offsets.items()},
-        }
+        return {"curves": {k: v.to_dict() for k, v in self._curves.items()}}
 
     @classmethod
     def from_dict(cls, data: dict) -> GapResponseManager:
@@ -584,10 +445,5 @@ class GapResponseManager:
                 obj._curves[k] = curve
             else:
                 obj._legacy_curves[k] = curve
-        for k, v in (data.get("offsets") or {}).items():
-            off = HeadOffset.from_dict(v)
-            if "|" in k:
-                obj._offsets[k] = off
-            else:
-                obj._legacy_offsets[k] = off
+        # "offsets" from earlier fork builds are dropped: HeadOffsetTracker owns them now
         return obj

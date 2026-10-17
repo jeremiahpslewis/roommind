@@ -135,18 +135,19 @@ async def test_no_room_sensor_means_no_learning(hass, mock_config_entry):
 
 
 def test_device_setpoint_display_is_in_the_acs_frame():
+    # Fork: the shown value follows the fork's head_frame_shift (sourced from HeadOffsetTracker)
     from custom_components.roommind.coordinator import RoomMindCoordinator
 
     show = RoomMindCoordinator._compute_device_setpoint
     cool = {"device_min_temp": 16.0, "has_thermostats": False, "has_acs": True}
     plain = show("cooling", 0.2, 24.5, 24.0, True, **cool)
-    assert show("cooling", 0.2, 24.5, 24.0, True, head_offset=1.5, **cool) == pytest.approx(plain + 1.5)
+    assert show("cooling", 0.2, 24.5, 24.0, True, head_frame_shift=1.5, **cool) == pytest.approx(plain + 1.5)
     heat_ac = {"device_max_temp": 30.0, "has_thermostats": False, "has_acs": True}
     plain = show("heating", 0.1, 20.5, 21.0, True, **heat_ac)
-    assert show("heating", 0.1, 20.5, 21.0, True, head_offset=1.5, **heat_ac) == pytest.approx(plain + 1.5)
+    assert show("heating", 0.1, 20.5, 21.0, True, head_frame_shift=1.5, **heat_ac) == pytest.approx(plain + 1.5)
     # With TRVs in the room the shown value is the TRV's, which has no head offset
     heat_trv = {"device_max_temp": 30.0, "has_thermostats": True, "has_acs": True}
-    assert show("heating", 0.1, 20.5, 21.0, True, head_offset=1.5, **heat_trv) == show(
+    assert show("heating", 0.1, 20.5, 21.0, True, head_frame_shift=1.5, **heat_trv) == show(
         "heating", 0.1, 20.5, 21.0, True, **heat_trv
     )
 

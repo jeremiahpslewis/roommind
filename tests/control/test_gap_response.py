@@ -12,10 +12,17 @@ from custom_components.roommind.control.gap_response import (
     MIN_TOTAL_SAMPLES,
     GapResponse,
     GapResponseManager,
-    HeadOffset,
 )
 from custom_components.roommind.control.mpc_controller import MPCController, clear_command_cache
 from custom_components.roommind.control.thermal_model import RCModel, RoomModelManager
+from custom_components.roommind.managers.head_offset_tracker import HeadOffsetTracker
+
+
+def _tracker(eid: str = "climate.ac", **offsets: float) -> HeadOffsetTracker:
+    """Upstream's head offset tracker with *offsets* ("heat"/"cool"/"idle") already learned."""
+    tracker = HeadOffsetTracker()
+    tracker.load_state({eid: {state: [value, 50] for state, value in offsets.items()}})
+    return tracker
 
 
 def _train(curve: GapResponse, truth, gaps=(0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), rounds=12):
@@ -136,24 +143,6 @@ def test_confidence_needs_a_spread_of_gaps_not_just_samples():
     assert curve.is_confident()
 
 
-def test_head_offset_prefers_the_running_estimate():
-    off = HeadOffset()
-    for _ in range(20):
-        off.observe(head_temp=24.0, room_temp=22.0, is_running=False)  # stratified, idle
-        off.observe(head_temp=22.8, room_temp=22.0, is_running=True)  # fan moving air
-    assert abs(off.commanding_offset() - 0.8) < 0.1
-
-
-def test_head_offset_falls_back_to_zero_when_unknown():
-    assert HeadOffset().commanding_offset() == 0.0
-
-
-def test_head_offset_rejects_implausible_readings():
-    off = HeadOffset()
-    assert not off.observe(head_temp=99.0, room_temp=22.0, is_running=True)
-    assert off.running is None
-
-
 def test_manager_keeps_curves_separate_per_device_and_mode():
     mgr = GapResponseManager()
     mgr.curve("climate.a", "cooling").observe(1.0, 2.0)
@@ -194,10 +183,15 @@ def test_manager_derives_rate_from_passive_drift_residual():
 def test_manager_survives_a_round_trip():
     mgr = GapResponseManager()
     _train(mgr.curve("climate.ac", "cooling"), _saturating)
-    mgr.observe_offset("climate.ac", head_temp=22.8, room_temp=22.0, is_running=True)
     restored = GapResponseManager.from_dict(mgr.to_dict())
     assert restored.curve("climate.ac", "cooling").is_confident()
-    assert restored.offset("climate.ac").n_running == 1
+
+
+def test_offsets_saved_by_earlier_fork_builds_are_ignored():
+    """The head offset is HeadOffsetTracker's now; an old "offsets" block must not break loading."""
+    data = GapResponseManager().to_dict()
+    data["offsets"] = {"climate.ac|normal": {"running": 1.0, "idle": 2.0, "n_running": 9, "n_idle": 9}}
+    assert GapResponseManager.from_dict(data).to_dict() == {"curves": {}}
 
 
 # --- integration with the controller -----------------------------------------
@@ -230,7 +224,7 @@ def _ac_room():
     }
 
 
-async def _commanded(gap_mgr, pf, current_temp=22.1, target=22.0):
+async def _commanded(gap_mgr, pf, current_temp=22.1, target=22.0, head_offsets=None):
     # Each call is an independent device: no proportional dwell from the previous one
     clear_command_cache()
     # Head reads the same as the room so the head-frame shift is zero and
@@ -246,6 +240,7 @@ async def _commanded(gap_mgr, pf, current_temp=22.1, target=22.0):
         settings={},
         has_external_sensor=True,
         gap_manager=gap_mgr,
+        head_offsets=head_offsets,
     )
     await ctrl.async_apply("cooling", target, power_fraction=pf, current_temp=current_temp)
     sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
@@ -266,15 +261,14 @@ async def test_identified_curve_sizes_the_gap_from_measurement():
     """Once identified, the setpoint is (room + offset) - gap_for_rate."""
     gap_mgr = GapResponseManager()
     _train(gap_mgr.curve("climate.ac", "cooling"), _saturating)
-    for _ in range(20):
-        gap_mgr.offset("climate.ac").observe(head_temp=22.6, room_temp=22.0, is_running=True)
+    offsets = _tracker(cool=0.5)
 
     # Q_cool = 4.0 °C/h, so pf=0.15 asks for 0.6 °C/h. The learned curve reaches
-    # that at a small gap, and offset ~0.6 shifts the anchor to the head sensor.
-    gentle = await _commanded(gap_mgr, pf=0.15)
-    hard = await _commanded(gap_mgr, pf=1.0)
+    # that at a small gap, and the 0.5 K offset shifts the anchor to the head sensor.
+    gentle = await _commanded(gap_mgr, pf=0.15, head_offsets=offsets)
+    hard = await _commanded(gap_mgr, pf=1.0, head_offsets=offsets)
     assert gentle > hard, "a smaller demand must command a smaller gap"
-    assert 22.1 + 0.6 - gentle < 1.5, "gentle demand must not open a large head gap"
+    assert 22.1 + 0.5 - gentle < 1.5, "gentle demand must not open a large head gap"
 
 
 @pytest.mark.asyncio
@@ -283,8 +277,6 @@ async def test_learned_path_never_exceeds_the_single_gap_ceiling():
     gap_mgr = GapResponseManager()
     # A curve that barely cools at any gap would otherwise demand an extreme setpoint.
     _train(gap_mgr.curve("climate.ac", "cooling"), lambda g: 0.05 * g)
-    for _ in range(20):
-        gap_mgr.offset("climate.ac").observe(head_temp=22.0, room_temp=22.0, is_running=True)
     sp = await _commanded(gap_mgr, pf=1.0)
     # Ceiling respected before the device's own 0.5°C step quantization.
     assert 22.1 - sp <= AC_MAX_HEAD_GAP_C + 0.5
@@ -320,14 +312,17 @@ def test_gap_for_rate_saturates_at_the_knee_not_the_cap():
     assert abs(curve.gap_for_rate(1.0, AC_MAX_HEAD_GAP_C) - 1.0) < 0.1
 
 
-def test_release_offset_prefers_most_adverse_reading():
-    ho = HeadOffset()
-    ho.running, ho.n_running = -2.0, 10
-    ho.idle, ho.n_idle = 1.0, 10
-    assert ho.commanding_offset() == -2.0  # active: return-air value
-    assert ho.release_offset("cool") == 1.0  # release must clear the idle reading
-    assert ho.release_offset("heat") == -2.0
-    assert HeadOffset().release_offset("cool") == 0.0
+def test_release_shift_takes_the_most_adverse_learned_offset():
+    hass = _ac_hass(head_temp=22.0)
+
+    def ctrl(offsets):
+        return MPCController(hass, _ac_room(), model_manager=RoomModelManager(), settings={}, head_offsets=offsets)
+
+    learned = ctrl(_tracker(cool=-2.0, heat=-2.0, idle=1.0))
+    assert learned.head_frame_shift("climate.ac", 22.0, "cool") == -2.0  # active: running value
+    assert learned.head_frame_shift("climate.ac", 22.0, release_intent="cool") == 1.0  # clears the idle reading
+    assert learned.head_frame_shift("climate.ac", 22.0, release_intent="heat") == -2.0
+    assert ctrl(None).head_frame_shift("climate.ac", 22.0, release_intent="cool", learned_only=True) == 0.0
 
 
 @pytest.mark.asyncio
@@ -345,9 +340,7 @@ async def test_release_clears_idle_offset_not_running():
     the floored park.
     """
     gap_mgr = GapResponseManager()
-    ho = gap_mgr.offset("climate.ac")
-    ho.running, ho.n_running = -2.0, 10
-    ho.idle, ho.n_idle = 1.0, 10
+    offsets = _tracker(cool=-2.0, idle=1.0)
     hass = _ac_hass(head_temp=20.9)
     mgr = RoomModelManager()
     mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
@@ -359,6 +352,7 @@ async def test_release_clears_idle_offset_not_running():
         settings={},
         has_external_sensor=True,
         gap_manager=gap_mgr,
+        head_offsets=offsets,
     )
     # Room 0.5 below target: holding regime, one step under the observed park
     await ctrl.async_apply("cooling", 21.0, power_fraction=0.0, current_temp=20.5)
@@ -370,9 +364,7 @@ async def test_release_clears_idle_offset_not_running():
 async def test_active_command_keeps_running_offset():
     """Active runs still translate with the running (return-air) offset."""
     gap_mgr = GapResponseManager()
-    ho = gap_mgr.offset("climate.ac")
-    ho.running, ho.n_running = -2.0, 10
-    ho.idle, ho.n_idle = 1.0, 10
+    offsets = _tracker(cool=-2.0, idle=1.0)
     hass = _ac_hass(head_temp=24.0)
     mgr = RoomModelManager()
     mgr.get_model = MagicMock(return_value=RCModel(C=1.0, U=0.15, Q_heat=3.0, Q_cool=4.0))
@@ -384,6 +376,7 @@ async def test_active_command_keeps_running_offset():
         settings={},
         has_external_sensor=True,
         gap_manager=gap_mgr,
+        head_offsets=offsets,
     )
     # Room 26, target 23, pf 0.5 → room-frame 21.0; running offset -2 → 19.0
     await ctrl.async_apply("cooling", 23.0, power_fraction=0.5, current_temp=26.0)
@@ -497,12 +490,10 @@ async def test_active_learned_command_never_parks_a_warm_room():
 
 
 # ---------------------------------------------------------------------------
-# Airflow-aware learning. Fan speed changes both learned quantities: the head's
-# offset from the room (less air past the return grille means it reads its own
-# stratified corner) and the rate a gap buys (quiet costs a head much of its
-# capacity). Pooling them fits a curve right for no speed at all — which began
-# to matter the moment RoomMind started setting the fan itself instead of
-# leaving every head on Auto.
+# Airflow-aware learning. Fan speed changes the rate a gap buys (quiet costs a
+# head much of its capacity). Pooling it fits a curve right for no speed at all —
+# which began to matter the moment RoomMind started setting the fan itself
+# instead of leaving every head on Auto. (The head offset is HeadOffsetTracker's.)
 # ---------------------------------------------------------------------------
 
 
@@ -519,8 +510,8 @@ def test_airflow_class_reads_the_devices_own_naming():
         assert airflow_class(name) == AIRFLOW_NORMAL, name
 
 
-def test_offsets_and_curves_are_separated_by_airflow():
-    """The same head, two fan speeds, two estimates — not one blended one."""
+def test_curves_are_separated_by_airflow():
+    """The same head, two fan speeds, two curves — not one blended one."""
     from custom_components.roommind.control.gap_response import (
         AIRFLOW_NORMAL,
         AIRFLOW_QUIET,
@@ -529,10 +520,7 @@ def test_offsets_and_curves_are_separated_by_airflow():
 
     mgr = GapResponseManager()
     for _ in range(50):
-        # Running quiet: the head reads far below the room (stratified) and a
-        # 2 K gap buys little. Running with air: closer, and much more cooling.
-        mgr.observe_offset("climate.ac", 20.0, 22.0, is_running=True, airflow=AIRFLOW_QUIET)
-        mgr.observe_offset("climate.ac", 21.5, 22.0, is_running=True, airflow=AIRFLOW_NORMAL)
+        # Running quiet a 2 K gap buys little; running with air, much more cooling.
         mgr.observe_response(
             "climate.ac",
             "cooling",
@@ -551,10 +539,6 @@ def test_offsets_and_curves_are_separated_by_airflow():
             dt_minutes=5.0,
             airflow=AIRFLOW_NORMAL,
         )
-
-    quiet_off = mgr.offset("climate.ac", AIRFLOW_QUIET).commanding_offset()
-    normal_off = mgr.offset("climate.ac", AIRFLOW_NORMAL).commanding_offset()
-    assert quiet_off < normal_off - 1.0, (quiet_off, normal_off)
 
     quiet_rate = mgr.curve("climate.ac", "cooling", AIRFLOW_QUIET).rate_for_gap(2.0)
     normal_rate = mgr.curve("climate.ac", "cooling", AIRFLOW_NORMAL).rate_for_gap(2.0)
@@ -577,7 +561,6 @@ def test_pre_airflow_state_seeds_both_classes_instead_of_starting_cold():
     trained = GapResponseManager()
     for i in range(200):
         gap = 0.5 + (i % 7) * 0.5
-        trained.observe_offset("climate.ac", 23.0, 22.0, is_running=True)
         trained.observe_response(
             "climate.ac",
             "cooling",
@@ -589,14 +572,12 @@ def test_pre_airflow_state_seeds_both_classes_instead_of_starting_cold():
     # Persist under the pre-airflow key shape, as a real install would have.
     legacy = trained.to_dict()
     legacy["curves"] = {"climate.ac|cooling": next(iter(trained.to_dict()["curves"].values()))}
-    legacy["offsets"] = {"climate.ac": next(iter(trained.to_dict()["offsets"].values()))}
 
     loaded = GapResponseManager.from_dict(legacy)
     for airflow in (AIRFLOW_NORMAL, AIRFLOW_QUIET):
         curve = loaded.curve("climate.ac", "cooling", airflow)
         assert curve.is_confident(), f"{airflow} lost the learned path"
         assert curve.rate_for_gap(2.0) > 0
-        assert loaded.offset("climate.ac", airflow).commanding_offset() == 1.0
 
 
 def test_a_seeded_bucket_can_still_be_moved_by_its_own_data():
@@ -623,3 +604,35 @@ def test_a_seeded_bucket_can_still_be_moved_by_its_own_data():
     frozen = before - GapResponse.from_dict(trained.to_dict()).rate_for_gap(2.0)
     assert moved > 1.0, f"seeded bucket barely moved: {moved}"
     assert moved > frozen * 5
+
+
+# ---------------------------------------------------------------------------
+# One head offset source: upstream's HeadOffsetTracker feeds both upstream's
+# setpoint shift and the fork's head frame, so the bias is compensated once.
+# ---------------------------------------------------------------------------
+
+
+async def _cooling_sent(head_temp: float, offsets) -> float:
+    clear_command_cache()
+    hass = _ac_hass(head_temp=head_temp)
+    ctrl = MPCController(
+        hass,
+        _ac_room(),
+        model_manager=RoomModelManager(),
+        outdoor_temp=32.0,
+        settings={},
+        has_external_sensor=True,
+        gap_manager=GapResponseManager(),
+        head_offsets=offsets,
+    )
+    await ctrl.async_apply("cooling", 24.0, power_fraction=0.5, current_temp=26.0)
+    sent = [c[0][2]["temperature"] for c in hass.services.async_call.call_args_list if c[0][1] == "set_temperature"]
+    return sent[-1]
+
+
+@pytest.mark.asyncio
+async def test_learned_offset_moves_an_active_ac_setpoint_once():
+    """A learned +1.5 K moves the command by 1.5 K, not 1.5 K twice, and wins over the live reading."""
+    plain = await _cooling_sent(head_temp=26.0, offsets=None)
+    learned = await _cooling_sent(head_temp=29.0, offsets=_tracker(cool=1.5))
+    assert learned == pytest.approx(plain + 1.5)

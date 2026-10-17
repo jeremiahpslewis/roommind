@@ -1640,23 +1640,16 @@ async def test_controller_reads_the_airflow_class_it_is_about_to_command():
     """The setpoint is sized from the capacity it will actually be delivered under.
 
     On the cycle where the fan changes, the head is still reporting the old
-    speed. Reading the old class's offset there sizes the command from the
-    wrong capacity — the changeover cycle is precisely when the two estimates
+    speed. Reading the old class's response curve there sizes the command from
+    the wrong capacity — the changeover cycle is precisely when the two curves
     differ most.
     """
-    from custom_components.roommind.control.gap_response import (
-        AIRFLOW_NORMAL,
-        AIRFLOW_QUIET,
-        GapResponseManager,
-    )
+    from custom_components.roommind.control.gap_response import AIRFLOW_QUIET, GapResponseManager
 
     clear_command_cache()
     # Head currently on Auto; the room is parked, so it is about to go Quiet.
     hass, _, _ = _fan_ctrl(fan_mode="Auto")
     gap_mgr = GapResponseManager()
-    for _ in range(60):
-        gap_mgr.observe_offset("climate.ac1", 25.0, 22.0, is_running=True, airflow=AIRFLOW_QUIET)
-        gap_mgr.observe_offset("climate.ac1", 22.5, 22.0, is_running=True, airflow=AIRFLOW_NORMAL)
 
     room = make_room(thermostats=[], acs=["climate.ac1"])
     room["devices"] = [
@@ -1682,7 +1675,7 @@ async def test_controller_reads_the_airflow_class_it_is_about_to_command():
 
     # It resolved the quiet class despite the head still reporting Auto.
     assert ctrl._intended_airflow["climate.ac1"] == AIRFLOW_QUIET
-    assert ctrl.head_frame_shift("climate.ac1", 22.0) == pytest.approx(3.0, abs=0.2)
+    assert ctrl._airflow_for("climate.ac1") == AIRFLOW_QUIET
 
 
 # ---------------------------------------------------------------------------

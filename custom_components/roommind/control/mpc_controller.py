@@ -518,30 +518,28 @@ def observed_park_level(
 
 
 def _resolve_fan_mode(state: Any, desired: str | None) -> str | None:
-    """Match ``desired`` against the device's advertised fan modes, loosely.
+    """``match_fan_mode``, plus a fall-through to the device's own slow speed.
 
-    Devices name the same speed differently in case and spacing ("Quiet" vs
-    "quiet", "Medium Low" vs "medium_low"), and the configured value is free
-    text. An exact-string match silently does nothing on a mismatch, which is
-    indistinguishable from the fan never being commanded at all.
+    A head that does not advertise the requested slow speed under that name
+    almost always has it under another one, and leaving the blower where it
+    was is the failure backing off exists to prevent — air over a cold coil
+    that the room feels as the AC never easing up. Only the slow end falls
+    through: nothing sensible substitutes for "turbo".
     """
     if not desired:
         return None
-    modes: list[str] = (state.attributes.get("fan_modes") or []) if state else []
+    match = match_fan_mode(state, desired)
+    if match is not None:
+        return match
+    raw = (state.attributes.get("fan_modes") or []) if state else []
+    if not isinstance(raw, (list, tuple)):
+        return None
+    modes: list[str] = list(raw)
 
-    def norm(v: str) -> str:
-        return "".join(ch for ch in str(v).lower() if ch.isalnum())
+    def norm(v: Any) -> str:
+        return "".join(ch for ch in str(v).casefold() if ch.isalnum())
 
-    want = norm(desired)
-    for mode in modes:
-        if norm(mode) == want:
-            return mode
-    # A head that does not advertise the requested slow speed under that name
-    # almost always has it under another one, and leaving the blower where it
-    # was is the failure backing off exists to prevent — air over a cold coil
-    # that the room feels as the AC never easing up. Only the slow end falls
-    # through: nothing sensible substitutes for "turbo".
-    if want in QUIET_FAN_FALLBACKS:
+    if norm(desired) in QUIET_FAN_FALLBACKS:
         for alt in QUIET_FAN_FALLBACKS:
             for mode in modes:
                 if norm(mode).startswith(alt):
@@ -2688,7 +2686,7 @@ class MPCController:
                         # its cooling rate fell to the honest value while the curve
                         # still credited negative gaps with a full unit's output, and
                         # the inversion parked a unit the MPC had asked to cool.
-                        _shift = self.head_frame_shift(eid, current_temp)
+                        _shift = self.head_frame_shift(eid, current_temp, "cool")
                         _limit = self.ac_setpoint_limit(current_temp, effective_target, mode, eid)
                         _floor = effective_target - _limit + _shift
                         ac_cool_target = min(effective_target + _shift, max(ac_cool_boost, _floor, learned))
@@ -3024,19 +3022,6 @@ class MPCController:
             return 0.0
         return self._head_offsets.offset(eid, intent)
 
-    def _cooling_setpoint_ha(self, eid: str, celsius: float) -> float:
-        """HA-unit proportional AC cooling setpoint in the device's frame, within its range."""
-        ha_t = celsius_to_ha_temp(self.hass, celsius + self._head_offset(eid, "cool"))
-        state = self.hass.states.get(eid)
-        if state is None:
-            return ha_t
-        try:
-            low = float(state.attributes["min_temp"])
-            high = float(state.attributes["max_temp"])
-        except (KeyError, TypeError, ValueError):
-            return ha_t
-        return min(max(ha_t, low), high)
-
     def _heating_setpoint_ha(
         self, eid: str, proportional_celsius: float, effective_target: float, direct_target: float | None = None
     ) -> float:
@@ -3108,7 +3093,7 @@ class MPCController:
         if required_rate <= 0:
             return None
         gap = curve.gap_for_rate(required_rate, AC_MAX_HEAD_GAP_C)
-        offset = self._gap_manager.offset(eid, self._airflow_for(eid)).commanding_offset()
+        offset = self._learned_head_offset(eid, "cool")
         setpoint = round(current_temp + offset - gap, 1)
         _LOGGER.debug(
             "gap-response: %s commanding room=%.2f offset=%+.2f required=%.2f°C/h "
@@ -3124,23 +3109,29 @@ class MPCController:
         )
         return setpoint
 
+    def _learned_head_offset(self, eid: str, state: str) -> float:
+        """Offset learned by upstream's HeadOffsetTracker for *state* ("heat"/"cool"/"idle"), 0.0 if none."""
+        return self._head_offsets.offset(eid, state) if self._head_offsets is not None else 0.0
+
     def head_frame_shift(
         self,
         eid: str,
         current_temp: float | None,
+        intent: str = "cool",
         *,
         release_intent: str | None = None,
         learned_only: bool = False,
     ) -> float:
         """Head-sensor bias (°C) between the device's own reading and the room.
 
-        Prefers the gap-response learned offsets when identified — the running
-        (return-air) offset for active commands, the most adverse of the known
-        offsets for releases (``release_intent`` = "cool"/"heat"), because a
-        release must clear the reading the head settles to once the fan slows.
-        Falls back to the instantaneous head-vs-room delta from the device's
-        ``current_temperature`` attribute. Clamped to ±AC_MAX_HEAD_GAP_C so a
-        broken head sensor cannot command an absurd setpoint. 0.0 without data.
+        Taken from the learned offsets (HeadOffsetTracker, the single source for
+        upstream's setpoint shift too): the offset of the running direction
+        (*intent*, "cool"/"heat") for active commands, the most adverse of that
+        and the idle offset for releases (``release_intent`` = "cool"/"heat"),
+        because a release must clear the reading the head settles to once the
+        unit stops. Falls back to the instantaneous head-vs-room delta from the
+        device's ``current_temperature`` attribute. Clamped to ±AC_MAX_HEAD_GAP_C
+        so a broken head sensor cannot command an absurd setpoint. 0.0 without data.
 
         ``learned_only`` drops that instantaneous fallback. The delta between a
         head that is holding still and a room that is drifting is not a sensor
@@ -3151,10 +3142,12 @@ class MPCController:
         """
         if current_temp is None:
             return 0.0
-        offset = 0.0
-        if self._gap_manager is not None:
-            tracker = self._gap_manager.offset(eid, self._airflow_for(eid))
-            offset = tracker.release_offset(release_intent) if release_intent else tracker.commanding_offset()
+        if release_intent:
+            running = self._learned_head_offset(eid, release_intent)
+            idle = self._learned_head_offset(eid, "idle")
+            offset = max(running, idle) if release_intent == "cool" else min(running, idle)
+        else:
+            offset = self._learned_head_offset(eid, intent)
         if not offset and not learned_only:
             state = self.hass.states.get(eid)
             raw = state.attributes.get("current_temperature") if state else None
@@ -3224,7 +3217,7 @@ class MPCController:
             # An active command supersedes any parked level: the next release
             # latches afresh from the head reading it actually ends at.
             reset_park_latch(eid)
-        shift = self.head_frame_shift(eid, current_temp, release_intent=intent if is_release else None)
+        shift = self.head_frame_shift(eid, current_temp, intent, release_intent=intent if is_release else None)
         if is_release:
             if intent == "cool":
                 shift = max(0.0, shift) + AC_RELEASE_PARK_C
@@ -3339,7 +3332,7 @@ class MPCController:
         """
         step = self._setpoint_step(eid) or 0.5
         sign = 1.0 if intent == "cool" else -1.0
-        parity = effective_target + self.head_frame_shift(eid, current_temp)
+        parity = effective_target + self.head_frame_shift(eid, current_temp, intent)
         # error > 0 = the room needs more output; error < 0 = it got too much
         error = (current_temp - effective_target) * sign
         # Same regime the park margin uses, and hysteretic for the same

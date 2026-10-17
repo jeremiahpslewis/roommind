@@ -80,7 +80,8 @@ async def test_cooling_setpoint_moves_by_the_cooling_offset():
 
 @pytest.mark.asyncio
 async def test_heating_setpoint_moves_by_the_heating_offset():
-    kwargs = {"power_fraction": 0.1, "current_temp": 20.5}
+    # Fork: at or below MIN_POWER_FRACTION the AC is in the holding regime (rung servo), so 0.2
+    kwargs = {"power_fraction": 0.2, "current_temp": 20.5}
     plain = await _apply(None, MODE_HEATING, TargetTemps(heat=21.0, cool=None), **kwargs)
     shifted = await _apply(_tracker(heat=1.5), MODE_HEATING, TargetTemps(heat=21.0, cool=None), **kwargs)
     assert shifted[0] == pytest.approx(plain[0] + 1.5)
@@ -89,8 +90,9 @@ async def test_heating_setpoint_moves_by_the_heating_offset():
 @pytest.mark.asyncio
 async def test_cooling_setpoint_stays_inside_the_device_range():
     """A sensor reading cold while cooling cannot push the full-power setpoint below min_temp."""
+    # Fork: the error-scaled AC limit keeps a small deficit well above min_temp, so a large one it is
     sent = await _apply(
-        _tracker(cool=-2.0), MODE_COOLING, TargetTemps(heat=None, cool=24.0), power_fraction=1.0, current_temp=27.0
+        _tracker(cool=-4.0), MODE_COOLING, TargetTemps(heat=None, cool=20.0), power_fraction=1.0, current_temp=30.0
     )
     assert sent == [16.0]
 
@@ -148,13 +150,14 @@ async def test_held_unit_gets_a_lowered_target_in_its_frame():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("idle", [1.88, 1.6, 2.0])
-async def test_setback_with_offset_is_not_resent_to_a_whole_degree_device(idle):
+# Fork: an AC's setback is target + learned idle offset + AC_RELEASE_PARK_C (1 K, upstream 2 K)
+@pytest.mark.parametrize(("idle", "expected"), [(1.88, 27.0), (1.6, 26.0), (2.0, 27.0)])
+async def test_setback_with_offset_is_not_resent_to_a_whole_degree_device(idle, expected):
     """A device without target_temp_step that shows whole degrees gets the setback once."""
     room = make_room(thermostats=[], acs=[AC])
     room["devices"][0]["idle_action"] = "setback"
     targets = TargetTemps(heat=None, cool=24.0)
-    state = _ac_state("cool", temperature=26.0)
+    state = _ac_state("cool", temperature=22.0)
     clear_command_cache()
     hass, ctrl = _ctrl(state, _tracker(idle=idle, cool=1.0), room=room)
     sent = []
@@ -165,7 +168,7 @@ async def test_setback_with_offset_is_not_resent_to_a_whole_degree_device(idle):
         if sent[-1]:
             # The device keeps whole degrees
             state.attributes["temperature"] = float(round(sent[-1][-1]))
-    assert sent[0] == [float(round(24.0 + idle + 2.0))]
+    assert sent[0] == [expected]
     assert sent[1:] == [[], []]
 
 
@@ -178,9 +181,9 @@ async def test_setback_with_offset_snaps_to_half_degrees_without_a_step():
     sent = await _apply(
         _tracker(idle=1.88), MODE_IDLE, TargetTemps(heat=None, cool=24.0), state=state, room=room, current_temp=23.5
     )
-    assert sent == [28.0]
+    assert sent == [27.0]  # fork: 24 + 2.0 + AC_RELEASE_PARK_C
     state = _ac_state("cool", temperature=26.3)
     sent = await _apply(
         _tracker(idle=1.6), MODE_IDLE, TargetTemps(heat=None, cool=24.0), state=state, room=room, current_temp=23.5
     )
-    assert sent == [27.5]
+    assert sent == [26.5]

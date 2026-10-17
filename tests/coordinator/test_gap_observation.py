@@ -84,7 +84,6 @@ class TestGapObservationAccumulation:
 
         _observe_at(coordinator, 60.0)  # 1.0 min from the ORIGINAL baseline
         assert coordinator._gap_manager.observe_response.call_count == 1
-        assert coordinator._gap_manager.observe_offset.call_count == 1
         kwargs = coordinator._gap_manager.observe_response.call_args.kwargs
         assert abs(kwargs["dt_minutes"] - 1.0) < 1e-9
 

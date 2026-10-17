@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from custom_components.roommind.const import TargetTemps
+from custom_components.roommind.const import AC_RELEASE_PARK_C, TargetTemps
 from custom_components.roommind.control.mpc_controller import (
     MODE_COOLING,
     MODE_HEATING,
@@ -23,6 +23,10 @@ from custom_components.roommind.control.mpc_optimizer import MPCPlan
 from custom_components.roommind.control.thermal_model import RoomModelManager
 
 from .conftest import build_hass, make_room
+
+# Fork: an AC's setback sits AC_RELEASE_PARK_C past the target (upstream: 2 K)
+HEAT_SETBACK = 21.0 - AC_RELEASE_PARK_C
+COOL_SETBACK = 24.0 + AC_RELEASE_PARK_C
 
 EID = "climate.ac1"
 HEAT_TARGETS = TargetTemps(heat=21.0, cool=24.0)
@@ -125,7 +129,7 @@ async def test_heat_setback_turns_off_when_no_heating_is_planned(monkeypatch):
     await ctrl.async_apply(mode, HEAT_TARGETS, power_fraction=0.0, current_temp=21.3)
 
     assert _turned_off(hass)
-    assert 19.0 not in [d["temperature"] for d in _calls(hass, "set_temperature")]
+    assert HEAT_SETBACK not in [d["temperature"] for d in _calls(hass, "set_temperature")]
 
 
 @pytest.mark.asyncio
@@ -137,7 +141,7 @@ async def test_heat_setback_stays_when_heating_is_planned_within_the_hour(monkey
     await ctrl.async_apply(mode, HEAT_TARGETS, power_fraction=0.0, current_temp=21.3)
 
     assert not _turned_off(hass)
-    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [19.0]
+    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [HEAT_SETBACK]
 
 
 @pytest.mark.asyncio
@@ -170,7 +174,7 @@ async def test_cool_setback_stays_when_cooling_is_planned_within_the_hour(monkey
     await ctrl.async_apply(mode, HEAT_TARGETS, power_fraction=0.0, current_temp=23.5)
 
     assert not _turned_off(hass)
-    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [26.0]
+    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [COOL_SETBACK]
 
 
 @pytest.mark.asyncio
@@ -192,7 +196,7 @@ async def test_managed_mode_keeps_the_setback(monkeypatch):
     await ctrl.async_apply(MODE_IDLE, TargetTemps(heat=21.0, cool=None), power_fraction=0.0)
 
     assert not _turned_off(hass)
-    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [19.0]
+    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [HEAT_SETBACK]
 
 
 @pytest.mark.asyncio
@@ -215,7 +219,7 @@ async def test_setback_holds_through_a_short_pause_even_if_the_plan_sees_none(mo
     await ctrl.async_apply(mode, HEAT_TARGETS, power_fraction=0.0, current_temp=21.3)
 
     assert not _turned_off(hass)
-    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [19.0]
+    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [HEAT_SETBACK]
 
 
 @pytest.mark.asyncio
@@ -263,7 +267,7 @@ async def test_async_idle_device_release_only_hits_the_released_mode():
     )
 
     assert not _turned_off(hass)
-    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [26.0]
+    assert [d["temperature"] for d in _calls(hass, "set_temperature")] == [COOL_SETBACK]
 
 
 @pytest.mark.asyncio

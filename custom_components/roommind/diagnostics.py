@@ -329,14 +329,13 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
         if coordinator:
             gap_diag: dict[str, Any] = {}
             for eid in get_ac_eids(config.get("devices", [])):
-                # Both airflow classes, because "the offset" is now two numbers
-                # and a head that looks untrained in one may be well trained in
-                # the other — which is exactly the question when a park or a
-                # commanded gap looks wrong.
+                # Both airflow classes: a head that looks untrained in one may
+                # be well trained in the other, which is exactly the question
+                # when a park or a commanded gap looks wrong. The head offset
+                # itself is in ac_head_offsets (HeadOffsetTracker).
                 per_airflow: dict[str, Any] = {}
                 seen = False
                 for airflow in (AIRFLOW_NORMAL, AIRFLOW_QUIET):
-                    offset = coordinator._gap_manager.offset(eid, airflow)
                     per_mode: dict[str, Any] = {}
                     for gap_mode in ("cooling", "heating"):
                         curve = coordinator._gap_manager.curve(eid, gap_mode, airflow)
@@ -351,14 +350,10 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
                             "identified_knots": curve.identified_knots,
                             "driving_setpoints": curve.is_confident(),
                         }
-                    if not (per_mode or offset.n_running or offset.n_idle):
+                    if not per_mode:
                         continue
                     seen = True
-                    per_airflow[airflow] = {
-                        "head_offset": offset.to_dict(),
-                        "commanding_offset_C": offset.commanding_offset(),
-                        "response": per_mode,
-                    }
+                    per_airflow[airflow] = {"response": per_mode}
                 if seen:
                     state = coordinator.hass.states.get(eid)
                     gap_diag[eid] = {

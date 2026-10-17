@@ -1267,7 +1267,11 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             ac_setpoint_limit=(
                 controller.ac_setpoint_limit(current_temp, target_temp, mode) if target_temp is not None else None
             ),
-            head_frame_shift=(controller.head_frame_shift(_first_ac, current_temp) if _first_ac is not None else None),
+            head_frame_shift=(
+                controller.head_frame_shift(_first_ac, current_temp, "heat" if mode == MODE_HEATING else "cool")
+                if _first_ac is not None
+                else None
+            ),
             compressor_protection_reason=compressor_protection_reason,
             coil_dry=coil_dry,
         )
@@ -1557,14 +1561,6 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         # One shown value only when every driven device agrees on the offset
         _relevant_offsets = {_direct_offsets.get(eid, 0.0) for eid in _mode_relevant_eids}
         _display_offset = _relevant_offsets.pop() if _all_direct and len(_relevant_offsets) == 1 else 0.0
-        # Same rule for the learned AC sensor offset: shown only when the room's proportional ACs agree
-        _head_shift = 0.0
-        if has_external_sensor and mode in (MODE_HEATING, MODE_COOLING):
-            _intent = "heat" if mode == MODE_HEATING else "cool"
-            _shifts = {
-                self._head_offsets.offset(eid, _intent) for eid in get_ac_eids(_room_devices) if eid not in _direct_eids
-            }
-            _head_shift = _shifts.pop() if len(_shifts) == 1 else 0.0
         _ac_heat_shifts = (
             {
                 eid: self._head_offsets.offset(eid, "heat")
@@ -1602,7 +1598,6 @@ class RoomMindCoordinator(DataUpdateCoordinator):
                 all_direct=_all_direct,
                 direct_offset=_display_offset,
                 direct_target=direct_target,
-                head_offset=_head_shift,
                 ac_setpoint_limit=ac_setpoint_limit,
                 head_frame_shift=head_frame_shift,
             )
@@ -1717,7 +1712,6 @@ class RoomMindCoordinator(DataUpdateCoordinator):
         all_direct: bool = False,
         direct_offset: float = 0.0,
         direct_target: float | None = None,
-        head_offset: float = 0.0,
         ac_setpoint_limit: float | None = None,
         head_frame_shift: float | None = None,
     ) -> float | None:
@@ -1890,12 +1884,10 @@ class RoomMindCoordinator(DataUpdateCoordinator):
             except (TypeError, ValueError):
                 continue
             # Airflow is part of the physics being learned, so it is part of
-            # the bucket: the same head at the same gap reads a different
-            # offset and delivers a different rate depending on how hard its
-            # blower is turning. Parked intervals feed the idle offset bucket —
-            # the reading the head settles to when the fan slows.
+            # the bucket: the same head at the same gap delivers a different
+            # rate depending on how hard its blower is turning. (The head's
+            # offset itself is HeadOffsetTracker's, see _observe_head_offsets.)
             airflow = airflow_class(state.attributes.get("fan_mode"))
-            self._gap_manager.observe_offset(eid, head_c, current_temp, is_running=mode != MODE_IDLE, airflow=airflow)
             gap = head_c - setpoint_c if obs_mode == MODE_COOLING else setpoint_c - head_c
             self._gap_manager.observe_response(
                 eid,
